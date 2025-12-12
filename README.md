@@ -43,6 +43,7 @@ out = model.infer_batch(["Hello world!"]*10, "/dir")
 
 
 # streamed inference w/ seamless streaming
+import torch
 stream = model.infer_stream("Hello world!", chunk_size=1)
 # audio chunks can be accessed via an iterator
 out = []
