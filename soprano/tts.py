@@ -45,15 +45,16 @@ class SopranoTTS:
 
         self.infer("Hello world!") # warmup
 
-    def _preprocess_text(self, texts):
+    def _preprocess_text(self, texts, min_length=30):
         '''
         adds prompt format and sentence/part index
+        Enforces a minimum sentence length by merging short sentences.
         '''
         res = []
         for text_idx, text in enumerate(texts):
             text = text.strip()
             sentences = re.split(r"(?<=[.!?])\s+", text)
-            processed_sentences = []
+            processed = []
             for sentence_idx, sentence in enumerate(sentences):
                 old_len = len(sentence)
                 new_sentence = re.sub(r"[^A-Za-z !\$%&'*+,-./0123456789<>?_]", "", sentence)
@@ -64,8 +65,29 @@ class SopranoTTS:
                 if old_len != new_len:
                     print(f"Warning: unsupported characters found in sentence: {sentence}\n\tThese characters have been removed.")
                 new_sentence = unidecode(new_sentence.strip())
-                processed_sentences.append((f'[STOP][TEXT]{new_sentence}[START]', text_idx, sentence_idx))
-            res.extend(processed_sentences)
+                processed.append({
+                    "text": new_sentence,
+                    "text_idx": text_idx,
+                })
+
+            if min_length > 0 and len(processed) > 1:
+                merged = []
+                i = 0
+                while i < len(processed):
+                    cur = processed[i]
+                    if len(cur["text"]) < min_length:
+                        if merged: merged[-1]["text"] = (merged[-1]["text"] + " " + cur["text"]).strip()
+                        else:
+                            if i + 1 < len(processed): processed[i + 1]["text"] = (cur["text"] + " " + processed[i + 1]["text"]).strip()
+                            else: merged.append(cur)
+                    else: merged.append(cur)
+                    i += 1
+                processed = merged
+            sentence_idxes = {}
+            for item in processed:
+                if item['text_idx'] not in sentence_idxes: sentence_idxes[item['text_idx']] = 0
+                res.append((f'[STOP][TEXT]{item["text"]}[START]', item["text_idx"], sentence_idxes[item['text_idx']]))
+                sentence_idxes[item['text_idx']] += 1
         return res
 
     def infer(self,
