@@ -16,11 +16,15 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+  "fastapi",
+  "huggingface_hub",
   "lmdeploy",
+  "numpy",
+  "scipy",
   "torch",
   "unidecode",
-  "inflect",
-  "scipy"
+  "uvicorn",
+  "inflect"
 ]
 license = {file = "LICENSE"}
 
