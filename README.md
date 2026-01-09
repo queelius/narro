@@ -122,8 +122,6 @@ curl http://localhost:8000/v1/audio/speech \
   --output speech.wav
 ```
 
-You can pass `"stream": True` for SSE responses.
-
 ## Usage tips:
 
 * Soprano works best when each sentence is between 2 and 15 seconds long.
