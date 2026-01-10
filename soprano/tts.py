@@ -32,6 +32,7 @@ class SopranoTTS:
             model_path=None):
         RECOGNIZED_DEVICES = ['cuda', 'cpu', 'mps']
         RECOGNIZED_BACKENDS = ['auto', 'lmdeploy', 'transformers']
+        assert device in RECOGNIZED_DEVICES, f"unrecognized device {device}, device must be in {RECOGNIZED_DEVICES}"
         if backend == 'auto':
             if device == 'cpu':
                 backend = 'transformers'
