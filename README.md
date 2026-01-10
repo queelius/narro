@@ -21,9 +21,9 @@ With only **80M parameters**, Soprano achieves a real‑time factor (RTF) of **~
 
 ## Installation
 
-**Requirements**: Linux or Windows, CUDA‑enabled GPU required (CPU support coming soon!).
+**Requirements**: Supports CPU, CUDA, and MPS devices on Linux, Windows, and Mac.
 
-### Install with wheel
+### Install with wheel (CUDA-only for now)
 
 ```bash
 pip install soprano-tts
@@ -31,17 +31,23 @@ pip uninstall -y torch
 pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 
-### Install from source
+### Install from source (CUDA)
+
+```bash
+git clone https://github.com/ekwek1/soprano.git
+cd soprano
+pip install -e .[lmdeploy]
+pip uninstall -y torch
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+```
+
+### Install from source (CPU/MPS)
 
 ```bash
 git clone https://github.com/ekwek1/soprano.git
 cd soprano
 pip install -e .
-pip uninstall -y torch
-pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 ```
-
-> **Note**: Soprano uses **LMDeploy** to accelerate inference by default. If LMDeploy cannot be installed in your environment, Soprano can fall back to the HuggingFace **transformers** backend (with slower performance). To enable this, pass `backend='transformers'` when creating the TTS model.
 
 ---
 

@@ -10,13 +10,27 @@ import time
 
 
 class SopranoTTS:
+    """
+    Soprano Text-to-Speech model.
+    
+    Args:
+        backend: Backend to use for inference. Options:
+            - 'auto' (default): Automatically select best backend. Tries lmdeploy first (fastest),
+                               falls back to transformers. CPU always uses transformers.
+            - 'lmdeploy': Force use of LMDeploy (fastest, CUDA only)
+            - 'transformers': Force use of HuggingFace Transformers (slower, all devices)
+            Can be overridden with SOPRANO_BACKEND environment variable.
+        device: Device to run inference on ('cuda', 'cpu', 'mps')
+        cache_size_mb: Cache size in MB for lmdeploy backend
+        decoder_batch_size: Batch size for decoder
+    """
     def __init__(self,
             backend='auto',
             device='cuda',
             cache_size_mb=100,
             decoder_batch_size=1,
             model_path=None):
-        RECOGNIZED_DEVICES = ['cuda', 'cpu']
+        RECOGNIZED_DEVICES = ['cuda', 'cpu', 'mps']
         RECOGNIZED_BACKENDS = ['auto', 'lmdeploy', 'transformers']
         assert device in RECOGNIZED_DEVICES, f"unrecognized device {device}, device must be in {RECOGNIZED_DEVICES}"
         if backend == 'auto':
@@ -27,9 +41,9 @@ class SopranoTTS:
                     import lmdeploy
                     backend = 'lmdeploy'
                 except ImportError:
-                    backend='transformers'
-            print(f"Using backend {backend}.")
+                    backend = 'transformers'
         assert backend in RECOGNIZED_BACKENDS, f"unrecognized backend {backend}, backend must be in {RECOGNIZED_BACKENDS}"
+        print(f"Using backend {backend}.")
 
         if backend == 'lmdeploy':
             from .backends.lmdeploy import LMDeployModel
@@ -39,14 +53,12 @@ class SopranoTTS:
             self.pipeline = TransformersModel(device=device, model_path=model_path)
 
         self.device = device
-        self.decoder = SopranoDecoder()
-        if device == 'cuda':
-            self.decoder = self.decoder.cuda()
+        self.decoder = SopranoDecoder().to(device)
         if model_path:
             decoder_path = os.path.join(model_path, 'decoder.pth')
         else:
             decoder_path = hf_hub_download(repo_id='ekwek/Soprano-80M', filename='decoder.pth')
-        self.decoder.load_state_dict(torch.load(decoder_path))
+        self.decoder.load_state_dict(torch.load(decoder_path, map_location=device))
         self.decoder_batch_size=decoder_batch_size
         self.RECEPTIVE_FIELD = 4 # Decoder receptive field
         self.TOKEN_SIZE = 2048 # Number of samples per audio token
