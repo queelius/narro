@@ -27,8 +27,6 @@ With only **80M parameters**, Soprano achieves a real‑time factor (RTF) of **~
 
 ```bash
 pip install soprano-tts
-pip uninstall -y torch
-pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 
 ### Install from source (CUDA)
@@ -37,8 +35,6 @@ pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 git clone https://github.com/ekwek1/soprano.git
 cd soprano
 pip install -e .[lmdeploy]
-pip uninstall -y torch
-pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 
 ### Install from source (CPU/MPS)
@@ -48,6 +44,15 @@ git clone https://github.com/ekwek1/soprano.git
 cd soprano
 pip install -e .
 ```
+
+> ### ⚠️ WARNING: Windows CUDA users
+> 
+> On **Windows with CUDA**, `pip` will install a CPU-only PyTorch build. To ensure CUDA support works as expected, reinstall PyTorch explicitly with the correct CUDA wheel **after** installing Soprano:
+> 
+> ```bash
+> pip uninstall -y torch
+> pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+> ```
 
 ---
 
