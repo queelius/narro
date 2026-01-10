@@ -56,7 +56,7 @@ pip install -e .
 ```python
 from soprano import SopranoTTS
 
-model = SopranoTTS(backend='auto', device='cuda', cache_size_mb=10, decoder_batch_size=1)
+model = SopranoTTS(backend='auto', device='cuda', cache_size_mb=100, decoder_batch_size=1)
 ```
 
 > **Tip**: You can increase cache_size_mb and decoder_batch_size to increase inference speed at the cost of higher memory usage.
@@ -111,6 +111,23 @@ for chunk in stream:
 out = torch.cat(chunks)
 ```
 
+### Serve endpoint
+
+```
+uvicorn soprano.server:app --host 0.0.0.0 --port 8000
+```
+
+Compatible with OpenAI speech API. Use the endpoint like this:
+
+```bash
+curl http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "The quick brown fox jumped over the lazy dog."
+  }' \
+  --output speech.wav
+```
+
 ## Usage tips:
 
 * Soprano works best when each sentence is between 2 and 15 seconds long.
@@ -155,10 +172,10 @@ I’m a second-year undergrad who’s just started working on TTS models, so I w
 * [x] Add model and inference code
 * [x] Seamless streaming
 * [x] Batched inference
-* [ ] Command-line interface (CLI)
-* [ ] Server / API inference
+* [x] Command-line interface (CLI)
+* [x] CPU support
+* [x] Server / API inference
 * [ ] Additional LLM backends
-* [ ] CPU support
 * [ ] Voice cloning
 * [ ] Multilingual support
 

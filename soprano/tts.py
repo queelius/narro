@@ -1,4 +1,5 @@
 from .vocos.decoder import SopranoDecoder
+from .utils.text import clean_text
 import torch
 import re
 from unidecode import unidecode
@@ -26,8 +27,9 @@ class SopranoTTS:
     def __init__(self,
             backend='auto',
             device='cuda',
-            cache_size_mb=10,
-            decoder_batch_size=1):
+            cache_size_mb=100,
+            decoder_batch_size=1,
+            model_path=None):
         RECOGNIZED_DEVICES = ['cuda', 'cpu', 'mps']
         RECOGNIZED_BACKENDS = ['auto', 'lmdeploy', 'transformers']
         assert device in RECOGNIZED_DEVICES, f"unrecognized device {device}, device must be in {RECOGNIZED_DEVICES}"
@@ -45,14 +47,17 @@ class SopranoTTS:
 
         if backend == 'lmdeploy':
             from .backends.lmdeploy import LMDeployModel
-            self.pipeline = LMDeployModel(device=device, cache_size_mb=cache_size_mb)
+            self.pipeline = LMDeployModel(device=device, cache_size_mb=cache_size_mb, model_path=model_path)
         elif backend == 'transformers':
             from .backends.transformers import TransformersModel
-            self.pipeline = TransformersModel(device=device)
+            self.pipeline = TransformersModel(device=device, model_path=model_path)
 
         self.device = device
         self.decoder = SopranoDecoder().to(device)
-        decoder_path = hf_hub_download(repo_id='ekwek/Soprano-80M', filename='decoder.pth')
+        if model_path:
+            decoder_path = os.path.join(model_path, 'decoder.pth')
+        else:
+            decoder_path = hf_hub_download(repo_id='ekwek/Soprano-80M', filename='decoder.pth')
         self.decoder.load_state_dict(torch.load(decoder_path, map_location=device))
         self.decoder_batch_size=decoder_batch_size
         self.RECEPTIVE_FIELD = 4 # Decoder receptive field
@@ -68,20 +73,12 @@ class SopranoTTS:
         res = []
         for text_idx, text in enumerate(texts):
             text = text.strip()
-            sentences = re.split(r"(?<=[.!?])\s+", text)
+            cleaned_text = clean_text(text)
+            sentences = re.split(r"(?<=[.!?])\s+", cleaned_text)
             processed = []
-            for sentence_idx, sentence in enumerate(sentences):
-                old_len = len(sentence)
-                new_sentence = re.sub(r"[^A-Za-z !\$%&'*+,-./0123456789<>?_]", "", sentence)
-                new_sentence = re.sub(r"[<>/_+]", "", new_sentence)
-                new_sentence = re.sub(r"\.\.[^\.]", ".", new_sentence)
-                new_sentence = re.sub(r"\s+", " ", new_sentence)
-                new_len = len(new_sentence)
-                if old_len != new_len:
-                    print(f"Warning: unsupported characters found in sentence: {sentence}\n\tThese characters have been removed.")
-                new_sentence = unidecode(new_sentence.strip())
+            for sentence in sentences:
                 processed.append({
-                    "text": new_sentence,
+                    "text": sentence,
                     "text_idx": text_idx,
                 })
 
