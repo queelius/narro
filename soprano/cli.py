@@ -21,6 +21,8 @@ def main():
                         help='Backend to use for inference')
     parser.add_argument('--cache-size', '-c', type=int, default=100,
                         help='Cache size in MB (for lmdeploy backend)')
+    parser.add_argument('--decoder-batch-size', '-bs', type=int, default=1,
+                        help='Batch size when decoding audio')
     parser.add_argument('--streaming', '-s', action='store_true',
                         help='Enable streaming playback to speakers')
     
@@ -31,6 +33,7 @@ def main():
         backend=args.backend,
         device=args.device,
         cache_size_mb=args.cache_size,
+        decoder_batch_size=args.decoder_batch_size,
         model_path=args.model_path
     )
     

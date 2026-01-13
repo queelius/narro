@@ -13,6 +13,8 @@ from soprano.utils.streaming import play_stream
 
 
 parser = argparse.ArgumentParser(description='Soprano Text-to-Speech Gradio WebUI')
+parser.add_argument('--model-path', '-m',
+                    help='Path to local model directory (optional)')
 parser.add_argument('--device', '-d', default='auto',
                     choices=['auto', 'cuda', 'cpu', 'mps'],
                     help='Device to use for inference')
@@ -32,6 +34,7 @@ model = SopranoTTS(
     device=args.device,
     cache_size_mb=args.cache_size,
     decoder_batch_size=args.decoder_batch_size,
+    model_path=args.model_path
 )
 device = model.device
 backend = model.backend
