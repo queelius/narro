@@ -1,5 +1,5 @@
 import torch
-from torch import nn
+from torch import nn, Tensor
 
 class ISTFT(nn.Module):
     """
@@ -26,6 +26,7 @@ class ISTFT(nn.Module):
         self.win_length = win_length
         window = torch.hann_window(win_length)
         self.register_buffer("window", window)
+        self.window: Tensor  # Type hint for mypy
 
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
         """
@@ -48,7 +49,8 @@ class ISTFT(nn.Module):
         else:
             raise ValueError("Padding must be 'center' or 'same'.")
 
-        assert spec.dim() == 3, "Expected a 3D tensor as input"
+        if spec.dim() != 3:
+            raise ValueError("Expected a 3D tensor as input")
         B, N, T = spec.shape
 
         # Inverse FFT
@@ -68,7 +70,8 @@ class ISTFT(nn.Module):
         ).squeeze()[pad:-pad]
 
         # Normalize
-        assert (window_envelope > 1e-11).all()
+        if not (window_envelope > 1e-11).all():
+            raise ValueError("Window envelope contains values too close to zero")
         y = y / window_envelope
 
         return y

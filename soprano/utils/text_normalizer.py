@@ -106,11 +106,15 @@ def _expand_num_prefix(m):
 
 def _expand_num_suffix(m):
     match = m.group(0)
-    if match[-1].upper() == 'K': return f"{match[:-1]} thousand"
-    elif match[-1].upper() == 'M': return f"{match[:-1]} million"
-    elif match[-1].upper() == 'B': return f"{match[:-1]} billion"
-    elif match[-1].upper() == 'T': return f"{match[:-1]} trillion"
-    return match # unexpected format
+    if match[-1].upper() == 'K':
+        return f"{match[:-1]} thousand"
+    elif match[-1].upper() == 'M':
+        return f"{match[:-1]} million"
+    elif match[-1].upper() == 'B':
+        return f"{match[:-1]} billion"
+    elif match[-1].upper() == 'T':
+        return f"{match[:-1]} trillion"
+    return match  # unexpected format
 
 def _split_alphanumeric(m):
     match = m.group(1)
@@ -127,7 +131,8 @@ def _expand_date(m):
 def _expand_phone_number(m):
     match = m.group(1)
     match = re.sub(r'\D', '', match)
-    assert len(match) == 10
+    if len(match) != 10:
+        return m.group(0)  # Return original if not a valid 10-digit phone number
     match = f"{' '.join(list(match[:3]))}, {' '.join(list(match[3:6]))}, {' '.join(list(match[6:]))}"
     return match
     
@@ -139,7 +144,8 @@ def _expand_time(m):
         if minutes == '00':
             if int(hours) == 0:
                 return '0'
-            elif int(hours) > 12: return f"{hours} minutes"
+            elif int(hours) > 12:
+                return f"{hours} minutes"
             return f"{hours} o'clock"
         elif minutes.startswith('0'):
             minutes = f'oh {minutes[1:]}'
@@ -328,7 +334,8 @@ def normalize_newlines(text):
     text = text.split('\n')
     for i in range(len(text)):
         text[i] = text[i].strip()
-        if not text[i]: continue
+        if not text[i]:
+            continue
         if text[i][-1] not in '.!?':
             text[i] = f"{text[i]}."
     return ' '.join(text)

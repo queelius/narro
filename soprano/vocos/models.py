@@ -48,7 +48,8 @@ class VocosBackbone(nn.Module):
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv1d, nn.Linear)):
             nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None: nn.init.constant_(m.bias, 0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embed(x) # (B, C, L)

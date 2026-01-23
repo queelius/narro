@@ -4,41 +4,40 @@ Gradio Web Interface for Soprano TTS
 """
 
 import argparse
+import logging
 import socket
 import time
+
 import gradio as gr
 import numpy as np
+
 from soprano import SopranoTTS
 from soprano.utils.streaming import play_stream
 
+logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser(description='Soprano Text-to-Speech Gradio WebUI')
 parser.add_argument('--model-path', '-m',
                     help='Path to local model directory (optional)')
-parser.add_argument('--device', '-d', default='auto',
-                    choices=['auto', 'cuda', 'cpu', 'mps'],
-                    help='Device to use for inference')
-parser.add_argument('--backend', '-b', default='auto',
-                    choices=['auto', 'transformers', 'lmdeploy'],
-                    help='Backend to use for inference')
-parser.add_argument('--cache-size', '-c', type=int, default=100,
-                    help='Cache size in MB (for lmdeploy backend)')
+parser.add_argument('--no-compile', action='store_true',
+                    help='Disable torch.compile optimization')
+parser.add_argument('--quantize', '-q', action='store_true',
+                    help='Enable INT8 quantization for faster CPU inference')
 parser.add_argument('--decoder-batch-size', '-bs', type=int, default=1,
                     help='Batch size when decoding audio')
 args = parser.parse_args()
 
+logging.basicConfig(level=logging.INFO)
+
 # Initialize model
-print("Loading Soprano TTS model...")
+logger.info("Loading Soprano TTS model...")
 model = SopranoTTS(
-    backend=args.backend,
-    device=args.device,
-    cache_size_mb=args.cache_size,
-    decoder_batch_size=args.decoder_batch_size,
-    model_path=args.model_path
+    model_path=args.model_path,
+    compile=not args.no_compile,
+    quantize=args.quantize,
+    decoder_batch_size=args.decoder_batch_size
 )
-device = model.device
-backend = model.backend
-print("Model loaded successfully!")
+logger.info("Model loaded successfully!")
 
 SAMPLE_RATE = 32000
 
@@ -85,7 +84,7 @@ def generate_speech(
 
         gen_time = time.perf_counter() - start_time
 
-        audio_np = audio.cpu().numpy()
+        audio_np = audio.numpy()
         audio_int16 = (audio_np * 32767).astype(np.int16)
 
         audio_seconds = len(audio_np) / SAMPLE_RATE
@@ -107,17 +106,17 @@ def generate_speech(
 # Create Gradio interface
 with gr.Blocks(title="Soprano TTS") as demo:
     gr.Markdown(
-        f"""# 🗣️ Soprano TTS
+        """# 🗣️ Soprano TTS
 
 <div align="center">
 <img width="300" height="300" alt="soprano-github" src="https://github.com/user-attachments/assets/4d612eac-23b8-44e6-8c59-d7ac14ebafd1" />
 </div>
 
-**Device:** {device.upper()} | **Backend:** {backend}
+**Device:** CPU
 
-**Model Weights:** https://huggingface.co/ekwek/Soprano-1.1-80M  
-**Model Demo:** https://huggingface.co/spaces/ekwek/Soprano-TTS  
-**GitHub:** https://github.com/ekwek1/soprano  
+**Model Weights:** https://huggingface.co/ekwek/Soprano-1.1-80M
+**Model Demo:** https://huggingface.co/spaces/ekwek/Soprano-TTS
+**GitHub:** https://github.com/ekwek1/soprano
 """
     )
     with gr.Row():
@@ -193,7 +192,7 @@ with gr.Blocks(title="Soprano TTS") as demo:
         outputs=[audio_output, status_output],
     )
     gr.Markdown(
-        f"""
+        """
 ### Usage tips:
 
 - When quoting, use double quotes instead of single quotes.
@@ -218,9 +217,8 @@ def find_free_port(start_port=7860, max_tries=100):
     raise OSError("Could not find a free port")
 
 def main():
-    # Start Gradio interface
     port = find_free_port(7860)
-    print(f"Starting Gradio interface on port {port}")
+    logger.info("Starting Gradio interface on port %d", port)
     demo.launch(
         server_name="127.0.0.1",
         server_port=port,

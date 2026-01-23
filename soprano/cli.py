@@ -3,8 +3,13 @@
 Soprano TTS Command Line Interface
 """
 import argparse
+import logging
+
 from soprano import SopranoTTS
 from soprano.utils.streaming import play_stream
+
+logger = logging.getLogger(__name__)
+
 
 def main():
     parser = argparse.ArgumentParser(description='Soprano Text-to-Speech CLI')
@@ -13,37 +18,34 @@ def main():
                         help='Output audio file path (non-streaming only)')
     parser.add_argument('--model-path', '-m',
                         help='Path to local model directory (optional)')
-    parser.add_argument('--device', '-d', default='auto',
-                        choices=['auto', 'cuda', 'cpu', 'mps'],
-                        help='Device to use for inference')
-    parser.add_argument('--backend', '-b', default='auto',
-                        choices=['auto', 'transformers', 'lmdeploy'],
-                        help='Backend to use for inference')
-    parser.add_argument('--cache-size', '-c', type=int, default=100,
-                        help='Cache size in MB (for lmdeploy backend)')
+    parser.add_argument('--no-compile', action='store_true',
+                        help='Disable torch.compile optimization')
+    parser.add_argument('--quantize', '-q', action='store_true',
+                        help='Enable INT8 quantization for faster CPU inference')
     parser.add_argument('--decoder-batch-size', '-bs', type=int, default=1,
                         help='Batch size when decoding audio')
     parser.add_argument('--streaming', '-s', action='store_true',
                         help='Enable streaming playback to speakers')
-    
+
     args = parser.parse_args()
-    
-    # Initialize TTS
+
+    logging.basicConfig(level=logging.INFO)
+
     tts = SopranoTTS(
-        backend=args.backend,
-        device=args.device,
-        cache_size_mb=args.cache_size,
-        decoder_batch_size=args.decoder_batch_size,
-        model_path=args.model_path
+        model_path=args.model_path,
+        compile=not args.no_compile,
+        quantize=args.quantize,
+        decoder_batch_size=args.decoder_batch_size
     )
-    
-    print(f"Generating speech for: '{args.text}'")
+
+    logger.info("Generating speech for: '%s'", args.text)
     if args.streaming:
         stream = tts.infer_stream(args.text, chunk_size=1)
         play_stream(stream)
     else:
         tts.infer(args.text, out_path=args.output)
-        print(f"Audio saved to: {args.output}")
+        logger.info("Audio saved to: %s", args.output)
+
 
 if __name__ == "__main__":
     main()

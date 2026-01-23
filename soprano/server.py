@@ -1,7 +1,4 @@
-import base64
 import io
-import json
-from typing import Generator
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -12,7 +9,7 @@ from torch import Tensor
 from soprano.tts import SopranoTTS
 
 # Load model at startup
-tts = SopranoTTS(cache_size_mb = 100)
+tts = SopranoTTS()
 
 app = FastAPI(title="Soprano TTS API")
 
@@ -20,11 +17,10 @@ def _tensor_to_wav_bytes(tensor: Tensor) -> bytes:
     """
     Convert a 1D fp32 torch tensor to a WAV byte stream.
     """
-    # convert to int16
     audio_int16 = (np.clip(tensor.numpy(), -1.0, 1.0) * 32767).astype(np.int16)
 
     wav_io = io.BytesIO()
-    write(wav_io, 32000, audio_int16) # 32kHz sample rate
+    write(wav_io, 32000, audio_int16)
     wav_io.seek(0)
     return wav_io.read()
 

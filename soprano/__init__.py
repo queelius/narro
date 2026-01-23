@@ -1,1 +1,1 @@
-from .tts import SopranoTTS
+from .tts import SopranoTTS as SopranoTTS
