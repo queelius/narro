@@ -174,15 +174,16 @@ class SopranoTTS:
             audio_concat[sentence[1]].append(None)
 
         for idx in range(0, len(hidden_states), self.decoder_batch_size):
-            batch_hidden_states = []
             lengths = [x.size(0) for x in hidden_states[idx:idx+self.decoder_batch_size]]
             N = len(lengths)
+            max_len = lengths[0]  # Already sorted descending
+
+            # Pre-allocate with zeros (single allocation, left-padded)
+            batch_hidden_states = torch.zeros((N, HIDDEN_DIM, max_len))
             for i in range(N):
-                batch_hidden_states.append(torch.cat([
-                    torch.zeros((1, HIDDEN_DIM, lengths[0]-lengths[i])),
-                    hidden_states[idx+i].unsqueeze(0).transpose(1, 2),
-                ], dim=2))
-            batch_hidden_states = torch.cat(batch_hidden_states)
+                seq_len = lengths[i]
+                batch_hidden_states[i, :, max_len-seq_len:] = hidden_states[idx+i].T
+
             with torch.no_grad():
                 audio = self.decoder(batch_hidden_states)
 

@@ -27,6 +27,15 @@ class ISTFT(nn.Module):
         window = torch.hann_window(win_length)
         self.register_buffer("window", window)
         self.window: Tensor  # Type hint for mypy
+        self._window_sq: Tensor | None = None  # Lazy-computed for checkpoint compatibility
+        self._envelope_cache: dict[int, Tensor] = {}  # Cache window envelope by T
+
+    @property
+    def window_sq(self) -> Tensor:
+        """Lazily compute and cache window squared."""
+        if self._window_sq is None:
+            self._window_sq = self.window.square()
+        return self._window_sq
 
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
         """
@@ -63,15 +72,26 @@ class ISTFT(nn.Module):
             ifft, output_size=(1, output_size), kernel_size=(1, self.win_length), stride=(1, self.hop_length),
         )[:, 0, 0, pad:-pad]
 
-        # Window envelope
-        window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
-        window_envelope = torch.nn.functional.fold(
-            window_sq, output_size=(1, output_size), kernel_size=(1, self.win_length), stride=(1, self.hop_length),
-        ).squeeze()[pad:-pad]
+        # Window envelope (cached by T for efficiency)
+        window_envelope = self._get_window_envelope(T, output_size, pad)
 
         # Normalize
-        if not (window_envelope > 1e-11).all():
-            raise ValueError("Window envelope contains values too close to zero")
         y = y / window_envelope
 
         return y
+
+    def _get_window_envelope(self, T: int, output_size: int, pad: int) -> Tensor:
+        """Get cached window envelope for given sequence length T."""
+        if T not in self._envelope_cache:
+            window_sq = self.window_sq.expand(1, T, -1).transpose(1, 2)
+            envelope = torch.nn.functional.fold(
+                window_sq,
+                output_size=(1, output_size),
+                kernel_size=(1, self.win_length),
+                stride=(1, self.hop_length),
+            ).squeeze()[pad:-pad]
+            # Validate envelope (only on first computation)
+            if not (envelope > 1e-11).all():
+                raise ValueError("Window envelope contains values too close to zero")
+            self._envelope_cache[T] = envelope
+        return self._envelope_cache[T]
