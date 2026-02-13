@@ -112,9 +112,8 @@ def _expand_num_suffix(m):
         return f"{match[:-1]} million"
     elif match[-1].upper() == 'B':
         return f"{match[:-1]} billion"
-    elif match[-1].upper() == 'T':
+    else:
         return f"{match[:-1]} trillion"
-    return match  # unexpected format
 
 def _split_alphanumeric(m):
     match = m.group(1)
@@ -379,74 +378,3 @@ def clean_text(text):
     text = collapse_triple_letters(text)
     return text
 
-
-if __name__ == '__main__':
-    print(clean_text('1,2,3,456,176'))
-    print(clean_text('123,456,789'))
-    print(clean_text('123,456,789th'))
-    print(clean_text('123-456-7890'))
-    print(clean_text('111-111-1111'))
-    print(clean_text('(111) 111-1111'))
-    print(clean_text('A(111) 111-1111'))
-    print(clean_text('A (111) 111-1111'))
-    print(clean_text('$2.47'))
-    print(clean_text('$247'))
-    print(clean_text('$0.27'))
-    print(clean_text('$1.00'))
-    print(clean_text('£20'))
-    for i in range(1990, 2030):
-        print(clean_text(str(i)))
-    print(clean_text('2656'))
-    print(clean_text('1024'))
-    print(clean_text('2.47023'))
-    print(clean_text('20.47023'))
-    print(clean_text('1.17.1.1'))
-    print(clean_text('111.111.1111'))
-    print(clean_text('1/1/2025'))
-    print(clean_text('1-1-2025'))
-    print(clean_text('1-1-25'))
-    print(clean_text('A 1/1/11 A'))
-    print(clean_text('A 1/1 A'))
-    print(clean_text('1/1'))
-    print(clean_text('1/10'))
-    print(clean_text('1/1/10'))
-    print(clean_text('11/1/1/10'))
-
-    print(clean_text('0:00'))
-    print(clean_text('12:00'))
-    print(clean_text('13:00'))
-    print(clean_text('8:00'))
-    print(clean_text('8:05'))
-    print(clean_text('8:15'))
-    print(clean_text('0:00:00'))
-    print(clean_text('00:01:10'))
-    print(clean_text('00:10:01'))
-    print(clean_text('01:01:01'))
-    print(clean_text('00:01:00'))
-    print(clean_text('01:00:00'))
-
-    print(clean_text('-1 + 2 * 3 - 4 / 5'))
-    print(clean_text('-1+2*3-5/4/25'))
-
-    print(clean_text('100x1'))
-    print(clean_text('100k'))
-    print(clean_text('100m'))
-    print(clean_text('100b'))
-    print(clean_text('100t'))
-    
-    print(clean_text('#1'))
-    
-    print(clean_text('12:00'))
-    print(clean_text('11:59'))
-    print(clean_text('01:00'))
-    print(clean_text('0100'))
-
-    print(clean_text('1st 2nd 3rd 4th'))
-    print(clean_text('1K 1M 1B 1T 1K1M1B1T'))
-    print(clean_text('and/or'))
-
-    print(clean_text('LMDeploy'))
-    print(clean_text('LMDeployDecoderModel'))
-    print(clean_text('Test'))
-    print(clean_text('UPPERCASE'))
-    print(clean_text('TPUs'))

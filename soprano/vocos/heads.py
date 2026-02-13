@@ -18,7 +18,7 @@ class ISTFTHead(nn.Module):
     def __init__(self, dim: int, n_fft: int, hop_length: int, padding: str = "center"):
         super().__init__()
         out_dim = n_fft + 2
-        self.out = torch.nn.Linear(dim, out_dim)
+        self.out = torch.nn.Conv1d(dim, out_dim, kernel_size=1)
         self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding)
 
     @torch.compiler.disable
@@ -27,24 +27,15 @@ class ISTFTHead(nn.Module):
         Forward pass of the ISTFTHead module.
 
         Args:
-            x (Tensor): Input tensor of shape (B, L, H), where B is the batch size,
-                        L is the sequence length, and H denotes the model dimension.
+            x (Tensor): Input tensor of shape (B, C, T), where B is the batch size,
+                        C is the model dimension, and T is the sequence length.
 
         Returns:
             Tensor: Reconstructed time-domain audio signal of shape (B, T), where T is the length of the output signal.
         """
-        x = self.out(x.transpose(1,2)).transpose(1, 2)
+        x = self.out(x)
         mag, p = x.chunk(2, dim=1)
-        mag = torch.exp(mag)
-        mag = torch.clip(mag, max=1e2)  # safeguard to prevent excessively large magnitudes
-        # wrapping happens here. These two lines produce real and imaginary value
-        x = torch.cos(p)
-        y = torch.sin(p)
-        # recalculating phase here does not produce anything new
-        # only costs time
-        # phase = torch.atan2(y, x)
-        # S = mag * torch.exp(phase * 1j)
-        # better directly produce the complex value 
-        S = mag * (x + 1j * y)
+        mag = torch.exp(mag).clip(max=1e2)
+        S = mag * (torch.cos(p) + 1j * torch.sin(p))
         audio = self.istft(S)
         return audio

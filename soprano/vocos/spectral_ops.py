@@ -49,14 +49,11 @@ class ISTFT(nn.Module):
             Tensor: Reconstructed time-domain signal of shape (B, L), where L is the length of the output signal.
         """
         if self.padding == "center":
-            spec[:,0] = 0 # fixes some strange bug where first/last freqs don't matter when bs<16 which causes exploding gradients
+            spec[:,0] = 0
             spec[:,-1] = 0
-            # Fallback to pytorch native implementation
             return torch.istft(spec, self.n_fft, self.hop_length, self.win_length, self.window, center=True)
-        elif self.padding == "same":
-            pad = (self.win_length - self.hop_length) // 2
-        else:
-            raise ValueError("Padding must be 'center' or 'same'.")
+
+        pad = (self.win_length - self.hop_length) // 2
 
         if spec.dim() != 3:
             raise ValueError("Expected a 3D tensor as input")

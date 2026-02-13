@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from .modules import ConvNeXtBlock
+from .modules import ChannelsFirstLayerNorm, ConvNeXtBlock
 
 class VocosBackbone(nn.Module):
     """
@@ -30,7 +30,7 @@ class VocosBackbone(nn.Module):
     ):
         super().__init__()
         self.embed = nn.Conv1d(input_channels, dim, kernel_size=input_kernel_size, padding=input_kernel_size//2, padding_mode=pad)
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.norm = ChannelsFirstLayerNorm(dim, eps=1e-6)
         self.convnext = nn.ModuleList(
             [
                 ConvNeXtBlock(
@@ -42,7 +42,7 @@ class VocosBackbone(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.final_layer_norm = nn.LayerNorm(dim, eps=1e-6)
+        self.final_layer_norm = ChannelsFirstLayerNorm(dim, eps=1e-6)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -52,11 +52,9 @@ class VocosBackbone(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed(x) # (B, C, L)
-        x = self.norm(x.transpose(1, 2))
-        x = x.transpose(1, 2)
+        x = self.embed(x)  # (B, C, L)
+        x = self.norm(x)
         for conv_block in self.convnext:
             x = conv_block(x)
-        x = self.final_layer_norm(x.transpose(1, 2))
-        x = x.transpose(1, 2)
+        x = self.final_layer_norm(x)
         return x
