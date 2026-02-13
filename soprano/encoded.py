@@ -94,6 +94,24 @@ class EncodedSpeech:
         return max(s.text_index for s in self.sentences) + 1
 
 
+def _tamper_format_version_for_test(path: str, version: int) -> None:
+    """Test helper: overwrite format_version in a saved .soprano file."""
+    path = _normalize_path(path)
+    data = dict(np.load(path, allow_pickle=False))
+    meta = json.loads(data['meta'].tobytes().decode('utf-8'))
+    meta['format_version'] = version
+    meta_json = json.dumps(meta).encode('utf-8')
+    data['meta'] = np.frombuffer(meta_json, dtype=np.uint8)
+    np.savez_compressed(path, **data)
+
+
+def _normalize_path(path: str) -> str:
+    """Ensure path ends with .npz (numpy's compressed archive format)."""
+    if not path.endswith('.npz'):
+        path = path + '.npz'
+    return path
+
+
 def save(encoded: EncodedSpeech, path: str, compress: bool = True) -> None:
     """Save EncodedSpeech to a .soprano file (npz container).
 
@@ -103,9 +121,10 @@ def save(encoded: EncodedSpeech, path: str, compress: bool = True) -> None:
 
     Args:
         encoded: The encoded speech to save.
-        path: Output file path.
+        path: Output file path (auto-appends .npz if needed).
         compress: Use np.savez_compressed (default True).
     """
+    path = _normalize_path(path)
     arrays = {}
     sentence_meta = []
 
@@ -141,6 +160,8 @@ def save(encoded: EncodedSpeech, path: str, compress: bool = True) -> None:
     meta_json = json.dumps(meta).encode('utf-8')
     arrays['meta'] = np.frombuffer(meta_json, dtype=np.uint8)
 
+    # np.savez_compressed appends .npz if not present, but we already
+    # normalized the path so the file lands where expected.
     save_fn = np.savez_compressed if compress else np.savez
     save_fn(path, **arrays)
 
@@ -152,17 +173,29 @@ def load(path: str) -> EncodedSpeech:
     """Load EncodedSpeech from a .soprano file.
 
     Converts float16 wire format back to float32 for computation.
-    Uses allow_pickle=False for safe deserialization.
+    Uses allow_pickle=False for safe deserialization — only numpy arrays
+    and JSON metadata are read.
 
     Args:
-        path: Path to the .soprano file.
+        path: Path to the .soprano file (auto-appends .npz if needed).
 
     Returns:
         EncodedSpeech with all sentences restored.
+
+    Raises:
+        ValueError: If the file's format version is newer than supported.
     """
+    path = _normalize_path(path)
     data = np.load(path, allow_pickle=False)
     meta_bytes = data['meta'].tobytes()
     meta = json.loads(meta_bytes.decode('utf-8'))
+
+    file_version = meta.get('format_version', 1)
+    if file_version > FORMAT_VERSION:
+        raise ValueError(
+            f"File format version {file_version} is newer than "
+            f"supported version {FORMAT_VERSION}. Please upgrade soprano."
+        )
 
     sentences = []
     for i in range(meta['num_sentences']):

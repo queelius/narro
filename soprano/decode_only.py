@@ -13,6 +13,7 @@ Usage:
 """
 
 import logging
+import os
 
 import numpy as np
 import torch
@@ -37,7 +38,6 @@ def load_decoder(model_path=None, compile=False):
     Returns:
         SopranoDecoder ready for inference.
     """
-    import os
     decoder = SopranoDecoder()
     if model_path:
         decoder_path = os.path.join(model_path, 'decoder.pth')
@@ -72,17 +72,25 @@ def decode(encoded, decoder=None, decoder_batch_size=4):
     if decoder is None:
         decoder = load_decoder()
 
+    num_texts = encoded.num_texts
+    if num_texts == 0:
+        return []
+
+    # Filter out 0-token sentences — they produce no audio and would crash
+    # the decoder (interpolate to negative size).
     items = []
     for s in encoded.sentences:
+        if s.hidden_states.shape[0] == 0:
+            continue
         hs = torch.from_numpy(s.hidden_states)
         items.append((hs, s.text_index, s.sentence_index))
 
+    if not items:
+        return [torch.zeros(0) for _ in range(num_texts)]
+
     items.sort(key=lambda x: -x[0].size(0))
 
-    num_texts = encoded.num_texts
-    audio_concat = [[] for _ in range(num_texts)]
-    for s in encoded.sentences:
-        audio_concat[s.text_index].append(None)
+    audio_pieces = {}
 
     hidden_states = [x[0] for x in items]
     meta = [(x[1], x[2]) for x in items]
@@ -104,9 +112,30 @@ def decode(encoded, decoder=None, decoder_batch_size=4):
         for i in range(N):
             text_id, sentence_id = meta[idx+i]
             trim = lengths[i] * TOKEN_SIZE - TOKEN_SIZE
-            audio_concat[text_id][sentence_id] = audio[i].squeeze()[-trim:] if trim > 0 else audio[i].squeeze()[:0]
+            audio_pieces[(text_id, sentence_id)] = audio[i].squeeze()[-trim:] if trim > 0 else audio[i].squeeze()[:0]
 
-    return [torch.cat(x) for x in audio_concat]
+    audio_concat = []
+    for text_id in range(num_texts):
+        pieces = sorted(
+            ((sid, a) for (tid, sid), a in audio_pieces.items() if tid == text_id),
+            key=lambda x: x[0],
+        )
+        if pieces:
+            audio_concat.append(torch.cat([a for _, a in pieces]))
+        else:
+            audio_concat.append(torch.zeros(0))
+    return audio_concat
+
+
+def write_wav(audio_tensor, out_path):
+    """Convert an audio tensor to PCM int16 and write a WAV file.
+
+    Args:
+        audio_tensor: 1D float32 tensor in [-1, 1] range.
+        out_path: Output WAV file path.
+    """
+    pcm = (np.clip(audio_tensor.numpy(), -1.0, 1.0) * INT16_MAX).astype(np.int16)
+    wavfile.write(out_path, SAMPLE_RATE, pcm)
 
 
 def decode_to_wav(encoded, out_path, decoder=None, decoder_batch_size=4):
@@ -121,7 +150,6 @@ def decode_to_wav(encoded, out_path, decoder=None, decoder_batch_size=4):
         decoder_batch_size: Batch size for decoder.
     """
     audio_list = decode(encoded, decoder=decoder, decoder_batch_size=decoder_batch_size)
-    audio = torch.cat(audio_list)
-    pcm = (np.clip(audio.numpy(), -1.0, 1.0) * INT16_MAX).astype(np.int16)
-    wavfile.write(out_path, SAMPLE_RATE, pcm)
-    logger.info("Wrote %s (%.1f seconds)", out_path, len(pcm) / SAMPLE_RATE)
+    write_wav(torch.cat(audio_list), out_path)
+    logger.info("Wrote %s (%.1f seconds)", out_path,
+                sum(a.shape[0] for a in audio_list) / SAMPLE_RATE)

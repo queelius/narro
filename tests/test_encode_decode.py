@@ -293,6 +293,106 @@ class TestDecode:
         expected = (15 - 1) * TOKEN_SIZE + (10 - 1) * TOKEN_SIZE
         assert audio[0].shape[0] == expected
 
+    def test_decode_zero_token_sentence_skipped(self):
+        """A 0-token sentence should be skipped — never sent to the decoder."""
+        tts = self._make_tts_with_mocks()
+        tts.decoder_batch_size = 10
+
+        sentences = [
+            SentenceEncoding(
+                hidden_states=np.zeros((0, HIDDEN_DIM), dtype=np.float32),
+                token_ids=np.zeros(0, dtype=np.int32),
+                token_entropy=np.zeros(0, dtype=np.float32),
+                finish_reason='stop', text="empty", text_index=0, sentence_index=0,
+            ),
+            SentenceEncoding(
+                hidden_states=np.random.randn(20, HIDDEN_DIM).astype(np.float32),
+                token_ids=np.zeros(20, dtype=np.int32),
+                token_entropy=np.zeros(20, dtype=np.float32),
+                finish_reason='stop', text="real", text_index=0, sentence_index=1,
+            ),
+        ]
+        encoded = EncodedSpeech(sentences=sentences, model_id='test/model')
+
+        def decoder_side_effect(batch):
+            B, C, T = batch.shape
+            # Real decoder would crash if T=0 (interpolate to size -3)
+            assert T > 0, "Decoder should never receive 0-length hidden states"
+            return torch.randn(B, T * TOKEN_SIZE)
+
+        tts.decoder.side_effect = decoder_side_effect
+
+        audio = tts.decode(encoded)
+        assert len(audio) == 1
+        # Only the 20-token sentence contributes audio
+        assert audio[0].shape[0] == (20 - 1) * TOKEN_SIZE
+
+    def test_decode_all_zero_token_sentences(self):
+        """All 0-token sentences should produce empty audio without calling decoder."""
+        tts = self._make_tts_with_mocks()
+        tts.decoder_batch_size = 10
+
+        sentences = [
+            SentenceEncoding(
+                hidden_states=np.zeros((0, HIDDEN_DIM), dtype=np.float32),
+                token_ids=np.zeros(0, dtype=np.int32),
+                token_entropy=np.zeros(0, dtype=np.float32),
+                finish_reason='stop', text="empty", text_index=0, sentence_index=0,
+            ),
+        ]
+        encoded = EncodedSpeech(sentences=sentences, model_id='test/model')
+
+        def decoder_side_effect(batch):
+            B, C, T = batch.shape
+            assert T > 0, "Decoder should never receive 0-length hidden states"
+            return torch.randn(B, T * TOKEN_SIZE)
+
+        tts.decoder.side_effect = decoder_side_effect
+
+        audio = tts.decode(encoded)
+        assert len(audio) == 1
+        assert audio[0].shape[0] == 0  # empty audio
+        tts.decoder.assert_not_called()
+
+    def test_decode_single_token_sentence(self):
+        """A 1-token sentence produces 0 audio samples (trim = 1*TOKEN_SIZE - TOKEN_SIZE = 0)."""
+        tts = self._make_tts_with_mocks()
+        tts.decoder_batch_size = 10
+
+        sentences = [
+            SentenceEncoding(
+                hidden_states=np.random.randn(1, HIDDEN_DIM).astype(np.float32),
+                token_ids=np.zeros(1, dtype=np.int32),
+                token_entropy=np.zeros(1, dtype=np.float32),
+                finish_reason='stop', text="one token", text_index=0, sentence_index=0,
+            ),
+            SentenceEncoding(
+                hidden_states=np.random.randn(10, HIDDEN_DIM).astype(np.float32),
+                token_ids=np.zeros(10, dtype=np.int32),
+                token_entropy=np.zeros(10, dtype=np.float32),
+                finish_reason='stop', text="real", text_index=0, sentence_index=1,
+            ),
+        ]
+        encoded = EncodedSpeech(sentences=sentences, model_id='test/model')
+
+        def decoder_side_effect(batch):
+            B, C, T = batch.shape
+            return torch.randn(B, T * TOKEN_SIZE)
+
+        tts.decoder.side_effect = decoder_side_effect
+
+        audio = tts.decode(encoded)
+        assert len(audio) == 1
+        # 1-token -> trim=0 -> 0 samples; 10-token -> 9*TOKEN_SIZE
+        assert audio[0].shape[0] == (10 - 1) * TOKEN_SIZE
+
+    def test_decode_empty_encoded_speech(self):
+        """Decoding an EncodedSpeech with no sentences should return empty list."""
+        tts = self._make_tts_with_mocks()
+        encoded = EncodedSpeech(sentences=[], model_id='test/model')
+        audio = tts.decode(encoded)
+        assert audio == []
+
 
 # ---------------------------------------------------------------------------
 # Roundtrip tests
@@ -350,7 +450,7 @@ class TestRoundtrip:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test.soprano")
             save(encoded, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             def decoder_side_effect(batch):
                 B, C, T = batch.shape
@@ -586,7 +686,7 @@ class TestCLISubcommands:
             output='/tmp/test.soprano',
             model_path=None,
             no_compile=True,
-            no_quantize=True,
+            quantize=False,
             num_threads=None,
             include_attention=False,
         )
@@ -615,7 +715,7 @@ class TestCLISubcommands:
             output='/tmp/test.wav',
             model_path=None,
             no_compile=True,
-            no_quantize=True,
+            quantize=False,
             num_threads=None,
             decoder_batch_size=4,
         )

@@ -12,8 +12,8 @@ def _add_common_args(parser):
                         help='Path to local model directory (optional)')
     parser.add_argument('--no-compile', action='store_true',
                         help='Disable torch.compile optimization')
-    parser.add_argument('--no-quantize', action='store_true',
-                        help='Disable INT8 quantization')
+    parser.add_argument('--quantize', action='store_true',
+                        help='Enable INT8 quantization (faster but lower quality)')
     parser.add_argument('--num-threads', '-t', type=int,
                         help='Number of CPU threads for inference')
 
@@ -24,7 +24,7 @@ def cmd_speak(args):
     tts = SopranoTTS(
         model_path=args.model_path,
         compile=not args.no_compile,
-        quantize=not args.no_quantize,
+        quantize=args.quantize,
         decoder_batch_size=args.decoder_batch_size,
         num_threads=args.num_threads,
     )
@@ -40,7 +40,7 @@ def cmd_encode(args):
     tts = SopranoTTS(
         model_path=args.model_path,
         compile=not args.no_compile,
-        quantize=not args.no_quantize,
+        quantize=args.quantize,
         num_threads=args.num_threads,
     )
     logger.info("Encoding: '%s'", args.text)
@@ -62,7 +62,24 @@ def cmd_decode(args):
     logger.info("Audio saved to: %s", args.output)
 
 
+def _add_speak_args(parser):
+    """Add speak-specific args (text, output, batch size)."""
+    parser.add_argument('text', help='Text to synthesize')
+    parser.add_argument('--output', '-o', default='output.wav',
+                        help='Output audio file path')
+    parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,
+                        help='Batch size when decoding audio')
+
+
 def main():
+    import sys
+
+    # Default to 'speak' when first arg isn't a known subcommand.
+    # This lets `soprano "Hello world"` work as shorthand for `soprano speak "Hello world"`.
+    _subcommands = {'speak', 'encode', 'decode'}
+    if len(sys.argv) > 1 and sys.argv[1] not in _subcommands and sys.argv[1] not in ('-h', '--help'):
+        sys.argv.insert(1, 'speak')
+
     parser = argparse.ArgumentParser(
         description='Soprano Text-to-Speech CLI',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -74,8 +91,11 @@ def main():
 
     subparsers = parser.add_subparsers(dest='command')
 
-    # --- speak (default, no subcommand) ---
-    # We handle this via the fallback when args.command is None
+    # --- speak ---
+    speak_parser = subparsers.add_parser('speak', help='Synthesize speech (default)')
+    _add_speak_args(speak_parser)
+    _add_common_args(speak_parser)
+    speak_parser.set_defaults(func=cmd_speak)
 
     # --- encode ---
     encode_parser = subparsers.add_parser('encode', help='Encode text to .soprano file')
@@ -94,16 +114,11 @@ def main():
                                help='Output WAV file path')
     decode_parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,
                                help='Batch size when decoding audio')
-    _add_common_args(decode_parser)
+    decode_parser.add_argument('--model-path', '-m',
+                               help='Path to local model directory (optional)')
+    decode_parser.add_argument('--no-compile', action='store_true',
+                               help='Disable torch.compile optimization')
     decode_parser.set_defaults(func=cmd_decode)
-
-    # --- default (speak) args on the main parser ---
-    parser.add_argument('text', nargs='?', help='Text to synthesize')
-    parser.add_argument('--output', '-o', default='output.wav',
-                        help='Output audio file path')
-    parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,
-                        help='Batch size when decoding audio')
-    _add_common_args(parser)
 
     args = parser.parse_args()
 
@@ -111,8 +126,6 @@ def main():
 
     if args.command is not None:
         args.func(args)
-    elif args.text:
-        cmd_speak(args)
     else:
         parser.print_help()
 

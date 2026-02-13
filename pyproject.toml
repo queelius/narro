@@ -30,5 +30,8 @@ license = {file = "LICENSE"}
 Homepage = "https://github.com/ekwek1/soprano"
 Issues = "https://github.com/ekwek1/soprano/issues"
 
+[tool.setuptools.packages.find]
+include = ["soprano*"]
+
 [project.scripts]
 soprano = "soprano.cli:main"

@@ -161,7 +161,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")  # np.savez appends .npz
+            loaded = load(path)  # np.savez appends .npz
 
             assert loaded.model_id == enc.model_id
             assert loaded.format_version == enc.format_version
@@ -182,7 +182,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             # Float16 has ~3 decimal digits of precision
             np.testing.assert_allclose(
@@ -200,7 +200,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             assert loaded.sentences[0].attention_weights is not None
             np.testing.assert_allclose(
@@ -217,7 +217,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             assert loaded.sentences[0].attention_weights is None
 
@@ -235,7 +235,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "meta_test.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             assert loaded.model_id == 'custom/model-v2'
             assert loaded.top_p == 0.9
@@ -251,7 +251,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test_uncompressed.soprano")
             save(enc, path, compress=False)
-            loaded = load(path + ".npz")
+            loaded = load(path)
             assert loaded.model_id == enc.model_id
 
     def test_roundtrip_token_ids_dtype(self):
@@ -262,7 +262,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             assert loaded.sentences[0].token_ids.dtype == np.int32
 
@@ -278,7 +278,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "multi.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             assert len(loaded.sentences) == 3
             assert loaded.sentences[0].text == "first"
@@ -287,6 +287,50 @@ class TestSaveLoad:
             assert loaded.sentences[0].hidden_states.shape == (10, 512)
             assert loaded.sentences[1].hidden_states.shape == (20, 512)
             assert loaded.sentences[2].hidden_states.shape == (15, 512)
+
+    def test_roundtrip_symmetric_paths(self):
+        """save(path) and load(path) should use the same path — no manual .npz."""
+        enc = _make_encoded()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.soprano")
+            save(enc, path)
+            loaded = load(path)  # NOT path + ".npz"
+            assert loaded.model_id == enc.model_id
+            assert len(loaded.sentences) == 1
+
+    def test_load_with_explicit_npz_extension(self):
+        """load() should also work when given a path ending in .npz."""
+        enc = _make_encoded()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.soprano")
+            save(enc, path)
+            loaded = load(path)  # explicit .npz still works
+            assert loaded.model_id == enc.model_id
+
+    def test_save_with_npz_extension_no_double_suffix(self):
+        """save() with a .npz path should not create file.npz.npz."""
+        enc = _make_encoded()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.npz")
+            save(enc, path)
+            assert os.path.exists(path)
+            loaded = load(path)
+            assert loaded.model_id == enc.model_id
+
+    def test_load_future_format_version_raises(self):
+        """load() should raise ValueError for unsupported future format versions."""
+        from soprano.encoded import _tamper_format_version_for_test
+        enc = _make_encoded()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "future.soprano")
+            save(enc, path)
+            _tamper_format_version_for_test(path, 999)
+            with pytest.raises(ValueError, match="format version 999"):
+                load(path)
 
     def test_properties_after_load(self):
         """Properties should work correctly on loaded EncodedSpeech."""
@@ -299,7 +343,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "props.soprano")
             save(enc, path)
-            loaded = load(path + ".npz")
+            loaded = load(path)
 
             assert loaded.total_tokens == 30
             assert loaded.num_texts == 2

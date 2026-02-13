@@ -552,123 +552,64 @@ class TestCLI:
     def test_cli_argument_parser_defaults(self):
         """CLI should parse required text arg with correct defaults."""
         from soprano.cli import main
-        import argparse
 
-        with patch('soprano.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            mock_parse.return_value = argparse.Namespace(
-                command=None,
-                text='Hello world',
-                output='output.wav',
+        with patch('sys.argv', ['soprano', 'Hello world', '-o', 'output.wav']), \
+             patch('soprano.SopranoTTS') as mock_tts:
+            mock_instance = MagicMock()
+            mock_tts.return_value = mock_instance
+            main()
+
+            mock_tts.assert_called_once_with(
                 model_path=None,
-                no_compile=False,
-                no_quantize=False,
+                compile=True,
+                quantize=False,
                 decoder_batch_size=4,
                 num_threads=None,
             )
-            with patch('soprano.SopranoTTS') as mock_tts:
-                mock_instance = MagicMock()
-                mock_tts.return_value = mock_instance
-                main()
-
-                mock_tts.assert_called_once_with(
-                    model_path=None,
-                    compile=True,
-                    quantize=True,
-                    decoder_batch_size=4,
-                    num_threads=None,
-                )
-                mock_instance.infer.assert_called_once_with(
-                    'Hello world', out_path='output.wav'
-                )
+            mock_instance.infer.assert_called_once_with(
+                'Hello world', out_path='output.wav'
+            )
 
     def test_cli_no_compile_flag(self):
         """--no-compile should pass compile=False to SopranoTTS."""
         from soprano.cli import main
-        import argparse
 
-        with patch('soprano.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            mock_parse.return_value = argparse.Namespace(
-                command=None,
-                text='Test',
-                output='test.wav',
-                model_path=None,
-                no_compile=True,
-                no_quantize=False,
-                decoder_batch_size=4,
-                num_threads=None,
-            )
-            with patch('soprano.SopranoTTS') as mock_tts:
-                mock_tts.return_value = MagicMock()
-                main()
-                call_kwargs = mock_tts.call_args[1]
-                assert call_kwargs['compile'] is False
+        with patch('sys.argv', ['soprano', 'Test', '--no-compile']), \
+             patch('soprano.SopranoTTS') as mock_tts:
+            mock_tts.return_value = MagicMock()
+            main()
+            assert mock_tts.call_args[1]['compile'] is False
 
-    def test_cli_no_quantize_flag(self):
-        """--no-quantize should pass quantize=False to SopranoTTS."""
+    def test_cli_quantize_flag(self):
+        """--quantize should pass quantize=True to SopranoTTS."""
         from soprano.cli import main
-        import argparse
 
-        with patch('soprano.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            mock_parse.return_value = argparse.Namespace(
-                command=None,
-                text='Test',
-                output='test.wav',
-                model_path=None,
-                no_compile=False,
-                no_quantize=True,
-                decoder_batch_size=4,
-                num_threads=None,
-            )
-            with patch('soprano.SopranoTTS') as mock_tts:
-                mock_tts.return_value = MagicMock()
-                main()
-                call_kwargs = mock_tts.call_args[1]
-                assert call_kwargs['quantize'] is False
+        with patch('sys.argv', ['soprano', 'Test', '--quantize']), \
+             patch('soprano.SopranoTTS') as mock_tts:
+            mock_tts.return_value = MagicMock()
+            main()
+            assert mock_tts.call_args[1]['quantize'] is True
 
     def test_cli_custom_threads_and_batch_size(self):
         """--num-threads and --decoder-batch-size should be passed through."""
         from soprano.cli import main
-        import argparse
 
-        with patch('soprano.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            mock_parse.return_value = argparse.Namespace(
-                command=None,
-                text='Test',
-                output='test.wav',
-                model_path=None,
-                no_compile=False,
-                no_quantize=False,
-                decoder_batch_size=8,
-                num_threads=4,
-            )
-            with patch('soprano.SopranoTTS') as mock_tts:
-                mock_tts.return_value = MagicMock()
-                main()
-                call_kwargs = mock_tts.call_args[1]
-                assert call_kwargs['decoder_batch_size'] == 8
-                assert call_kwargs['num_threads'] == 4
+        with patch('sys.argv', ['soprano', 'Test', '-t', '4', '-bs', '8']), \
+             patch('soprano.SopranoTTS') as mock_tts:
+            mock_tts.return_value = MagicMock()
+            main()
+            assert mock_tts.call_args[1]['decoder_batch_size'] == 8
+            assert mock_tts.call_args[1]['num_threads'] == 4
 
     def test_cli_model_path(self):
         """--model-path should be passed through to SopranoTTS."""
         from soprano.cli import main
-        import argparse
 
-        with patch('soprano.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            mock_parse.return_value = argparse.Namespace(
-                command=None,
-                text='Test',
-                output='test.wav',
-                model_path='/tmp/my_model',
-                no_compile=False,
-                no_quantize=False,
-                decoder_batch_size=4,
-                num_threads=None,
-            )
-            with patch('soprano.SopranoTTS') as mock_tts:
-                mock_tts.return_value = MagicMock()
-                main()
-                call_kwargs = mock_tts.call_args[1]
-                assert call_kwargs['model_path'] == '/tmp/my_model'
+        with patch('sys.argv', ['soprano', 'Test', '-m', '/tmp/my_model']), \
+             patch('soprano.SopranoTTS') as mock_tts:
+            mock_tts.return_value = MagicMock()
+            main()
+            assert mock_tts.call_args[1]['model_path'] == '/tmp/my_model'
 
 
 # ---------------------------------------------------------------------------
@@ -1774,5 +1715,297 @@ class TestMigrationGammaCheck:
             "head.out.weight": torch.randn(2050, 768, 1),
         }
         assert is_migrated(state_dict)
+
+
+# ---------------------------------------------------------------------------
+# ISTFT validation error tests (spectral_ops lines 22, 59, 92)
+# ---------------------------------------------------------------------------
+
+class TestISTFTValidation:
+    """Test ISTFT validation error paths."""
+
+    def test_invalid_padding_raises(self):
+        """ISTFT with invalid padding should raise ValueError."""
+        from soprano.vocos.spectral_ops import ISTFT
+        with pytest.raises(ValueError, match="Padding must be"):
+            ISTFT(n_fft=2048, hop_length=512, win_length=2048, padding="invalid")
+
+    def test_non_3d_input_raises(self):
+        """ISTFT with non-3D input tensor should raise ValueError."""
+        from soprano.vocos.spectral_ops import ISTFT
+        istft = ISTFT(n_fft=2048, hop_length=512, win_length=2048, padding="same")
+        # 2D tensor instead of 3D
+        bad_input = torch.randn(1025, 20, dtype=torch.cfloat)
+        with pytest.raises(ValueError, match="Expected a 3D tensor"):
+            istft(bad_input)
+
+
+# ---------------------------------------------------------------------------
+# BaseModel.infer with include_attention=True (base.py lines 78-80, 101)
+# ---------------------------------------------------------------------------
+
+class TestBaseModelAttention:
+    """Test BaseModel.infer attention extraction path."""
+
+    def _make_base_model(self):
+        from soprano.backends.base import BaseModel
+        bm = BaseModel()
+        bm.model = MagicMock()
+        bm.tokenizer = MagicMock()
+        return bm
+
+    def test_infer_with_attention_extracts_weights(self):
+        """include_attention=True should extract attention from outputs."""
+        bm = self._make_base_model()
+        eos_token_id = 2
+        bm.model.config.eos_token_id = eos_token_id
+        bm.tokenizer.pad_token_id = 0
+
+        input_len = 3
+        bm.tokenizer.return_value = {
+            'input_ids': torch.tensor([[1, 5, 6]]),
+            'attention_mask': torch.tensor([[1, 1, 1]]),
+        }
+
+        mock_outputs = MagicMock()
+        # 2 generated tokens + EOS
+        mock_outputs.sequences = torch.tensor([[1, 5, 6, 10, 11, eos_token_id]])
+
+        mock_outputs.hidden_states = [
+            (torch.randn(1, 1, 512),),  # token 10
+            (torch.randn(1, 1, 512),),  # token 11
+            (torch.randn(1, 1, 512),),  # EOS
+        ]
+        mock_outputs.scores = [torch.randn(1, 100) for _ in range(3)]
+
+        # Attention: tuple of (layers), each layer is (batch, heads, seq_len, seq_len)
+        # For each generated step, the full attention has shape expanding
+        num_heads = 4
+        # Step 0: seq_len = input_len + 1 = 4
+        attn_step0 = torch.randn(1, num_heads, 4, 4)
+        # Step 1: seq_len = input_len + 2 = 5
+        attn_step1 = torch.randn(1, num_heads, 5, 5)
+        # Step 2 (EOS): seq_len = input_len + 3 = 6
+        attn_step2 = torch.randn(1, num_heads, 6, 6)
+
+        # attentions is a tuple indexed by step, each step is a tuple of layers
+        mock_outputs.attentions = [
+            (attn_step0,),  # last layer for step 0
+            (attn_step1,),
+            (attn_step2,),
+        ]
+
+        bm.model.generate.return_value = mock_outputs
+
+        results = bm.infer(["Hello world"], include_attention=True)
+        assert results[0]['attention'] is not None
+        # Should have 2 attention vectors (one per non-EOS token)
+        assert results[0]['attention'].shape[0] == 2
+        # Each attention vector should be sliced to input_len positions
+        assert results[0]['attention'].shape[1] == input_len
+
+    def test_infer_without_attention_returns_none(self):
+        """include_attention=False should return attention=None."""
+        bm = self._make_base_model()
+        eos_token_id = 2
+        bm.model.config.eos_token_id = eos_token_id
+        bm.tokenizer.pad_token_id = 0
+        bm.tokenizer.return_value = {
+            'input_ids': torch.tensor([[1]]),
+            'attention_mask': torch.tensor([[1]]),
+        }
+        mock_outputs = MagicMock()
+        mock_outputs.sequences = torch.tensor([[1, 10, eos_token_id]])
+        mock_outputs.hidden_states = [(torch.randn(1, 1, 512),), (torch.randn(1, 1, 512),)]
+        mock_outputs.scores = [torch.randn(1, 100), torch.randn(1, 100)]
+        bm.model.generate.return_value = mock_outputs
+
+        results = bm.infer(["Test"], include_attention=False)
+        assert results[0]['attention'] is None
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch paths (cli.py lines 117, 121)
+# ---------------------------------------------------------------------------
+
+class TestCLIDispatch:
+    """Test CLI main() dispatch branches."""
+
+    def test_subcommand_dispatch(self):
+        """When command is set, args.func should be called."""
+        from soprano.cli import main
+        import argparse
+
+        mock_func = MagicMock()
+        with patch('sys.argv', ['soprano', 'encode', 'Hello']), \
+             patch('soprano.cli.argparse.ArgumentParser.parse_args') as mock_parse:
+            mock_parse.return_value = argparse.Namespace(
+                command='encode',
+                func=mock_func,
+                text='Hello',
+                output='out.soprano',
+            )
+            main()
+            mock_func.assert_called_once()
+
+    def test_no_text_prints_help(self):
+        """When no args at all, parser.print_help should be called."""
+        from soprano.cli import main
+
+        with patch('sys.argv', ['soprano']), \
+             patch('soprano.cli.argparse.ArgumentParser.print_help') as mock_help:
+            main()
+            mock_help.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# load_decoder tests (decode_only.py lines 41-58)
+# ---------------------------------------------------------------------------
+
+class TestLoadDecoder:
+    """Test decode_only.load_decoder with mocked dependencies."""
+
+    def test_load_decoder_from_local_path(self):
+        """load_decoder with model_path should load from local file."""
+        from soprano.decode_only import load_decoder
+        from soprano.vocos.decoder import SopranoDecoder
+
+        # Create a valid state dict from a fresh decoder
+        ref_decoder = SopranoDecoder()
+        state_dict = ref_decoder.state_dict()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decoder_path = os.path.join(tmpdir, 'decoder.pth')
+            torch.save(state_dict, decoder_path)
+            decoder = load_decoder(model_path=tmpdir, compile=False)
+            assert isinstance(decoder, SopranoDecoder)
+
+    def test_load_decoder_from_hub(self):
+        """load_decoder without model_path should download from HuggingFace."""
+        from soprano.decode_only import load_decoder
+        from soprano.vocos.decoder import SopranoDecoder
+
+        ref_decoder = SopranoDecoder()
+        state_dict = ref_decoder.state_dict()
+
+        with patch('soprano.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
+             patch('torch.load', return_value=state_dict):
+            decoder = load_decoder(compile=False)
+            assert isinstance(decoder, SopranoDecoder)
+
+    def test_load_decoder_with_compile_failure_warns(self):
+        """load_decoder with compile=True should warn if torch.compile fails."""
+        import warnings
+        from soprano.decode_only import load_decoder
+        from soprano.vocos.decoder import SopranoDecoder
+
+        ref_decoder = SopranoDecoder()
+        state_dict = ref_decoder.state_dict()
+
+        with patch('soprano.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
+             patch('torch.load', return_value=state_dict), \
+             patch('torch.compile', side_effect=RuntimeError("compile not supported")):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                decoder = load_decoder(compile=True)
+                # Should have warned about compile failure
+                assert any("torch.compile failed" in str(warning.message) for warning in w)
+
+    def test_decode_with_no_decoder_loads_default(self):
+        """decode() with decoder=None should call load_decoder internally."""
+        from soprano.decode_only import decode
+        from soprano.encoded import EncodedSpeech
+
+        encoded = EncodedSpeech(sentences=[], model_id='test')
+
+        with patch('soprano.decode_only.load_decoder') as mock_load:
+            mock_load.return_value = MagicMock()
+            result = decode(encoded, decoder=None)
+            mock_load.assert_called_once()
+            assert result == []
+
+
+# ---------------------------------------------------------------------------
+# TransformersModel init tests (transformers.py lines 8-27)
+# ---------------------------------------------------------------------------
+
+class TestTransformersModelInit:
+    """Test TransformersModel.__init__ with mocked HuggingFace classes."""
+
+    def test_init_default_model(self):
+        """TransformersModel() should load the default model."""
+        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+
+            from soprano.backends.transformers import TransformersModel
+            tm = TransformersModel(compile=False, quantize=False)
+
+            mock_model_cls.from_pretrained.assert_called_once_with(
+                'ekwek/Soprano-1.1-80M', torch_dtype=torch.float32)
+            mock_model.eval.assert_called_once()
+
+    def test_init_with_quantize(self):
+        """TransformersModel with quantize=True should call quantize_dynamic."""
+        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+             patch('torch.quantization.quantize_dynamic') as mock_quantize:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+            mock_quantize.return_value = mock_model
+
+            from soprano.backends.transformers import TransformersModel
+            tm = TransformersModel(compile=False, quantize=True)
+
+            mock_quantize.assert_called_once()
+
+    def test_init_with_compile(self):
+        """TransformersModel with compile=True should call torch.compile."""
+        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+             patch('torch.compile') as mock_compile:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+            mock_compile.return_value = mock_model
+
+            from soprano.backends.transformers import TransformersModel
+            tm = TransformersModel(compile=True, quantize=False)
+
+            mock_compile.assert_called_once()
+
+    def test_init_compile_failure_warns(self):
+        """TransformersModel should warn if torch.compile fails."""
+        import warnings
+        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+             patch('torch.compile', side_effect=RuntimeError("not supported")):
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+
+            from soprano.backends.transformers import TransformersModel
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                tm = TransformersModel(compile=True, quantize=False)
+                assert any("torch.compile failed" in str(warning.message) for warning in w)
+
+    def test_init_custom_model_path(self):
+        """TransformersModel with model_path should use that path."""
+        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+
+            from soprano.backends.transformers import TransformersModel
+            tm = TransformersModel(model_path='/custom/model', compile=False, quantize=False)
+
+            mock_model_cls.from_pretrained.assert_called_once_with(
+                '/custom/model', torch_dtype=torch.float32)
+            mock_tok_cls.from_pretrained.assert_called_once_with('/custom/model')
 
 

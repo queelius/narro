@@ -5,15 +5,11 @@ from collections import deque
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
-from scipy.io import wavfile
 
 from .backends.transformers import TransformersModel
 from .encoded import EncodedSpeech, SentenceEncoding
 from .utils.text_normalizer import clean_text
 from .utils.text_splitter import split_and_recombine_text
-from .vocos.decoder import SopranoDecoder
-from .vocos.migrate_weights import load_with_migration
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +37,14 @@ class SopranoTTS:
     Args:
         model_path: Path to local model directory (uses HuggingFace if None)
         compile: Enable torch.compile for faster inference (default: True)
-        quantize: Enable INT8 quantization for faster CPU inference (default: True)
+        quantize: Enable INT8 quantization for faster CPU inference (default: False, degrades quality)
         decoder_batch_size: Batch size for decoder (default: 4)
         num_threads: Number of CPU threads for inference (None = auto-detect)
     """
     def __init__(self,
             model_path=None,
             compile=True,
-            quantize=True,
+            quantize=False,
             decoder_batch_size=4,
             num_threads=None):
         # Configure threading before model load
@@ -64,23 +60,8 @@ class SopranoTTS:
         self.model_id = model_path if model_path else MODEL_ID
         self.pipeline = TransformersModel(model_path=model_path, compile=compile, quantize=quantize)
 
-        self.decoder = SopranoDecoder()
-        if model_path:
-            decoder_path = os.path.join(model_path, 'decoder.pth')
-        else:
-            decoder_path = hf_hub_download(repo_id=MODEL_ID, filename='decoder.pth')
-        state_dict = torch.load(decoder_path, map_location='cpu', weights_only=True)
-        state_dict = load_with_migration(state_dict)
-        self.decoder.load_state_dict(state_dict)
-        self.decoder.train(False)
-
-        if compile:
-            try:
-                self.decoder = torch.compile(self.decoder, mode="reduce-overhead")
-            except Exception as e:
-                import warnings
-                warnings.warn(f"torch.compile failed for decoder: {e}")
-
+        from .decode_only import load_decoder
+        self.decoder = load_decoder(model_path=model_path, compile=compile)
         self.decoder_batch_size = decoder_batch_size
 
         # Warmup decoder directly with synthetic tensors (no LLM needed).
@@ -238,8 +219,7 @@ class SopranoTTS:
     def decode(self, encoded):
         """Decode an EncodedSpeech into audio tensors.
 
-        Sorts sentences by descending length for efficient batched decoding,
-        then reassembles audio in original text order.
+        Delegates to decode_only.decode() — the canonical decode implementation.
 
         Args:
             encoded: EncodedSpeech from encode_batch() or load().
@@ -247,53 +227,13 @@ class SopranoTTS:
         Returns:
             List of 1D torch.Tensor audio waveforms, one per input text.
         """
+        from .decode_only import decode as _decode
         t_start = time.perf_counter()
-
-        # Convert numpy hidden states back to torch and pair with metadata
-        items = []
-        for s in encoded.sentences:
-            hs = torch.from_numpy(s.hidden_states)
-            items.append((hs, s.text_index, s.sentence_index))
-
-        # Sort by descending hidden state length for efficient padding
-        items.sort(key=lambda x: -x[0].size(0))
-
-        num_texts = encoded.num_texts
-        audio_concat = [[] for _ in range(num_texts)]
-        for s in encoded.sentences:
-            audio_concat[s.text_index].append(None)
-
-        hidden_states = [x[0] for x in items]
-        meta = [(x[1], x[2]) for x in items]
-
-        for idx in range(0, len(hidden_states), self.decoder_batch_size):
-            t_dec = time.perf_counter()
-            batch = hidden_states[idx:idx+self.decoder_batch_size]
-            lengths = [x.size(0) for x in batch]
-            N = len(lengths)
-            max_len = lengths[0]  # Already sorted descending
-
-            batch_hidden_states = torch.zeros((N, HIDDEN_DIM, max_len))
-            for i in range(N):
-                seq_len = lengths[i]
-                batch_hidden_states[i, :, max_len-seq_len:] = batch[i].T
-
-            with torch.inference_mode():
-                audio = self.decoder(batch_hidden_states)
-
-            logger.debug("Decoder batch %d: %.1f ms (%d sentences, max_len=%d)",
-                          idx // self.decoder_batch_size, (time.perf_counter() - t_dec) * 1000,
-                          N, max_len)
-
-            for i in range(N):
-                text_id, sentence_id = meta[idx+i]
-                trim = lengths[i] * TOKEN_SIZE - TOKEN_SIZE
-                audio_concat[text_id][sentence_id] = audio[i].squeeze()[-trim:] if trim > 0 else audio[i].squeeze()[:0]
-
-        audio_concat = [torch.cat(x) for x in audio_concat]
-
-        logger.info("decode: %.1f ms (%d texts)", (time.perf_counter() - t_start) * 1000, num_texts)
-        return audio_concat
+        result = _decode(encoded, decoder=self.decoder,
+                         decoder_batch_size=self.decoder_batch_size)
+        logger.info("decode: %.1f ms (%d texts)",
+                     (time.perf_counter() - t_start) * 1000, encoded.num_texts)
+        return result
 
     # ------------------------------------------------------------------
     # Convenience methods
@@ -305,8 +245,8 @@ class SopranoTTS:
                               repetition_penalty=repetition_penalty, retries=retries)
         results = self.decode(encoded)[0]
         if out_path:
-            pcm = (np.clip(results.numpy(), -1.0, 1.0) * INT16_MAX).astype(np.int16)
-            wavfile.write(out_path, SAMPLE_RATE, pcm)
+            from .decode_only import write_wav
+            write_wav(results, out_path)
         return results
 
     def infer_batch(self, texts, out_dir=None, top_p=0.95, temperature=0.0,
@@ -317,19 +257,18 @@ class SopranoTTS:
         audio_concat = self.decode(encoded)
 
         if out_dir:
+            from .decode_only import write_wav
             os.makedirs(out_dir, exist_ok=True)
-            for i in range(len(audio_concat)):
-                pcm = (np.clip(audio_concat[i].numpy(), -1.0, 1.0) * INT16_MAX).astype(np.int16)
-                wavfile.write(f"{out_dir}/{i}.wav", SAMPLE_RATE, pcm)
+            for i, audio in enumerate(audio_concat):
+                write_wav(audio, f"{out_dir}/{i}.wav")
 
         return audio_concat
 
     def decode_to_wav(self, encoded, out_path):
         """Decode an EncodedSpeech and write concatenated audio to a WAV file."""
+        from .decode_only import write_wav
         audio_list = self.decode(encoded)
-        audio = torch.cat(audio_list)
-        pcm = (np.clip(audio.numpy(), -1.0, 1.0) * INT16_MAX).astype(np.int16)
-        wavfile.write(out_path, SAMPLE_RATE, pcm)
+        write_wav(torch.cat(audio_list), out_path)
 
     def infer_stream(self, text, chunk_size=1, top_p=0.95, temperature=0.0, repetition_penalty=1.2):
         start_time = time.time()
