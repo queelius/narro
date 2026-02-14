@@ -29,7 +29,20 @@ def cmd_speak(args):
         num_threads=args.num_threads,
     )
     logger.info("Generating speech for: '%s'", args.text)
-    tts.infer(args.text, out_path=args.output)
+
+    if args.align:
+        from narro.alignment import extract_alignment_from_encoded, save_alignment
+        encoded = tts.encode(args.text, include_attention=True)
+        audio_list = tts.decode(encoded)
+        from narro.decode_only import write_wav
+        import torch
+        write_wav(torch.cat(audio_list), args.output)
+        alignment = extract_alignment_from_encoded(encoded)
+        save_alignment(alignment, args.align)
+        logger.info("Alignment saved to: %s", args.align)
+    else:
+        tts.infer(args.text, out_path=args.output)
+
     logger.info("Audio saved to: %s", args.output)
 
 
@@ -63,12 +76,14 @@ def cmd_decode(args):
 
 
 def _add_speak_args(parser):
-    """Add speak-specific args (text, output, batch size)."""
+    """Add speak-specific args (text, output, batch size, alignment)."""
     parser.add_argument('text', help='Text to synthesize')
     parser.add_argument('--output', '-o', default='output.wav',
                         help='Output audio file path')
     parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,
                         help='Batch size when decoding audio')
+    parser.add_argument('--align', '-a',
+                        help='Output word-alignment JSON file path')
 
 
 def main():
