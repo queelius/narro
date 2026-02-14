@@ -9,7 +9,6 @@ BACKEND-SELECTION.md
 Taskfile.yml
 benchmark.py
 examples-backend.py
-*.onnx
 *.soprano.npz
 .coverage
 .playwright-mcp/
