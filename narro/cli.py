@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Soprano TTS Command Line Interface"""
+"""Narro TTS Command Line Interface"""
 import argparse
 import logging
 
@@ -20,8 +20,8 @@ def _add_common_args(parser):
 
 def cmd_speak(args):
     """Default command: encode + decode text to WAV."""
-    from soprano import SopranoTTS
-    tts = SopranoTTS(
+    from narro import Narro
+    tts = Narro(
         model_path=args.model_path,
         compile=not args.no_compile,
         quantize=args.quantize,
@@ -34,10 +34,10 @@ def cmd_speak(args):
 
 
 def cmd_encode(args):
-    """Encode text to .soprano file."""
-    from soprano import SopranoTTS
-    from soprano.encoded import save
-    tts = SopranoTTS(
+    """Encode text to .narro file."""
+    from narro import Narro
+    from narro.encoded import save
+    tts = Narro(
         model_path=args.model_path,
         compile=not args.no_compile,
         quantize=args.quantize,
@@ -51,9 +51,9 @@ def cmd_encode(args):
 
 
 def cmd_decode(args):
-    """Decode .soprano file to WAV."""
-    from soprano.encoded import load
-    from soprano.decode_only import decode_to_wav, load_decoder
+    """Decode .narro file to WAV."""
+    from narro.encoded import load
+    from narro.decode_only import decode_to_wav, load_decoder
     logger.info("Loading encoded speech from: %s", args.input)
     encoded = load(args.input)
     decoder = load_decoder(model_path=args.model_path, compile=not args.no_compile)
@@ -75,18 +75,18 @@ def main():
     import sys
 
     # Default to 'speak' when first arg isn't a known subcommand.
-    # This lets `soprano "Hello world"` work as shorthand for `soprano speak "Hello world"`.
+    # This lets `narro "Hello world"` work as shorthand for `narro speak "Hello world"`.
     _subcommands = {'speak', 'encode', 'decode'}
     if len(sys.argv) > 1 and sys.argv[1] not in _subcommands and sys.argv[1] not in ('-h', '--help'):
         sys.argv.insert(1, 'speak')
 
     parser = argparse.ArgumentParser(
-        description='Soprano Text-to-Speech CLI',
+        description='Narro Text-to-Speech CLI',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  soprano "Hello world" -o output.wav
-  soprano encode "Hello world" -o encoded.soprano
-  soprano decode encoded.soprano -o output.wav
+  narro "Hello world" -o output.wav
+  narro encode "Hello world" -o encoded.narro
+  narro decode encoded.narro -o output.wav
 """)
 
     subparsers = parser.add_subparsers(dest='command')
@@ -98,18 +98,18 @@ def main():
     speak_parser.set_defaults(func=cmd_speak)
 
     # --- encode ---
-    encode_parser = subparsers.add_parser('encode', help='Encode text to .soprano file')
+    encode_parser = subparsers.add_parser('encode', help='Encode text to .narro file')
     encode_parser.add_argument('text', help='Text to encode')
-    encode_parser.add_argument('--output', '-o', default='output.soprano',
-                               help='Output .soprano file path')
+    encode_parser.add_argument('--output', '-o', default='output.narro',
+                               help='Output .narro file path')
     encode_parser.add_argument('--include-attention', action='store_true',
                                help='Include attention weights (larger file)')
     _add_common_args(encode_parser)
     encode_parser.set_defaults(func=cmd_encode)
 
     # --- decode ---
-    decode_parser = subparsers.add_parser('decode', help='Decode .soprano file to WAV')
-    decode_parser.add_argument('input', help='Input .soprano file path')
+    decode_parser = subparsers.add_parser('decode', help='Decode .narro file to WAV')
+    decode_parser.add_argument('input', help='Input .narro file path')
     decode_parser.add_argument('--output', '-o', default='output.wav',
                                help='Output WAV file path')
     decode_parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,

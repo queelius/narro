@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Soprano TTS pipeline benchmark.
+"""Narro TTS pipeline benchmark.
 
 Measures startup, cold inference, and warm inference.
 
@@ -52,7 +52,7 @@ TEXTS = {
 
 def run_benchmark(num_runs, compile_flag):
     """Run full benchmark suite."""
-    from soprano.tts import SopranoTTS, TOKEN_SIZE, SAMPLE_RATE
+    from narro.tts import Narro, TOKEN_SIZE, SAMPLE_RATE
 
     print(f"\n{'=' * 70}")
     print(f"  compile={compile_flag}  |  runs={num_runs}")
@@ -63,7 +63,7 @@ def run_benchmark(num_runs, compile_flag):
     torch.manual_seed(42)
 
     t0 = time.perf_counter()
-    tts = SopranoTTS(
+    tts = Narro(
         compile=compile_flag,
         quantize=True,
     )
@@ -129,7 +129,7 @@ def run_benchmark(num_runs, compile_flag):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Soprano TTS benchmark")
+    parser = argparse.ArgumentParser(description="Narro TTS benchmark")
     parser.add_argument("--runs", type=int, default=5,
                         help="Number of warm inference runs (default: 5)")
     parser.add_argument("--no-compile", action="store_true",

@@ -1,13 +1,13 @@
-"""Lightweight decode-only module for Soprano TTS.
+"""Lightweight decode-only module for Narro TTS.
 
 Loads only the Vocos decoder (~5MB) without the LLM (~374MB).
-Useful for decoding pre-encoded .soprano files on resource-constrained devices.
+Useful for decoding pre-encoded .narro files on resource-constrained devices.
 
 Usage:
-    from soprano.decode_only import decode, decode_to_wav
-    from soprano.encoded import load
+    from narro.decode_only import decode, decode_to_wav
+    from narro.encoded import load
 
-    encoded = load("blog-post.soprano")
+    encoded = load("blog-post.narro")
     audio = decode(encoded)              # list[torch.Tensor]
     decode_to_wav(encoded, "output.wav") # convenience
 """

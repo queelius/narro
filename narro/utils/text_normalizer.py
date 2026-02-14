@@ -1,5 +1,5 @@
 """
-Normalize input text to a format that Soprano recognizes.
+Normalize input text to a format that Narro recognizes.
 Adapted from https://github.com/neonbjb/tortoise-tts/blob/main/tortoise/utils/tokenizer.py
 """
 import re

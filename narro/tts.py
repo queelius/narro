@@ -27,9 +27,9 @@ DIFF_THRESHOLD = 300
 MAX_RUNLENGTH = 16
 
 
-class SopranoTTS:
+class Narro:
     """
-    Soprano Text-to-Speech model (CPU-optimized).
+    Narro Text-to-Speech model (CPU-optimized).
 
     Pipeline: text -> Qwen3-80M LLM hidden states -> Vocos decoder -> audio
     Based on ekwek/Soprano-1.1-80M (LLM) and Vocos vocoder architecture.
