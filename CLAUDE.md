@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Soprano is an ultra-lightweight text-to-speech (TTS) core library (80M params) that generates 32kHz audio. It uses an LLM to produce hidden states from text, then a Vocos-based decoder converts those hidden states to audio via ISTFT. CPU-only.
+Narro is an ultra-lightweight text-to-speech (TTS) core library (80M params) that generates 32kHz audio. It wraps the Soprano-1.1-80M model, using an LLM to produce hidden states from text, then a Vocos-based decoder converts those hidden states to audio via ISTFT. CPU-only.
 
 ## Development Commands
 
@@ -22,10 +22,10 @@ pytest tests/test_performance.py::TestWeightMigration::test_migrate_pwconv_weigh
 pytest tests/ -m benchmark
 
 # Run with coverage
-pytest tests/ --cov=soprano
+pytest tests/ --cov=narro
 
 # CLI usage
-soprano "Hello world" -o output.wav
+narro "Hello world" -o output.wav
 ```
 
 ## Architecture
@@ -61,7 +61,7 @@ Tests use `pytest` with `unittest.mock`. Performance tests validate tensor shape
 
 ## Project-Specific Conventions
 
-- The `SopranoTTS` constructor runs a warmup inference (`self.infer("Hello world!")`) — tests that construct it must mock this or patch the class.
+- The `Narro` constructor runs a warmup inference (`self.infer("Hello world!")`) — tests that construct it must mock this or patch the class.
 - Audio tensors are float32 in `[-1, 1]` range internally; converted to int16 PCM at output boundaries (WAV files).
 - The `ISTFTHead.forward` is decorated with `@torch.compiler.disable` because torch.compile doesn't support complex FFT operations.
 - `temperature=0.0` in the public API is silently clamped to `0.001` in the backend to avoid division by zero.
