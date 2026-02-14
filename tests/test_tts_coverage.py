@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from soprano.tts import (
-    SopranoTTS,
+from narro.tts import (
+    Narro,
     SAMPLE_RATE,
     INT16_MAX,
     RECEPTIVE_FIELD,
@@ -27,8 +27,8 @@ from soprano.tts import (
 # ---------------------------------------------------------------------------
 
 def _make_tts_stub():
-    """Create a SopranoTTS stub without triggering __init__ (warmup inference)."""
-    obj = object.__new__(SopranoTTS)
+    """Create a Narro stub without triggering __init__ (warmup inference)."""
+    obj = object.__new__(Narro)
     obj.model_id = 'test/model'
     return obj
 
@@ -54,7 +54,7 @@ def _make_pipeline_response(seq_len, finish_reason='stop'):
 # ---------------------------------------------------------------------------
 
 class TestPreprocessText:
-    """Test SopranoTTS._preprocess_text behavior."""
+    """Test Narro._preprocess_text behavior."""
 
     def test_single_short_sentence(self):
         """A single short sentence should not be split or merged."""
@@ -231,7 +231,7 @@ class TestHallucinationDetectorEdgeCases:
 # ---------------------------------------------------------------------------
 
 class TestInfer:
-    """Test SopranoTTS.infer with a mocked pipeline and decoder."""
+    """Test Narro.infer with a mocked pipeline and decoder."""
 
     def _make_tts_with_mocks(self):
         """Create a TTS stub with mocked pipeline and decoder."""
@@ -292,7 +292,7 @@ class TestInfer:
 # ---------------------------------------------------------------------------
 
 class TestInferBatch:
-    """Test SopranoTTS.infer_batch with mocked pipeline and decoder."""
+    """Test Narro.infer_batch with mocked pipeline and decoder."""
 
     def _make_tts_with_mocks(self):
         tts = _make_tts_stub()
@@ -390,7 +390,7 @@ class TestInferBatch:
         audio_len = (seq_len - 1) * TOKEN_SIZE
         tts.decoder.return_value = torch.randn(1, audio_len + TOKEN_SIZE)
 
-        with patch('soprano.tts.logger') as mock_logger:
+        with patch('narro.tts.logger') as mock_logger:
             tts.infer_batch(["Hello world."])
             mock_logger.warning.assert_called()
 
@@ -442,7 +442,7 @@ class TestInferBatch:
 # ---------------------------------------------------------------------------
 
 class TestInferStream:
-    """Test SopranoTTS.infer_stream with a mocked pipeline and decoder."""
+    """Test Narro.infer_stream with a mocked pipeline and decoder."""
 
     def _make_tts_with_mocks(self):
         tts = _make_tts_stub()
@@ -515,7 +515,7 @@ class TestInferStream:
         audio_samples = (RECEPTIVE_FIELD + 2) * TOKEN_SIZE
         tts.decoder.return_value = torch.randn(1, audio_samples)
 
-        with patch('soprano.tts.logger') as mock_logger:
+        with patch('narro.tts.logger') as mock_logger:
             list(tts.infer_stream("Hello."))
             # The first chunk should log latency
             mock_logger.info.assert_called()
@@ -551,10 +551,10 @@ class TestCLI:
 
     def test_cli_argument_parser_defaults(self):
         """CLI should parse required text arg with correct defaults."""
-        from soprano.cli import main
+        from narro.cli import main
 
-        with patch('sys.argv', ['soprano', 'Hello world', '-o', 'output.wav']), \
-             patch('soprano.SopranoTTS') as mock_tts:
+        with patch('sys.argv', ['narro', 'Hello world', '-o', 'output.wav']), \
+             patch('narro.Narro') as mock_tts:
             mock_instance = MagicMock()
             mock_tts.return_value = mock_instance
             main()
@@ -571,42 +571,42 @@ class TestCLI:
             )
 
     def test_cli_no_compile_flag(self):
-        """--no-compile should pass compile=False to SopranoTTS."""
-        from soprano.cli import main
+        """--no-compile should pass compile=False to Narro."""
+        from narro.cli import main
 
-        with patch('sys.argv', ['soprano', 'Test', '--no-compile']), \
-             patch('soprano.SopranoTTS') as mock_tts:
+        with patch('sys.argv', ['narro', 'Test', '--no-compile']), \
+             patch('narro.Narro') as mock_tts:
             mock_tts.return_value = MagicMock()
             main()
             assert mock_tts.call_args[1]['compile'] is False
 
     def test_cli_quantize_flag(self):
-        """--quantize should pass quantize=True to SopranoTTS."""
-        from soprano.cli import main
+        """--quantize should pass quantize=True to Narro."""
+        from narro.cli import main
 
-        with patch('sys.argv', ['soprano', 'Test', '--quantize']), \
-             patch('soprano.SopranoTTS') as mock_tts:
+        with patch('sys.argv', ['narro', 'Test', '--quantize']), \
+             patch('narro.Narro') as mock_tts:
             mock_tts.return_value = MagicMock()
             main()
             assert mock_tts.call_args[1]['quantize'] is True
 
     def test_cli_custom_threads_and_batch_size(self):
         """--num-threads and --decoder-batch-size should be passed through."""
-        from soprano.cli import main
+        from narro.cli import main
 
-        with patch('sys.argv', ['soprano', 'Test', '-t', '4', '-bs', '8']), \
-             patch('soprano.SopranoTTS') as mock_tts:
+        with patch('sys.argv', ['narro', 'Test', '-t', '4', '-bs', '8']), \
+             patch('narro.Narro') as mock_tts:
             mock_tts.return_value = MagicMock()
             main()
             assert mock_tts.call_args[1]['decoder_batch_size'] == 8
             assert mock_tts.call_args[1]['num_threads'] == 4
 
     def test_cli_model_path(self):
-        """--model-path should be passed through to SopranoTTS."""
-        from soprano.cli import main
+        """--model-path should be passed through to Narro."""
+        from narro.cli import main
 
-        with patch('sys.argv', ['soprano', 'Test', '-m', '/tmp/my_model']), \
-             patch('soprano.SopranoTTS') as mock_tts:
+        with patch('sys.argv', ['narro', 'Test', '-m', '/tmp/my_model']), \
+             patch('narro.Narro') as mock_tts:
             mock_tts.return_value = MagicMock()
             main()
             assert mock_tts.call_args[1]['model_path'] == '/tmp/my_model'
@@ -620,42 +620,42 @@ class TestTextNormalizer:
     """Test text normalization functions."""
 
     def test_clean_text_basic(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("Hello World!")
         assert result == "hello world!"
 
     def test_abbreviation_expansion(self):
-        from soprano.utils.text_normalizer import expand_abbreviations
+        from narro.utils.text_normalizer import expand_abbreviations
         assert "doctor" in expand_abbreviations("Dr. Smith")
         assert "mister" in expand_abbreviations("Mr. Jones")
 
     def test_number_expansion(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("42")
         assert "forty" in result and "two" in result
 
     def test_dollar_expansion(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("$5.99")
         assert "dollar" in result
         assert "cent" in result
 
     def test_dollar_expansion_zero(self):
-        from soprano.utils.text_normalizer import _expand_dollars
+        from narro.utils.text_normalizer import _expand_dollars
         import re
         m = re.match(r'\$([\d\.\,]*\d+)', '$0.00')
         result = _expand_dollars(m)
         assert "zero dollars" in result
 
     def test_dollar_expansion_cents_only(self):
-        from soprano.utils.text_normalizer import _expand_dollars
+        from narro.utils.text_normalizer import _expand_dollars
         import re
         m = re.match(r'\$([\d\.\,]*\d+)', '$0.50')
         result = _expand_dollars(m)
         assert "cent" in result
 
     def test_dollar_expansion_one_dollar(self):
-        from soprano.utils.text_normalizer import _expand_dollars
+        from narro.utils.text_normalizer import _expand_dollars
         import re
         m = re.match(r'\$([\d\.\,]*\d+)', '$1.00')
         result = _expand_dollars(m)
@@ -663,7 +663,7 @@ class TestTextNormalizer:
         assert "dollars" not in result  # singular
 
     def test_dollar_expansion_one_cent(self):
-        from soprano.utils.text_normalizer import _expand_dollars
+        from narro.utils.text_normalizer import _expand_dollars
         import re
         m = re.match(r'\$([\d\.\,]*\d+)', '$0.01')
         result = _expand_dollars(m)
@@ -672,233 +672,233 @@ class TestTextNormalizer:
 
     def test_pound_expansion(self):
         """Pounds sign is handled by regex before unidecode. Test normalize_numbers directly."""
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("£20")
         assert "pounds" in result
 
     def test_num_prefix(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("#1")
         assert "number" in result
 
     def test_num_suffix_k(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("100K")
         assert "thousand" in result
 
     def test_num_suffix_m(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("5M")
         assert "million" in result
 
     def test_num_suffix_b(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("3B")
         assert "billion" in result
 
     def test_num_suffix_t(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("2T")
         assert "trillion" in result
 
     def test_special_characters(self):
-        from soprano.utils.text_normalizer import expand_special_characters
+        from narro.utils.text_normalizer import expand_special_characters
         assert "at" in expand_special_characters("user@domain")
         assert "and" in expand_special_characters("A & B")
         assert "percent" in expand_special_characters("50%")
 
     def test_collapse_whitespace(self):
-        from soprano.utils.text_normalizer import collapse_whitespace
+        from narro.utils.text_normalizer import collapse_whitespace
         assert collapse_whitespace("hello   world") == "hello world"
         assert collapse_whitespace("hello .") == "hello."
 
     def test_dedup_punctuation(self):
-        from soprano.utils.text_normalizer import dedup_punctuation
+        from narro.utils.text_normalizer import dedup_punctuation
         assert dedup_punctuation("hello....") == "hello..."
         assert dedup_punctuation("hello,,,,") == "hello,"
         assert dedup_punctuation("hello!!") == "hello!"
         assert dedup_punctuation("hello??") == "hello?"
 
     def test_collapse_triple_letters(self):
-        from soprano.utils.text_normalizer import collapse_triple_letters
+        from narro.utils.text_normalizer import collapse_triple_letters
         assert collapse_triple_letters("hellooo") == "helloo"
         assert collapse_triple_letters("aaa") == "aa"
 
     def test_convert_to_ascii(self):
-        from soprano.utils.text_normalizer import convert_to_ascii
+        from narro.utils.text_normalizer import convert_to_ascii
         result = convert_to_ascii("cafe\u0301")
         assert "cafe" in result
 
     def test_normalize_newlines(self):
-        from soprano.utils.text_normalizer import normalize_newlines
+        from narro.utils.text_normalizer import normalize_newlines
         result = normalize_newlines("Hello\nworld")
         assert "Hello." in result
 
     def test_normalize_newlines_preserves_terminal_punctuation(self):
-        from soprano.utils.text_normalizer import normalize_newlines
+        from narro.utils.text_normalizer import normalize_newlines
         result = normalize_newlines("Hello!\nworld?")
         assert "Hello!" in result
         assert "world?" in result
 
     def test_normalize_newlines_skips_empty_lines(self):
-        from soprano.utils.text_normalizer import normalize_newlines
+        from narro.utils.text_normalizer import normalize_newlines
         result = normalize_newlines("Hello\n\nworld")
         # Empty line between should just collapse
         assert "Hello." in result
 
     def test_remove_unknown_characters(self):
-        from soprano.utils.text_normalizer import remove_unknown_characters
+        from narro.utils.text_normalizer import remove_unknown_characters
         result = remove_unknown_characters("Hello{world}")
         assert "{" not in result
 
     def test_time_expansion_hours_oclock(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("8:00")
         assert "o'clock" in result or "eight" in result
 
     def test_time_expansion_with_minutes(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("8:15")
         assert "fifteen" in result or "15" in result
 
     def test_time_expansion_zero_prefix_minutes(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("8:05")
         assert "oh" in result
 
     def test_date_expansion(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("1/1/2025")
         assert "dash" in result
 
     def test_phone_number_expansion(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("(123) 456-7890")
         # Phone numbers get expanded digit-by-digit
         assert len(result) > 0
 
     def test_decimal_expansion(self):
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("3.14")
         assert "point" in result
 
     def test_fraction_expansion(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("1/2")
         assert "over" in result
 
     def test_ordinal_expansion(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("1st")
         assert "first" in result
 
     def test_year_2000(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("2000")
         assert "two thousand" in result
 
     def test_year_2005(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("2005")
         assert "thousand" in result
 
     def test_year_1999(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("1999")
         assert "nineteen" in result
 
     def test_year_2100(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("2100")
         assert "hundred" in result
 
     def test_multiply_expansion(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("3 * 4")
         assert "times" in result
 
     def test_divide_expansion(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("8 / 2")
         assert "over" in result
 
     def test_add_expansion(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("3 + 4")
         assert "plus" in result
 
     def test_subtract_expansion(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("5 - 3")
         assert "minus" in result
 
     def test_link_header_expansion(self):
-        from soprano.utils.text_normalizer import normalize_special
+        from narro.utils.text_normalizer import normalize_special
         result = normalize_special("https://example.com")
         assert "h t t p" in result
 
     def test_dash_in_sentence_expansion(self):
-        from soprano.utils.text_normalizer import normalize_special
+        from narro.utils.text_normalizer import normalize_special
         result = normalize_special("word - another")
         assert "," in result
 
     def test_dot_abbreviation_expansion(self):
-        from soprano.utils.text_normalizer import normalize_special
+        from narro.utils.text_normalizer import normalize_special
         result = normalize_special("U.S")
         assert "dot" in result
 
     def test_parentheses_expansion(self):
-        from soprano.utils.text_normalizer import normalize_special
+        from narro.utils.text_normalizer import normalize_special
         result = normalize_special("hello (world) there")
         assert "(" not in result
 
     def test_mixed_case_splitting(self):
-        from soprano.utils.text_normalizer import normalize_mixedcase
+        from narro.utils.text_normalizer import normalize_mixedcase
         result = normalize_mixedcase("LMDeploy")
         # CamelCase should be split
         assert " " in result or result == "LMDeploy"
 
     def test_cased_abbreviation_hz(self):
-        from soprano.utils.text_normalizer import expand_abbreviations
+        from narro.utils.text_normalizer import expand_abbreviations
         assert "hertz" in expand_abbreviations("100 Hz signal")
 
     def test_cased_abbreviation_cpu(self):
-        from soprano.utils.text_normalizer import expand_abbreviations
+        from narro.utils.text_normalizer import expand_abbreviations
         assert "c p u" in expand_abbreviations("the CPU is fast")
 
     def test_cased_abbreviation_gpu_plural(self):
-        from soprano.utils.text_normalizer import expand_abbreviations
+        from narro.utils.text_normalizer import expand_abbreviations
         result = expand_abbreviations("multiple GPUs")
         assert "g p u" in result
 
     def test_cased_abbreviation_day(self):
-        from soprano.utils.text_normalizer import expand_abbreviations
+        from narro.utils.text_normalizer import expand_abbreviations
         assert "monday" in expand_abbreviations("Mon morning")
 
     def test_cased_abbreviation_month(self):
-        from soprano.utils.text_normalizer import expand_abbreviations
+        from narro.utils.text_normalizer import expand_abbreviations
         assert "january" in expand_abbreviations("Jan 1st")
 
     def test_preunicode_em_dash(self):
-        from soprano.utils.text_normalizer import expand_preunicode_special_characters
+        from narro.utils.text_normalizer import expand_preunicode_special_characters
         result = expand_preunicode_special_characters("hello\u2014world")
         assert " - " in result
 
     def test_comma_number_removal(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         # "1,000" should have comma removed then be expanded
         result = normalize_numbers("1,000")
         assert "," not in result
 
     def test_alphanumeric_splitting(self):
-        from soprano.utils.text_normalizer import normalize_numbers
+        from narro.utils.text_normalizer import normalize_numbers
         result = normalize_numbers("100x")
         # "100x" => "100 x" after splitting
         assert " " in result or "x" in result
 
     def test_clean_text_full_pipeline(self):
         """Test clean_text processes all stages end to end."""
-        from soprano.utils.text_normalizer import clean_text
+        from narro.utils.text_normalizer import clean_text
         result = clean_text("Dr. Smith paid $42.50 on 1/15/2025 at 3:30 for 2 APIs & 100K tokens!")
         assert isinstance(result, str)
         assert len(result) > 0
@@ -916,18 +916,18 @@ class TestTextSplitter:
     """Test the text splitting utility."""
 
     def test_single_sentence(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("Hello world.")
         assert len(result) == 1
         assert result[0] == "Hello world."
 
     def test_multiple_sentences(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("First sentence. Second sentence.")
         assert len(result) >= 1
 
     def test_respects_max_length(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         long_text = "This is a sentence. " * 50
         result = split_and_recombine_text(long_text, max_length=100)
         for chunk in result:
@@ -935,37 +935,37 @@ class TestTextSplitter:
             assert len(chunk) <= 120  # Some slack for word boundaries
 
     def test_empty_string(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("")
         assert result == []
 
     def test_whitespace_only(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("   ")
         assert result == []
 
     def test_punctuation_only(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("...")
         assert result == []
 
     def test_question_marks_split(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("Is this a question? Yes it is.")
         assert len(result) >= 1
 
     def test_exclamation_marks_split(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("Wow! That is great.")
         assert len(result) >= 1
 
     def test_newline_split(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("First paragraph.\nSecond paragraph.")
         assert len(result) >= 1
 
     def test_preserves_quotes(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         text = 'She said "Hello world." and left.'
         result = split_and_recombine_text(text)
         # The period inside quotes should not cause a split
@@ -973,19 +973,19 @@ class TestTextSplitter:
         assert "Hello world." in combined
 
     def test_very_long_word(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         # A word longer than max_length should still be handled
         long_word = "a" * 500
         result = split_and_recombine_text(long_word, max_length=100)
         assert len(result) >= 1
 
     def test_consecutive_boundary_markers(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         result = split_and_recombine_text("Really?! Absolutely!!")
         assert len(result) >= 1
 
     def test_smart_quotes_normalized(self):
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         text = '\u201cHello\u201d she said.'
         result = split_and_recombine_text(text)
         combined = " ".join(result)
@@ -1002,7 +1002,7 @@ class TestMigrateCheckpointFile:
 
     def test_migrate_checkpoint_file_default_output(self):
         """migrate_checkpoint_file with no output_path should create .migrated file."""
-        from soprano.vocos.migrate_weights import migrate_checkpoint_file
+        from narro.vocos.migrate_weights import migrate_checkpoint_file
         state_dict = {
             "convnext.0.pwconv1.weight": torch.randn(1536, 512),
             "norm.weight": torch.randn(768),
@@ -1021,7 +1021,7 @@ class TestMigrateCheckpointFile:
 
     def test_migrate_checkpoint_file_custom_output(self):
         """migrate_checkpoint_file with explicit output_path."""
-        from soprano.vocos.migrate_weights import migrate_checkpoint_file
+        from narro.vocos.migrate_weights import migrate_checkpoint_file
         state_dict = {
             "convnext.0.pwconv1.weight": torch.randn(1536, 512),
         }
@@ -1045,7 +1045,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_time_zero_hours_zero_minutes(self):
         """0:00 should return '0' (line 146)."""
-        from soprano.utils.text_normalizer import _expand_time
+        from narro.utils.text_normalizer import _expand_time
         import re
         m = re.match(r'(\d\d?:\d\d(?::\d\d)?)', '0:00')
         result = _expand_time(m)
@@ -1053,7 +1053,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_time_13_hours_zero_minutes(self):
         """13:00 should return '13 minutes' (line 148)."""
-        from soprano.utils.text_normalizer import _expand_time
+        from narro.utils.text_normalizer import _expand_time
         import re
         m = re.match(r'(\d\d?:\d\d(?::\d\d)?)', '13:00')
         result = _expand_time(m)
@@ -1061,7 +1061,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_time_hms_with_nonzero_hours(self):
         """H:M:S format with nonzero hours (line 154-156)."""
-        from soprano.utils.text_normalizer import _expand_time
+        from narro.utils.text_normalizer import _expand_time
         import re
         m = re.match(r'(\d\d?:\d\d(?::\d\d)?)', '01:01:01')
         result = _expand_time(m)
@@ -1070,7 +1070,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_time_hms_zero_hours_nonzero_minutes(self):
         """0:MM:SS format (line 157-158)."""
-        from soprano.utils.text_normalizer import _expand_time
+        from narro.utils.text_normalizer import _expand_time
         import re
         m = re.match(r'(\d\d?:\d\d(?::\d\d)?)', '00:05:10')
         result = _expand_time(m)
@@ -1078,7 +1078,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_time_hms_zero_hours_zero_minutes(self):
         """0:00:SS format should return seconds only (line 159-160)."""
-        from soprano.utils.text_normalizer import _expand_time
+        from narro.utils.text_normalizer import _expand_time
         import re
         m = re.match(r'(\d\d?:\d\d(?::\d\d)?)', '00:00:30')
         result = _expand_time(m)
@@ -1086,7 +1086,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_time_hms_hours_zero_seconds(self):
         """H:M:00 format (seconds == '00' branch)."""
-        from soprano.utils.text_normalizer import _expand_time
+        from narro.utils.text_normalizer import _expand_time
         import re
         m = re.match(r'(\d\d?:\d\d(?::\d\d)?)', '01:00:00')
         result = _expand_time(m)
@@ -1094,7 +1094,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_time_hms_minutes_zero_seconds(self):
         """0:MM:00 format with nonzero minutes, zero seconds."""
-        from soprano.utils.text_normalizer import _expand_time
+        from narro.utils.text_normalizer import _expand_time
         import re
         m = re.match(r'(\d\d?:\d\d(?::\d\d)?)', '00:05:00')
         result = _expand_time(m)
@@ -1102,7 +1102,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_phone_number_invalid_length(self):
         """Phone number with non-10-digit count returns original (line 135)."""
-        from soprano.utils.text_normalizer import _expand_phone_number
+        from narro.utils.text_normalizer import _expand_phone_number
         import re
         m = re.match(r'(\(?\d{3}\)?[-.\s]\d{3}[-.\s]?\d{4})', '123-456-7890')
         result = _expand_phone_number(m)
@@ -1111,7 +1111,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_dollar_unexpected_format(self):
         """Dollar with more than 2 decimal parts (line 166)."""
-        from soprano.utils.text_normalizer import _expand_dollars
+        from narro.utils.text_normalizer import _expand_dollars
         import re
         m = re.match(r'\$([\d\.\,]*\d+)', '$1.2.3')
         result = _expand_dollars(m)
@@ -1119,7 +1119,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_fraction_with_more_than_two_parts(self):
         """Fraction like 1/2/3 should use 'slash' instead of 'over' (line 188-190)."""
-        from soprano.utils.text_normalizer import _expand_fraction, _fraction_re
+        from narro.utils.text_normalizer import _expand_fraction, _fraction_re
         import re
         m = re.search(_fraction_re, '1/2/3')
         result = _expand_fraction(m)
@@ -1127,7 +1127,7 @@ class TestTextNormalizerEdgeCases:
 
     def test_fraction_with_two_parts(self):
         """Fraction like 1/2 should use 'over'."""
-        from soprano.utils.text_normalizer import _expand_fraction, _fraction_re
+        from narro.utils.text_normalizer import _expand_fraction, _fraction_re
         import re
         m = re.search(_fraction_re, '1/2')
         result = _expand_fraction(m)
@@ -1135,19 +1135,19 @@ class TestTextNormalizerEdgeCases:
 
     def test_mixed_case_uppercase_plural(self):
         """Uppercase word ending in 's' => possessive form (line 309-310)."""
-        from soprano.utils.text_normalizer import normalize_mixedcase
+        from narro.utils.text_normalizer import normalize_mixedcase
         result = normalize_mixedcase("TPUs")
         assert "'s" in result
 
     def test_mixed_case_single_capital_word(self):
         """Single capital word should be returned unchanged (line 305-306)."""
-        from soprano.utils.text_normalizer import normalize_mixedcase
+        from narro.utils.text_normalizer import normalize_mixedcase
         result = normalize_mixedcase("Test")
         assert result == "Test"
 
     def test_mixed_case_all_uppercase(self):
         """All uppercase should be returned unchanged (line 307-308)."""
-        from soprano.utils.text_normalizer import normalize_mixedcase
+        from narro.utils.text_normalizer import normalize_mixedcase
         result = normalize_mixedcase("UPPERCASE")
         assert result == "UPPERCASE"
 
@@ -1162,7 +1162,7 @@ class TestTextSplitterEdgeCases:
 
     def test_force_split_at_sentence_boundary(self):
         """Text exceeding max_length with a sentence boundary should split there."""
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         # Create text with a sentence boundary before max_length
         text = "Short sentence. " + "a " * 200 + "end."
         result = split_and_recombine_text(text, desired_length=10, max_length=50)
@@ -1170,7 +1170,7 @@ class TestTextSplitterEdgeCases:
 
     def test_force_split_no_sentence_boundary(self):
         """Text exceeding max_length without sentence boundaries should split at word boundary (lines 51-52)."""
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         # Single long sentence with no sentence-ending punctuation
         text = "word " * 100  # 500 chars with no periods
         result = split_and_recombine_text(text, desired_length=10, max_length=50)
@@ -1178,7 +1178,7 @@ class TestTextSplitterEdgeCases:
 
     def test_end_of_quote_boundary(self):
         """End of quote followed by space should be treated as boundary."""
-        from soprano.utils.text_splitter import split_and_recombine_text
+        from narro.utils.text_splitter import split_and_recombine_text
         text = '"Hello world" she said. Then she left.'
         result = split_and_recombine_text(text)
         assert len(result) >= 1
@@ -1193,7 +1193,7 @@ class TestBaseModelInfer:
 
     def _make_base_model(self):
         """Create a BaseModel instance with mocked model and tokenizer."""
-        from soprano.backends.base import BaseModel
+        from narro.backends.base import BaseModel
         bm = BaseModel()
         bm.model = MagicMock()
         bm.tokenizer = MagicMock()
@@ -1318,7 +1318,7 @@ class TestBaseModelStreamInfer:
     """Test BaseModel.stream_infer with mocked model and tokenizer."""
 
     def _make_base_model(self):
-        from soprano.backends.base import BaseModel
+        from narro.backends.base import BaseModel
         bm = BaseModel()
         bm.model = MagicMock()
         bm.tokenizer = MagicMock()
@@ -1595,7 +1595,7 @@ class TestBaseModelMultiPromptBatch:
     """Test BaseModel.infer with multiple prompts in a batch."""
 
     def _make_base_model(self):
-        from soprano.backends.base import BaseModel
+        from narro.backends.base import BaseModel
         bm = BaseModel()
         bm.model = MagicMock()
         bm.tokenizer = MagicMock()
@@ -1658,7 +1658,7 @@ class TestISTFTForwardPass:
 
     def test_same_padding_produces_audio(self):
         """ISTFT with 'same' padding should produce output of expected length."""
-        from soprano.vocos.spectral_ops import ISTFT
+        from narro.vocos.spectral_ops import ISTFT
         n_fft, hop_length = 2048, 512
         istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding="same")
         T = 20
@@ -1670,7 +1670,7 @@ class TestISTFTForwardPass:
 
     def test_center_padding_produces_audio(self):
         """ISTFT with 'center' padding should produce output."""
-        from soprano.vocos.spectral_ops import ISTFT
+        from narro.vocos.spectral_ops import ISTFT
         n_fft, hop_length = 2048, 512
         istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding="center")
         T = 20
@@ -1682,7 +1682,7 @@ class TestISTFTForwardPass:
 
     def test_different_sequence_lengths(self):
         """ISTFT should handle varying sequence lengths."""
-        from soprano.vocos.spectral_ops import ISTFT
+        from narro.vocos.spectral_ops import ISTFT
         n_fft, hop_length = 2048, 512
         istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding="same")
         for T in [5, 10, 50]:
@@ -1697,7 +1697,7 @@ class TestMigrationGammaCheck:
 
     def test_partially_migrated_with_1d_gamma_detected(self):
         """is_migrated should return False when pwconv is 3D but gamma is still 1D."""
-        from soprano.vocos.migrate_weights import is_migrated
+        from narro.vocos.migrate_weights import is_migrated
         state_dict = {
             "convnext.0.pwconv1.weight": torch.randn(1536, 512, 1),  # migrated
             "convnext.0.gamma": torch.randn(512),  # NOT migrated
@@ -1707,7 +1707,7 @@ class TestMigrationGammaCheck:
 
     def test_fully_migrated_with_2d_gamma(self):
         """is_migrated should return True when all keys including gamma are migrated."""
-        from soprano.vocos.migrate_weights import is_migrated
+        from narro.vocos.migrate_weights import is_migrated
         state_dict = {
             "convnext.0.pwconv1.weight": torch.randn(1536, 512, 1),
             "convnext.0.gamma": torch.randn(512, 1),  # correctly migrated
@@ -1726,13 +1726,13 @@ class TestISTFTValidation:
 
     def test_invalid_padding_raises(self):
         """ISTFT with invalid padding should raise ValueError."""
-        from soprano.vocos.spectral_ops import ISTFT
+        from narro.vocos.spectral_ops import ISTFT
         with pytest.raises(ValueError, match="Padding must be"):
             ISTFT(n_fft=2048, hop_length=512, win_length=2048, padding="invalid")
 
     def test_non_3d_input_raises(self):
         """ISTFT with non-3D input tensor should raise ValueError."""
-        from soprano.vocos.spectral_ops import ISTFT
+        from narro.vocos.spectral_ops import ISTFT
         istft = ISTFT(n_fft=2048, hop_length=512, win_length=2048, padding="same")
         # 2D tensor instead of 3D
         bad_input = torch.randn(1025, 20, dtype=torch.cfloat)
@@ -1748,7 +1748,7 @@ class TestBaseModelAttention:
     """Test BaseModel.infer attention extraction path."""
 
     def _make_base_model(self):
-        from soprano.backends.base import BaseModel
+        from narro.backends.base import BaseModel
         bm = BaseModel()
         bm.model = MagicMock()
         bm.tokenizer = MagicMock()
@@ -1833,27 +1833,27 @@ class TestCLIDispatch:
 
     def test_subcommand_dispatch(self):
         """When command is set, args.func should be called."""
-        from soprano.cli import main
+        from narro.cli import main
         import argparse
 
         mock_func = MagicMock()
-        with patch('sys.argv', ['soprano', 'encode', 'Hello']), \
-             patch('soprano.cli.argparse.ArgumentParser.parse_args') as mock_parse:
+        with patch('sys.argv', ['narro', 'encode', 'Hello']), \
+             patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
             mock_parse.return_value = argparse.Namespace(
                 command='encode',
                 func=mock_func,
                 text='Hello',
-                output='out.soprano',
+                output='out.narro',
             )
             main()
             mock_func.assert_called_once()
 
     def test_no_text_prints_help(self):
         """When no args at all, parser.print_help should be called."""
-        from soprano.cli import main
+        from narro.cli import main
 
-        with patch('sys.argv', ['soprano']), \
-             patch('soprano.cli.argparse.ArgumentParser.print_help') as mock_help:
+        with patch('sys.argv', ['narro']), \
+             patch('narro.cli.argparse.ArgumentParser.print_help') as mock_help:
             main()
             mock_help.assert_called_once()
 
@@ -1867,8 +1867,8 @@ class TestLoadDecoder:
 
     def test_load_decoder_from_local_path(self):
         """load_decoder with model_path should load from local file."""
-        from soprano.decode_only import load_decoder
-        from soprano.vocos.decoder import SopranoDecoder
+        from narro.decode_only import load_decoder
+        from narro.vocos.decoder import SopranoDecoder
 
         # Create a valid state dict from a fresh decoder
         ref_decoder = SopranoDecoder()
@@ -1882,13 +1882,13 @@ class TestLoadDecoder:
 
     def test_load_decoder_from_hub(self):
         """load_decoder without model_path should download from HuggingFace."""
-        from soprano.decode_only import load_decoder
-        from soprano.vocos.decoder import SopranoDecoder
+        from narro.decode_only import load_decoder
+        from narro.vocos.decoder import SopranoDecoder
 
         ref_decoder = SopranoDecoder()
         state_dict = ref_decoder.state_dict()
 
-        with patch('soprano.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
+        with patch('narro.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
              patch('torch.load', return_value=state_dict):
             decoder = load_decoder(compile=False)
             assert isinstance(decoder, SopranoDecoder)
@@ -1896,13 +1896,13 @@ class TestLoadDecoder:
     def test_load_decoder_with_compile_failure_warns(self):
         """load_decoder with compile=True should warn if torch.compile fails."""
         import warnings
-        from soprano.decode_only import load_decoder
-        from soprano.vocos.decoder import SopranoDecoder
+        from narro.decode_only import load_decoder
+        from narro.vocos.decoder import SopranoDecoder
 
         ref_decoder = SopranoDecoder()
         state_dict = ref_decoder.state_dict()
 
-        with patch('soprano.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
+        with patch('narro.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
              patch('torch.load', return_value=state_dict), \
              patch('torch.compile', side_effect=RuntimeError("compile not supported")):
             with warnings.catch_warnings(record=True) as w:
@@ -1913,12 +1913,12 @@ class TestLoadDecoder:
 
     def test_decode_with_no_decoder_loads_default(self):
         """decode() with decoder=None should call load_decoder internally."""
-        from soprano.decode_only import decode
-        from soprano.encoded import EncodedSpeech
+        from narro.decode_only import decode
+        from narro.encoded import EncodedSpeech
 
         encoded = EncodedSpeech(sentences=[], model_id='test')
 
-        with patch('soprano.decode_only.load_decoder') as mock_load:
+        with patch('narro.decode_only.load_decoder') as mock_load:
             mock_load.return_value = MagicMock()
             result = decode(encoded, decoder=None)
             mock_load.assert_called_once()
@@ -1934,13 +1934,13 @@ class TestTransformersModelInit:
 
     def test_init_default_model(self):
         """TransformersModel() should load the default model."""
-        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
-             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls:
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls:
             mock_model = MagicMock()
             mock_model_cls.from_pretrained.return_value = mock_model
             mock_tok_cls.from_pretrained.return_value = MagicMock()
 
-            from soprano.backends.transformers import TransformersModel
+            from narro.backends.transformers import TransformersModel
             tm = TransformersModel(compile=False, quantize=False)
 
             mock_model_cls.from_pretrained.assert_called_once_with(
@@ -1949,30 +1949,30 @@ class TestTransformersModelInit:
 
     def test_init_with_quantize(self):
         """TransformersModel with quantize=True should call quantize_dynamic."""
-        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
-             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls, \
              patch('torch.quantization.quantize_dynamic') as mock_quantize:
             mock_model = MagicMock()
             mock_model_cls.from_pretrained.return_value = mock_model
             mock_tok_cls.from_pretrained.return_value = MagicMock()
             mock_quantize.return_value = mock_model
 
-            from soprano.backends.transformers import TransformersModel
+            from narro.backends.transformers import TransformersModel
             tm = TransformersModel(compile=False, quantize=True)
 
             mock_quantize.assert_called_once()
 
     def test_init_with_compile(self):
         """TransformersModel with compile=True should call torch.compile."""
-        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
-             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls, \
              patch('torch.compile') as mock_compile:
             mock_model = MagicMock()
             mock_model_cls.from_pretrained.return_value = mock_model
             mock_tok_cls.from_pretrained.return_value = MagicMock()
             mock_compile.return_value = mock_model
 
-            from soprano.backends.transformers import TransformersModel
+            from narro.backends.transformers import TransformersModel
             tm = TransformersModel(compile=True, quantize=False)
 
             mock_compile.assert_called_once()
@@ -1980,14 +1980,14 @@ class TestTransformersModelInit:
     def test_init_compile_failure_warns(self):
         """TransformersModel should warn if torch.compile fails."""
         import warnings
-        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
-             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls, \
              patch('torch.compile', side_effect=RuntimeError("not supported")):
             mock_model = MagicMock()
             mock_model_cls.from_pretrained.return_value = mock_model
             mock_tok_cls.from_pretrained.return_value = MagicMock()
 
-            from soprano.backends.transformers import TransformersModel
+            from narro.backends.transformers import TransformersModel
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
                 tm = TransformersModel(compile=True, quantize=False)
@@ -1995,13 +1995,13 @@ class TestTransformersModelInit:
 
     def test_init_custom_model_path(self):
         """TransformersModel with model_path should use that path."""
-        with patch('soprano.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
-             patch('soprano.backends.transformers.AutoTokenizer') as mock_tok_cls:
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls:
             mock_model = MagicMock()
             mock_model_cls.from_pretrained.return_value = mock_model
             mock_tok_cls.from_pretrained.return_value = MagicMock()
 
-            from soprano.backends.transformers import TransformersModel
+            from narro.backends.transformers import TransformersModel
             tm = TransformersModel(model_path='/custom/model', compile=False, quantize=False)
 
             mock_model_cls.from_pretrained.assert_called_once_with(

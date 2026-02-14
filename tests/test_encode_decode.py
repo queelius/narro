@@ -1,4 +1,4 @@
-"""Tests for the encode/decode API in soprano/tts.py and soprano/decode_only.py."""
+"""Tests for the encode/decode API in narro/tts.py and narro/decode_only.py."""
 
 import os
 import tempfile
@@ -8,14 +8,14 @@ import numpy as np
 import pytest
 import torch
 
-from soprano.tts import (
-    SopranoTTS,
+from narro.tts import (
+    Narro,
     SAMPLE_RATE,
     INT16_MAX,
     TOKEN_SIZE,
     HIDDEN_DIM,
 )
-from soprano.encoded import EncodedSpeech, SentenceEncoding, save, load
+from narro.encoded import EncodedSpeech, SentenceEncoding, save, load
 
 
 # ---------------------------------------------------------------------------
@@ -23,8 +23,8 @@ from soprano.encoded import EncodedSpeech, SentenceEncoding, save, load
 # ---------------------------------------------------------------------------
 
 def _make_tts_stub():
-    """Create a SopranoTTS stub without triggering __init__."""
-    obj = object.__new__(SopranoTTS)
+    """Create a Narro stub without triggering __init__."""
+    obj = object.__new__(Narro)
     obj.model_id = 'test/model'
     return obj
 
@@ -448,7 +448,7 @@ class TestRoundtrip:
         encoded = tts.encode("Hello world.")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.soprano")
+            path = os.path.join(tmpdir, "test.narro")
             save(encoded, path)
             loaded = load(path)
 
@@ -495,7 +495,7 @@ class TestDecodeOnly:
 
     def test_decode_function_with_mock_decoder(self):
         """decode_only.decode() should work with a pre-loaded decoder."""
-        from soprano.decode_only import decode
+        from narro.decode_only import decode
 
         encoded = _make_encoded_speech([20], num_texts=1)
 
@@ -511,7 +511,7 @@ class TestDecodeOnly:
 
     def test_decode_to_wav_with_mock_decoder(self):
         """decode_only.decode_to_wav() should write a WAV file."""
-        from soprano.decode_only import decode_to_wav
+        from narro.decode_only import decode_to_wav
 
         encoded = _make_encoded_speech([20], num_texts=1)
 
@@ -533,7 +533,7 @@ class TestDecodeOnly:
 
     def test_decode_multiple_texts(self):
         """decode_only.decode() should handle multiple texts."""
-        from soprano.decode_only import decode
+        from narro.decode_only import decode
 
         sentences = [
             SentenceEncoding(
@@ -568,7 +568,7 @@ class TestDecodeOnly:
 class TestBaseModelEnrichedOutput:
 
     def _make_base_model(self):
-        from soprano.backends.base import BaseModel
+        from narro.backends.base import BaseModel
         bm = BaseModel()
         bm.model = MagicMock()
         bm.tokenizer = MagicMock()
@@ -678,12 +678,12 @@ class TestCLISubcommands:
 
     def test_encode_subcommand(self):
         """encode subcommand should call tts.encode and save."""
-        from soprano.cli import cmd_encode
+        from narro.cli import cmd_encode
         import argparse
 
         args = argparse.Namespace(
             text='Hello world',
-            output='/tmp/test.soprano',
+            output='/tmp/test.narro',
             model_path=None,
             no_compile=True,
             quantize=False,
@@ -691,8 +691,8 @@ class TestCLISubcommands:
             include_attention=False,
         )
 
-        with patch('soprano.SopranoTTS') as mock_tts_cls, \
-             patch('soprano.encoded.save') as mock_save:
+        with patch('narro.Narro') as mock_tts_cls, \
+             patch('narro.encoded.save') as mock_save:
             mock_tts = MagicMock()
             mock_tts_cls.return_value = mock_tts
             mock_encoded = MagicMock()
@@ -703,15 +703,15 @@ class TestCLISubcommands:
             cmd_encode(args)
 
             mock_tts.encode.assert_called_once_with('Hello world', include_attention=False)
-            mock_save.assert_called_once_with(mock_encoded, '/tmp/test.soprano')
+            mock_save.assert_called_once_with(mock_encoded, '/tmp/test.narro')
 
     def test_decode_subcommand(self):
         """decode subcommand should call load and decode_to_wav."""
-        from soprano.cli import cmd_decode
+        from narro.cli import cmd_decode
         import argparse
 
         args = argparse.Namespace(
-            input='/tmp/test.soprano',
+            input='/tmp/test.narro',
             output='/tmp/test.wav',
             model_path=None,
             no_compile=True,
@@ -720,9 +720,9 @@ class TestCLISubcommands:
             decoder_batch_size=4,
         )
 
-        with patch('soprano.encoded.load') as mock_load, \
-             patch('soprano.decode_only.load_decoder') as mock_load_decoder, \
-             patch('soprano.decode_only.decode_to_wav') as mock_decode_wav:
+        with patch('narro.encoded.load') as mock_load, \
+             patch('narro.decode_only.load_decoder') as mock_load_decoder, \
+             patch('narro.decode_only.decode_to_wav') as mock_decode_wav:
             mock_encoded = MagicMock()
             mock_load.return_value = mock_encoded
             mock_decoder = MagicMock()
@@ -730,5 +730,5 @@ class TestCLISubcommands:
 
             cmd_decode(args)
 
-            mock_load.assert_called_once_with('/tmp/test.soprano')
+            mock_load.assert_called_once_with('/tmp/test.narro')
             mock_decode_wav.assert_called_once()

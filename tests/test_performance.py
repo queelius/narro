@@ -1,4 +1,4 @@
-"""Performance and optimization tests for Soprano TTS."""
+"""Performance and optimization tests for Narro TTS."""
 
 import time
 
@@ -7,11 +7,11 @@ import pytest
 import torch
 from torch import nn
 
-from soprano.vocos.modules import ChannelsFirstLayerNorm, ConvNeXtBlock
-from soprano.vocos.models import VocosBackbone
-from soprano.vocos.decoder import SopranoDecoder
-from soprano.vocos.heads import ISTFTHead
-from soprano.vocos.migrate_weights import (
+from narro.vocos.modules import ChannelsFirstLayerNorm, ConvNeXtBlock
+from narro.vocos.models import VocosBackbone
+from narro.vocos.decoder import SopranoDecoder
+from narro.vocos.heads import ISTFTHead
+from narro.vocos.migrate_weights import (
     migrate_decoder_weights,
     is_migrated,
     load_with_migration,
@@ -26,10 +26,10 @@ class TestHallucinationDetector:
     """Test the vectorized hallucination detector."""
 
     def _make_tts_stub(self):
-        """Create a SopranoTTS-like object with only the detector method."""
-        from soprano.tts import SopranoTTS
+        """Create a Narro-like object with only the detector method."""
+        from narro.tts import Narro
         # Build a minimal stub without __init__ side-effects
-        obj = object.__new__(SopranoTTS)
+        obj = object.__new__(Narro)
         return obj
 
     def test_no_hallucination(self):
@@ -49,7 +49,7 @@ class TestHallucinationDetector:
 
     def test_short_sequence_skipped(self):
         """Sequences shorter than MAX_RUNLENGTH should return False immediately."""
-        from soprano.tts import MAX_RUNLENGTH
+        from narro.tts import MAX_RUNLENGTH
         tts = self._make_tts_stub()
         hidden_state = [torch.randn(512) for _ in range(MAX_RUNLENGTH)]
         assert tts.hallucination_detector(hidden_state) is False
@@ -70,7 +70,7 @@ class TestHallucinationDetector:
 
     def test_edge_just_above_threshold(self):
         """Exactly MAX_RUNLENGTH+1 similar states should trigger."""
-        from soprano.tts import MAX_RUNLENGTH, DIFF_THRESHOLD
+        from narro.tts import MAX_RUNLENGTH, DIFF_THRESHOLD
         tts = self._make_tts_stub()
         # Need enough states and enough consecutive similar ones
         hidden_state = []

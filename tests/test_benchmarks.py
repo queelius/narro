@@ -1,4 +1,4 @@
-"""Benchmark tests for Soprano TTS pipeline timing.
+"""Benchmark tests for Narro TTS pipeline timing.
 
 Skipped by default. Run with:
     pytest tests/test_benchmarks.py -v -k benchmark --no-header -rN
@@ -9,8 +9,8 @@ import time
 import pytest
 import torch
 
-from soprano.tts import SopranoTTS, SAMPLE_RATE
-from soprano.vocos.decoder import SopranoDecoder
+from narro.tts import Narro, SAMPLE_RATE
+from narro.vocos.decoder import SopranoDecoder
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ class TestEndToEndBenchmark:
         num_runs = 5
 
         t0 = time.perf_counter()
-        tts = SopranoTTS(compile=False, quantize=True)
+        tts = Narro(compile=False, quantize=True)
         startup = time.perf_counter() - t0
 
         # Cold
