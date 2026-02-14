@@ -448,7 +448,7 @@ class TestRoundtrip:
         encoded = tts.encode("Hello world.")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(encoded, path)
             loaded = load(path)
 
@@ -683,7 +683,7 @@ class TestCLISubcommands:
 
         args = argparse.Namespace(
             text='Hello world',
-            output='/tmp/test.narro',
+            output='/tmp/test.soprano',
             model_path=None,
             no_compile=True,
             quantize=False,
@@ -703,7 +703,7 @@ class TestCLISubcommands:
             cmd_encode(args)
 
             mock_tts.encode.assert_called_once_with('Hello world', include_attention=False)
-            mock_save.assert_called_once_with(mock_encoded, '/tmp/test.narro')
+            mock_save.assert_called_once_with(mock_encoded, '/tmp/test.soprano')
 
     def test_decode_subcommand(self):
         """decode subcommand should call load and decode_to_wav."""
@@ -711,7 +711,7 @@ class TestCLISubcommands:
         import argparse
 
         args = argparse.Namespace(
-            input='/tmp/test.narro',
+            input='/tmp/test.soprano',
             output='/tmp/test.wav',
             model_path=None,
             no_compile=True,
@@ -730,5 +730,5 @@ class TestCLISubcommands:
 
             cmd_decode(args)
 
-            mock_load.assert_called_once_with('/tmp/test.narro')
+            mock_load.assert_called_once_with('/tmp/test.soprano')
             mock_decode_wav.assert_called_once()

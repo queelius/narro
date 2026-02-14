@@ -2,7 +2,7 @@
 
 The IR decouples the LLM encoder from the Vocos decoder, enabling:
 - Offline encoding (encode once, decode many times)
-- Cross-platform decoding (ship .narro files)
+- Cross-platform decoding (ship .soprano files)
 - Quality estimation via per-token entropy
 - Text-audio alignment via attention weights
 """
@@ -95,7 +95,7 @@ class EncodedSpeech:
 
 
 def _tamper_format_version_for_test(path: str, version: int) -> None:
-    """Test helper: overwrite format_version in a saved .narro file."""
+    """Test helper: overwrite format_version in a saved .soprano file."""
     path = _normalize_path(path)
     data = dict(np.load(path, allow_pickle=False))
     meta = json.loads(data['meta'].tobytes().decode('utf-8'))
@@ -113,7 +113,7 @@ def _normalize_path(path: str) -> str:
 
 
 def save(encoded: EncodedSpeech, path: str, compress: bool = True) -> None:
-    """Save EncodedSpeech to a .narro file (npz container).
+    """Save EncodedSpeech to a .soprano file (npz container).
 
     Wire format uses float16 for hidden states and entropy to halve file size.
     Token IDs are stored as uint16. No pickle is used — all data is stored as
@@ -170,14 +170,14 @@ def save(encoded: EncodedSpeech, path: str, compress: bool = True) -> None:
 
 
 def load(path: str) -> EncodedSpeech:
-    """Load EncodedSpeech from a .narro file.
+    """Load EncodedSpeech from a .soprano file.
 
     Converts float16 wire format back to float32 for computation.
     Uses allow_pickle=False for safe deserialization — only numpy arrays
     and JSON metadata are read.
 
     Args:
-        path: Path to the .narro file (auto-appends .npz if needed).
+        path: Path to the .soprano file (auto-appends .npz if needed).
 
     Returns:
         EncodedSpeech with all sentences restored.

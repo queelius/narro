@@ -159,7 +159,7 @@ class TestSaveLoad:
         ])
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
             loaded = load(path)  # np.savez appends .npz
 
@@ -180,7 +180,7 @@ class TestSaveLoad:
         enc = _make_encoded(sentences=[s])
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
             loaded = load(path)
 
@@ -198,7 +198,7 @@ class TestSaveLoad:
         enc = _make_encoded(sentences=[s])
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
             loaded = load(path)
 
@@ -215,7 +215,7 @@ class TestSaveLoad:
         enc = _make_encoded(sentences=[s])
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
             loaded = load(path)
 
@@ -233,7 +233,7 @@ class TestSaveLoad:
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "meta_test.narro")
+            path = os.path.join(tmpdir, "meta_test.soprano")
             save(enc, path)
             loaded = load(path)
 
@@ -249,7 +249,7 @@ class TestSaveLoad:
         enc = _make_encoded()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test_uncompressed.narro")
+            path = os.path.join(tmpdir, "test_uncompressed.soprano")
             save(enc, path, compress=False)
             loaded = load(path)
             assert loaded.model_id == enc.model_id
@@ -260,7 +260,7 @@ class TestSaveLoad:
         enc = _make_encoded(sentences=[s])
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
             loaded = load(path)
 
@@ -276,7 +276,7 @@ class TestSaveLoad:
         enc = _make_encoded(sentences=sentences)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "multi.narro")
+            path = os.path.join(tmpdir, "multi.soprano")
             save(enc, path)
             loaded = load(path)
 
@@ -293,7 +293,7 @@ class TestSaveLoad:
         enc = _make_encoded()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
             loaded = load(path)  # NOT path + ".npz"
             assert loaded.model_id == enc.model_id
@@ -304,7 +304,7 @@ class TestSaveLoad:
         enc = _make_encoded()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test.narro")
+            path = os.path.join(tmpdir, "test.soprano")
             save(enc, path)
             loaded = load(path)  # explicit .npz still works
             assert loaded.model_id == enc.model_id
@@ -326,7 +326,7 @@ class TestSaveLoad:
         enc = _make_encoded()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "future.narro")
+            path = os.path.join(tmpdir, "future.soprano")
             save(enc, path)
             _tamper_format_version_for_test(path, 999)
             with pytest.raises(ValueError, match="format version 999"):
@@ -341,7 +341,7 @@ class TestSaveLoad:
         enc = _make_encoded(sentences=sentences)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "props.narro")
+            path = os.path.join(tmpdir, "props.soprano")
             save(enc, path)
             loaded = load(path)
 

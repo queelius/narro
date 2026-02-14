@@ -1843,7 +1843,7 @@ class TestCLIDispatch:
                 command='encode',
                 func=mock_func,
                 text='Hello',
-                output='out.narro',
+                output='out.soprano',
             )
             main()
             mock_func.assert_called_once()

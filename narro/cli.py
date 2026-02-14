@@ -34,7 +34,7 @@ def cmd_speak(args):
 
 
 def cmd_encode(args):
-    """Encode text to .narro file."""
+    """Encode text to .soprano file."""
     from narro import Narro
     from narro.encoded import save
     tts = Narro(
@@ -51,7 +51,7 @@ def cmd_encode(args):
 
 
 def cmd_decode(args):
-    """Decode .narro file to WAV."""
+    """Decode .soprano file to WAV."""
     from narro.encoded import load
     from narro.decode_only import decode_to_wav, load_decoder
     logger.info("Loading encoded speech from: %s", args.input)
@@ -85,8 +85,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   narro "Hello world" -o output.wav
-  narro encode "Hello world" -o encoded.narro
-  narro decode encoded.narro -o output.wav
+  narro encode "Hello world" -o encoded.soprano
+  narro decode encoded.soprano -o output.wav
 """)
 
     subparsers = parser.add_subparsers(dest='command')
@@ -98,18 +98,18 @@ def main():
     speak_parser.set_defaults(func=cmd_speak)
 
     # --- encode ---
-    encode_parser = subparsers.add_parser('encode', help='Encode text to .narro file')
+    encode_parser = subparsers.add_parser('encode', help='Encode text to .soprano file')
     encode_parser.add_argument('text', help='Text to encode')
-    encode_parser.add_argument('--output', '-o', default='output.narro',
-                               help='Output .narro file path')
+    encode_parser.add_argument('--output', '-o', default='output.soprano',
+                               help='Output .soprano file path')
     encode_parser.add_argument('--include-attention', action='store_true',
                                help='Include attention weights (larger file)')
     _add_common_args(encode_parser)
     encode_parser.set_defaults(func=cmd_encode)
 
     # --- decode ---
-    decode_parser = subparsers.add_parser('decode', help='Decode .narro file to WAV')
-    decode_parser.add_argument('input', help='Input .narro file path')
+    decode_parser = subparsers.add_parser('decode', help='Decode .soprano file to WAV')
+    decode_parser.add_argument('input', help='Input .soprano file path')
     decode_parser.add_argument('--output', '-o', default='output.wav',
                                help='Output WAV file path')
     decode_parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,
