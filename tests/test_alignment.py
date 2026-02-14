@@ -134,6 +134,65 @@ class TestExtractAlignment:
         result = extract_alignment(attention, token_to_word, token_duration)
         assert result == []
 
+    def test_duplicate_words_produce_separate_entries(self):
+        """Repeated words (e.g., 'the ... the') should each get their own entry."""
+        T = 12
+        input_len = 6  # e.g. [STOP][TEXT] the cat the mat
+
+        attention = np.zeros((T, input_len), dtype=np.float32)
+        attention[:3, 2] = 1.0   # first "the"
+        attention[3:6, 3] = 1.0  # "cat"
+        attention[6:9, 4] = 1.0  # second "the"
+        attention[9:, 5] = 1.0   # "mat"
+
+        token_to_word = {2: "the", 3: "cat", 4: "the", 5: "mat"}
+        token_duration = 0.064
+
+        result = extract_alignment(attention, token_to_word, token_duration)
+
+        assert len(result) == 4
+        words = [r['word'] for r in result]
+        assert words.count('the') == 2
+        # The two "the" entries should have different start times
+        the_entries = [r for r in result if r['word'] == 'the']
+        assert the_entries[0]['start'] != the_entries[1]['start']
+
+    def test_zero_spread_has_minimum_width(self):
+        """When all attention is on a single token, the entry should still have non-zero width."""
+        T = 10
+        input_len = 3
+
+        attention = np.zeros((T, input_len), dtype=np.float32)
+        # All attention on a single generated token
+        attention[5, 2] = 1.0
+
+        token_to_word = {2: "hello"}
+        token_duration = 0.064
+
+        result = extract_alignment(attention, token_to_word, token_duration)
+
+        assert len(result) == 1
+        assert result[0]['end'] > result[0]['start']
+
+    def test_zero_attention_word(self):
+        """A word with zero attention should appear with zero duration."""
+        T = 5
+        input_len = 4
+
+        attention = np.zeros((T, input_len), dtype=np.float32)
+        attention[:, 2] = 1.0  # only "hello" gets attention
+
+        token_to_word = {2: "hello", 3: "ghost"}
+        token_duration = 0.064
+
+        result = extract_alignment(attention, token_to_word, token_duration)
+
+        assert len(result) == 2
+        ghost = [r for r in result if r['word'] == 'ghost']
+        assert len(ghost) == 1
+        assert ghost[0]['start'] == 0.0
+        assert ghost[0]['end'] == 0.0
+
 
 # ---------------------------------------------------------------------------
 # save_alignment tests
@@ -331,22 +390,16 @@ class TestCLIAlignFlag:
 
     def test_cli_align_flag_short(self):
         """The speak subcommand should accept -a shorthand."""
-        from narro.cli import main
-        from unittest.mock import patch, MagicMock
+        import narro.cli as cli_mod
 
-        # Test that -a is accepted by the parser
-        with patch('sys.argv', ['narro', 'speak', 'Hello', '-a', 'out.json']):
-            from narro.cli import main as _main
-            import narro.cli as cli_mod
+        parser = cli_mod.argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest='command')
+        speak_parser = subparsers.add_parser('speak')
+        cli_mod._add_speak_args(speak_parser)
+        cli_mod._add_common_args(speak_parser)
 
-            parser = cli_mod.argparse.ArgumentParser()
-            subparsers = parser.add_subparsers(dest='command')
-            speak_parser = subparsers.add_parser('speak')
-            cli_mod._add_speak_args(speak_parser)
-            cli_mod._add_common_args(speak_parser)
-
-            args = parser.parse_args(['speak', 'Hello', '-a', 'out.json'])
-            assert args.align == 'out.json'
+        args = parser.parse_args(['speak', 'Hello', '-a', 'out.json'])
+        assert args.align == 'out.json'
 
     def test_cli_align_flag_defaults_none(self):
         """--align should default to None when not provided."""

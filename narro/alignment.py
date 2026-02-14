@@ -32,22 +32,30 @@ def extract_alignment(attention, token_to_word, token_duration):
     if T == 0 or not token_to_word:
         return []
 
-    # Collect unique words and their input token indices
-    # A word may span multiple input tokens
-    word_positions = {}  # word -> list of input token indices
-    word_order = []  # preserve insertion order for determinism
+    # Collect word instances and their input token indices.
+    # A word may span multiple input tokens, and the same word string may
+    # appear multiple times (e.g., "the cat sat on the mat"). We track
+    # each occurrence separately using (occurrence_index, word) tuples.
+    word_instances = []  # list of (word_str, [input_token_indices])
+    seen_positions = set()
     for token_idx, word in sorted(token_to_word.items()):
-        if word not in word_positions:
-            word_positions[word] = []
-            word_order.append(word)
-        word_positions[word].append(token_idx)
+        if token_idx in seen_positions:
+            continue
+        seen_positions.add(token_idx)
+        # Check if this is a continuation of the previous word instance
+        if word_instances and word_instances[-1][0] == word:
+            prev_indices = word_instances[-1][1]
+            if token_idx == prev_indices[-1] + 1:
+                # Adjacent token for the same word — extend
+                prev_indices.append(token_idx)
+                continue
+        word_instances.append((word, [token_idx]))
 
     # Generated token timestamps (center of each token's time interval)
     timestamps = np.arange(T) * token_duration
 
     alignment = []
-    for word in word_order:
-        indices = word_positions[word]
+    for word, indices in word_instances:
 
         # Sum attention across all input tokens belonging to this word
         word_attention = np.zeros(T, dtype=np.float32)
@@ -70,9 +78,10 @@ def extract_alignment(attention, token_to_word, token_duration):
         # Center of mass (expected timestamp)
         center = float(np.dot(weights, timestamps))
 
-        # Weighted standard deviation as spread
+        # Weighted standard deviation as spread, clamped to at least
+        # half a token duration so words always have non-zero width
         variance = float(np.dot(weights, (timestamps - center) ** 2))
-        spread = float(np.sqrt(variance))
+        spread = max(float(np.sqrt(variance)), token_duration / 2)
 
         start = max(0.0, center - spread)
         end = min(T * token_duration, center + spread)

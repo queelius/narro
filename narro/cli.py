@@ -33,17 +33,12 @@ def cmd_speak(args):
     if args.align:
         from narro.alignment import extract_alignment_from_encoded, save_alignment
         encoded = tts.encode(args.text, include_attention=True)
-        audio_list = tts.decode(encoded)
-        from narro.decode_only import write_wav
-        import torch
-        write_wav(torch.cat(audio_list), args.output)
+        tts.decode_to_wav(encoded, args.output)
         alignment = extract_alignment_from_encoded(encoded)
         save_alignment(alignment, args.align)
-        logger.info("Alignment saved to: %s", args.align)
     else:
         tts.infer(args.text, out_path=args.output)
-
-    logger.info("Audio saved to: %s", args.output)
+        logger.info("Audio saved to: %s", args.output)
 
 
 def cmd_encode(args):
