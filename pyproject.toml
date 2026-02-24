@@ -18,6 +18,7 @@ classifiers = [
 dependencies = [
   "huggingface_hub",
   "numpy",
+  "pyyaml",
   "scipy",
   "torch>=2.1.0",
   "transformers>=4.51.0",
