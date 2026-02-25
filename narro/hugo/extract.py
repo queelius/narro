@@ -13,12 +13,31 @@ from typing import Any
 import yaml
 
 
+def _strip_fenced_code(text: str) -> str:
+    """Remove fenced code blocks (``` or ~~~), handling unclosed fences."""
+    lines = text.split('\n')
+    result = []
+    fence = None
+    for line in lines:
+        if fence is None:
+            m = re.match(r'^(`{3,}|~{3,})', line)
+            if m:
+                fence = m.group(1)
+            else:
+                result.append(line)
+        else:
+            if re.match(r'^' + re.escape(fence) + r'\s*$', line):
+                fence = None
+    return '\n'.join(result)
+
+
 def parse_frontmatter(markdown: str) -> tuple[dict[str, Any], str]:
     """Parse YAML frontmatter from markdown.
 
     Returns (metadata, body). If no frontmatter is found,
     returns ({}, full_input).
     """
+    markdown = markdown.replace('\r\n', '\n')
     pattern = re.compile(r"\A---\n(.*?\n)---\n?(.*)", re.DOTALL)
     match = pattern.match(markdown)
     if not match:
@@ -52,15 +71,18 @@ def extract_prose(text: str) -> str:
     13. Strip inline code backticks (preserve text)
     14. Collapse excessive whitespace
     """
+    # 0. Normalize CRLF line endings
+    text = text.replace('\r\n', '\n')
+
     # 1. Strip fenced code blocks (``` or ~~~)
-    text = re.sub(r"^(`{3,}|~{3,}).*?\n.*?^\1\s*$", "", text, flags=re.MULTILINE | re.DOTALL)
+    text = _strip_fenced_code(text)
 
     # 2. Strip indented code blocks (4 spaces or tab after a blank line)
     text = re.sub(r"(?<=\n\n)((?:(?:    |\t).+\n?)+)", "", text)
 
     # 3. Strip LaTeX math
-    # Block math: $$...$$
-    text = re.sub(r"\$\$.*?\$\$", "", text, flags=re.DOTALL)
+    # Block math: $$...$$ (only when $$ is on its own line)
+    text = re.sub(r"^\$\$\s*\n.*?\n\s*\$\$\s*$", "", text, flags=re.MULTILINE | re.DOTALL)
     # Block math: \[...\]
     text = re.sub(r"\\\[.*?\\\]", "", text, flags=re.DOTALL)
     # Inline math: \(...\)
@@ -79,6 +101,10 @@ def extract_prose(text: str) -> str:
     text = re.sub(r"\{\{<[^>]*/>\}\}", "", text)
     # Any remaining single shortcode tags (non-paired)
     text = re.sub(r"\{\{<[^>]*>\}\}", "", text)
+    # Percent-delimited shortcodes: {{% name %}}...{{% /name %}}, {{% name /%}}, {{% name %}}
+    text = re.sub(r"\{\{%\s*(\w+)[^%]*%\}\}.*?\{\{%\s*/\s*\1\s*%\}\}", "", text, flags=re.DOTALL)
+    text = re.sub(r"\{\{%[^%]*/%\}\}", "", text)
+    text = re.sub(r"\{\{%[^%]*%\}\}", "", text)
 
     # 6. Strip HTML tags
     text = re.sub(r"<[^>]+>", "", text)

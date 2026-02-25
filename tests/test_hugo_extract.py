@@ -80,7 +80,7 @@ class TestExtractProse:
         assert "Next paragraph." in result
 
     def test_strips_latex_block(self):
-        text = "Before math.\n\n$$E=mc^2$$\n\nAfter math."
+        text = "Before math.\n\n$$\nE=mc^2\n$$\n\nAfter math."
         result = extract_prose(text)
         assert "E=mc" not in result
         assert "Before math." in result
@@ -208,6 +208,50 @@ class TestExtractProse:
         assert "first" in result
         assert "tenth" in result
 
+    def test_unclosed_fenced_code_block(self):
+        """An unclosed ``` block strips from fence to EOF, and completes quickly."""
+        text = "Before.\n\n```python\nsome code\nmore code"
+        result = extract_prose(text)
+        assert "some code" not in result
+        assert "more code" not in result
+        assert "Before." in result
+
+    def test_strips_percent_shortcodes(self):
+        """{{% note %}}Content{{% /note %}} gets stripped."""
+        text = "Before. {{% note %}}Content inside{{% /note %}} After."
+        result = extract_prose(text)
+        assert "note" not in result
+        assert "Content inside" not in result
+        assert "Before." in result
+        assert "After." in result
+
+    def test_crlf_line_endings(self):
+        """Frontmatter and body with CRLF work correctly."""
+        md = "---\r\ntitle: Hello\r\n---\r\nBody text\r\n"
+        meta, body = parse_frontmatter(md)
+        assert meta["title"] == "Hello"
+        assert "Body text" in body
+
+        text = "## Heading\r\n\r\nParagraph."
+        result = extract_prose(text)
+        assert "##" not in result
+        assert "Heading" in result
+        assert "Paragraph." in result
+
+    def test_dollar_signs_in_prose_preserved(self):
+        """Inline $$100 should NOT be stripped (not LaTeX block math)."""
+        text = "The item costs $$100 at the store."
+        result = extract_prose(text)
+        assert "$$100" in result
+
+    def test_empty_input(self):
+        """Empty string returns empty string."""
+        assert extract_prose("") == ""
+
+    def test_whitespace_only_input(self):
+        """Whitespace-only input returns empty string."""
+        assert extract_prose("   \n\n  \n  ") == ""
+
     def test_realistic_post(self):
         """A full markdown document with headings, code, math, images, links, shortcodes."""
         md = """\
@@ -217,7 +261,9 @@ This post explains **gradient descent** in machine learning.
 
 Consider the loss function:
 
-$$L(\\theta) = \\frac{1}{n} \\sum_{i=1}^{n} (y_i - f(x_i; \\theta))^2$$
+$$
+L(\\theta) = \\frac{1}{n} \\sum_{i=1}^{n} (y_i - f(x_i; \\theta))^2
+$$
 
 The update rule is \\(\\theta \\leftarrow \\theta - \\alpha \\nabla L\\).
 
