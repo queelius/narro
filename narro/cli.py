@@ -70,6 +70,24 @@ def cmd_decode(args):
     logger.info("Audio saved to: %s", args.output)
 
 
+def cmd_hugo(args):
+    """Dispatch hugo subcommands."""
+    from narro.hugo.cli import cmd_hugo_generate, cmd_hugo_install, cmd_hugo_status
+    if args.hugo_command == 'generate':
+        cmd_hugo_generate(
+            args.site_root,
+            force=args.force,
+            dry_run=args.dry_run,
+            post_slug=args.post,
+        )
+    elif args.hugo_command == 'install':
+        cmd_hugo_install(args.site_root)
+    elif args.hugo_command == 'status':
+        cmd_hugo_status(args.site_root)
+    else:
+        args._hugo_parser.print_help()
+
+
 def _add_speak_args(parser):
     """Add speak-specific args (text, output, batch size, alignment)."""
     parser.add_argument('text', help='Text to synthesize')
@@ -86,7 +104,7 @@ def main():
 
     # Default to 'speak' when first arg isn't a known subcommand.
     # This lets `narro "Hello world"` work as shorthand for `narro speak "Hello world"`.
-    _subcommands = {'speak', 'encode', 'decode'}
+    _subcommands = {'speak', 'encode', 'decode', 'hugo'}
     if len(sys.argv) > 1 and sys.argv[1] not in _subcommands and sys.argv[1] not in ('-h', '--help'):
         sys.argv.insert(1, 'speak')
 
@@ -97,6 +115,8 @@ def main():
   narro "Hello world" -o output.wav
   narro encode "Hello world" -o encoded.soprano
   narro decode encoded.soprano -o output.wav
+  narro hugo generate ~/mysite
+  narro hugo install ~/mysite
 """)
 
     subparsers = parser.add_subparsers(dest='command')
@@ -129,6 +149,28 @@ def main():
     decode_parser.add_argument('--no-compile', action='store_true',
                                help='Disable torch.compile optimization')
     decode_parser.set_defaults(func=cmd_decode)
+
+    # --- hugo ---
+    hugo_parser = subparsers.add_parser('hugo', help='Hugo site integration')
+    hugo_subparsers = hugo_parser.add_subparsers(dest='hugo_command')
+    hugo_parser.set_defaults(func=cmd_hugo, _hugo_parser=hugo_parser)
+
+    # hugo generate
+    gen_parser = hugo_subparsers.add_parser('generate', help='Generate TTS for posts')
+    gen_parser.add_argument('site_root', help='Path to Hugo site root')
+    gen_parser.add_argument('--force', action='store_true',
+                            help='Regenerate even if audio exists')
+    gen_parser.add_argument('--dry-run', action='store_true',
+                            help='Show what would be generated')
+    gen_parser.add_argument('--post', help='Generate for a single post slug')
+
+    # hugo install
+    inst_parser = hugo_subparsers.add_parser('install', help='Install player assets')
+    inst_parser.add_argument('site_root', help='Path to Hugo site root')
+
+    # hugo status
+    stat_parser = hugo_subparsers.add_parser('status', help='Show TTS status')
+    stat_parser.add_argument('site_root', help='Path to Hugo site root')
 
     args = parser.parse_args()
 
