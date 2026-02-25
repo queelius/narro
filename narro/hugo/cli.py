@@ -262,6 +262,9 @@ def cmd_hugo_generate(
         try:
             # Extract speakable prose
             prose = extract_prose(p["body"])
+            if not prose.strip():
+                print(f"  Skipped: no speakable text in {p['slug']}", file=sys.stderr)
+                continue
 
             # Encode with attention for alignment
             encoded = tts.encode(prose, include_attention=True)

@@ -164,8 +164,9 @@ class TestHugoStatus:
         (site / "content" / "post" / "done" / "narration.opus").write_bytes(b"\x00")
         cmd_hugo_status(str(site))
         out = capsys.readouterr().out
-        # Should indicate audio exists (e.g. checkmark or "yes")
+        # Should indicate audio exists
         assert "Done Post" in out
+        assert "yes" in out.lower() or "\u2713" in out or "ready" in out.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +246,7 @@ class TestHugoGenerate:
                 Path(opus_out).write_bytes(b"\x00" * 10)
             return subprocess.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+        monkeypatch.setattr("narro.hugo.cli.subprocess.run", fake_subprocess_run)
 
         fake_alignment = [{"word": "hello", "start": 0.0, "end": 0.5}]
         monkeypatch.setattr(
@@ -300,7 +301,7 @@ class TestHugoGenerate:
                 Path(cmd[-1]).write_bytes(b"\x00" * 10)
             return subprocess.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+        monkeypatch.setattr("narro.hugo.cli.subprocess.run", fake_subprocess_run)
         monkeypatch.setattr(
             "narro.hugo.cli.extract_alignment_from_encoded",
             lambda enc: [],
@@ -343,7 +344,7 @@ class TestHugoGenerate:
                 Path(cmd[-1]).write_bytes(b"\x00" * 10)
             return subprocess.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+        monkeypatch.setattr("narro.hugo.cli.subprocess.run", fake_subprocess_run)
         monkeypatch.setattr(
             "narro.hugo.cli.extract_alignment_from_encoded",
             lambda enc: [],
@@ -392,7 +393,7 @@ class TestHugoGenerate:
                 Path(cmd[-1]).write_bytes(b"\x00" * 10)
             return subprocess.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+        monkeypatch.setattr("narro.hugo.cli.subprocess.run", fake_subprocess_run)
         monkeypatch.setattr(
             "narro.hugo.cli.extract_alignment_from_encoded",
             lambda enc: [],
