@@ -26,6 +26,11 @@ pytest tests/ --cov=narro
 
 # CLI usage
 narro "Hello world" -o output.wav
+
+# Hugo integration
+narro hugo install ~/mysite
+narro hugo generate ~/mysite
+narro hugo status ~/mysite
 ```
 
 ## Architecture
@@ -54,6 +59,16 @@ The decoder's `ConvNeXtBlock` was refactored from `nn.Linear` to `nn.Conv1d` (ke
 ### Hallucination Detection
 
 `tts.py:hallucination_detector` monitors consecutive hidden states — if the L1 difference between adjacent states stays below `DIFF_THRESHOLD=300` for more than `MAX_RUNLENGTH=16` steps, it flags hallucination and can trigger regeneration (controlled by `retries` parameter).
+
+### Hugo Integration
+
+`narro/hugo/` provides Hugo site TTS integration:
+
+- `extract.py`: `extract_prose()` strips markdown to speakable text (frontmatter, code, math, images, shortcodes, HTML)
+- `cli.py`: `cmd_hugo_generate()`, `cmd_hugo_install()`, `cmd_hugo_status()` — called via `narro hugo <subcommand>`
+- `assets/`: Hugo partial (`tts-player.html`), JS player (`tts-player.js`), CSS (`tts-player.css`)
+
+Usage: `narro hugo install <site>` copies assets, then `narro hugo generate <site>` creates narration for posts with `tts: true`. Requires ffmpeg for WAV→Opus conversion.
 
 ## Testing
 
