@@ -16,6 +16,7 @@
   var alignment = [];
   var wordSpans = [];
   var activeIdx = -1;
+  var rafId = null;
 
   // --- Initialization ---
 
@@ -32,8 +33,15 @@
   }
 
   /**
+   * Normalize a word for matching: lowercase, strip punctuation.
+   */
+  function normalizeWord(w) {
+    return w.toLowerCase().replace(/[^a-z0-9']/g, "");
+  }
+
+  /**
    * Walk text nodes in the article, wrap each word in a <span>.
-   * Match words sequentially to alignment entries.
+   * Match words to alignment entries by normalized text comparison.
    */
   function wrapWords() {
     var article = document.querySelector("article") || document.querySelector(".content");
@@ -63,10 +71,15 @@
         var span = document.createElement("span");
         span.className = "tts-word";
 
+        // Match DOM word to alignment entry by normalized text
         if (alignIdx < alignment.length) {
-          span.dataset.idx = alignIdx;
-          wordSpans[alignIdx] = span;
-          alignIdx++;
+          var domNorm = normalizeWord(part);
+          var alignNorm = normalizeWord(alignment[alignIdx].word);
+          if (domNorm === alignNorm || domNorm.indexOf(alignNorm) >= 0 || alignNorm.indexOf(domNorm) >= 0) {
+            span.dataset.idx = alignIdx;
+            wordSpans[alignIdx] = span;
+            alignIdx++;
+          }
         }
 
         span.textContent = part;
@@ -123,9 +136,49 @@
       }
       if (idx >= 0 && wordSpans[idx]) {
         wordSpans[idx].classList.add("tts-active");
+        // Scroll active word into view if off-screen
+        scrollToWord(wordSpans[idx]);
       }
       activeIdx = idx;
     }
+  }
+
+  /**
+   * Gently scroll to keep the active word visible.
+   */
+  function scrollToWord(span) {
+    var rect = span.getBoundingClientRect();
+    var viewH = window.innerHeight;
+    // Only scroll if the word is outside the middle 60% of the viewport
+    if (rect.top < viewH * 0.2 || rect.bottom > viewH * 0.8) {
+      span.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }
+
+  /**
+   * Animation loop for smooth highlighting (~60fps while playing).
+   */
+  function tick() {
+    updateTime();
+    highlightWord();
+    if (!audio.paused) {
+      rafId = requestAnimationFrame(tick);
+    }
+  }
+
+  function startLoop() {
+    if (rafId === null) {
+      rafId = requestAnimationFrame(tick);
+    }
+  }
+
+  function stopLoop() {
+    if (rafId !== null) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+    updateTime();
+    highlightWord();
   }
 
   function onWordClick(e) {
@@ -148,12 +201,15 @@
     }
   });
 
-  audio.addEventListener("timeupdate", function () {
+  audio.addEventListener("play", startLoop);
+  audio.addEventListener("pause", stopLoop);
+  audio.addEventListener("seeked", function () {
     updateTime();
     highlightWord();
   });
 
   audio.addEventListener("ended", function () {
+    stopLoop();
     btn.textContent = "\u25B6 Listen";
     if (activeIdx >= 0 && wordSpans[activeIdx]) {
       wordSpans[activeIdx].classList.remove("tts-active");

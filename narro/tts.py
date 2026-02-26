@@ -194,6 +194,7 @@ class Narro:
                 text_index=text_idx,
                 sentence_index=sentence_idx,
                 attention_weights=attention,
+                input_token_offsets=response.get('input_token_offsets'),
             ))
 
         encoded = EncodedSpeech(

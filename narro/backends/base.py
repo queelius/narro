@@ -22,6 +22,62 @@ def _token_entropy(logits):
 
 class BaseModel:
 
+    def _build_token_word_map(self, prompt, sentence_text):
+        """Build token-to-word mapping using tokenizer offset_mapping.
+
+        Maps input token positions to the words they encode, so alignment
+        extraction knows which attention columns correspond to which words.
+
+        Returns:
+            dict[int, str] mapping token position -> word string,
+            or None if offset_mapping is unavailable.
+        """
+        try:
+            encoding = self.tokenizer(
+                prompt,
+                return_offsets_mapping=True,
+            )
+        except Exception:
+            return None
+
+        offsets = encoding.get('offset_mapping')
+        if offsets is None:
+            return None
+
+        # Character range of the sentence text within the prompt
+        prefix = '[STOP][TEXT]'
+        suffix = '[START]'
+        text_start = prompt.find(prefix) + len(prefix)
+        text_end = prompt.rfind(suffix)
+        if text_start < 0 or text_end < 0 or text_end <= text_start:
+            return None
+
+        # Build character ranges for each word
+        words = sentence_text.split()
+        word_ranges = []
+        search_pos = text_start
+        for word in words:
+            idx = prompt.find(word, search_pos)
+            if idx == -1:
+                continue
+            word_ranges.append((idx, idx + len(word), word))
+            search_pos = idx + len(word)
+
+        # Map tokens to words by checking which word each token overlaps
+        token_to_word = {}
+        for tok_idx, (char_start, char_end) in enumerate(offsets):
+            if char_start >= char_end:
+                continue
+            if char_start < text_start or char_end > text_end:
+                continue
+            tok_mid = (char_start + char_end) / 2
+            for word_start, word_end, word in word_ranges:
+                if tok_mid >= word_start and tok_mid < word_end:
+                    token_to_word[tok_idx] = word
+                    break
+
+        return token_to_word if token_to_word else None
+
     def infer(self, prompts, top_p=0.95, temperature=0.3, repetition_penalty=1.2,
               include_attention=False):
         temperature = max(temperature, 0.001)
@@ -56,6 +112,25 @@ class BaseModel:
                       total_tokens / gen_time if gen_time > 0 else 0)
 
         input_len = inputs['input_ids'].shape[1]
+
+        # Build token-to-word maps (needs individual tokenization per prompt)
+        token_word_maps = [None] * len(prompts)
+        if include_attention:
+            for idx, prompt in enumerate(prompts):
+                # Extract sentence text from wrapped prompt
+                pfx, sfx = '[STOP][TEXT]', '[START]'
+                pfx_pos = prompt.find(pfx)
+                sfx_pos = prompt.rfind(sfx)
+                if pfx_pos >= 0 and sfx_pos > pfx_pos:
+                    sentence_text = prompt[pfx_pos + len(pfx):sfx_pos]
+                    twm = self._build_token_word_map(prompt, sentence_text)
+                    if twm is not None:
+                        # Adjust for left-padding: shift positions by pad offset
+                        attn_mask = inputs['attention_mask'][idx]
+                        pad_offset = int((attn_mask == 0).sum().item())
+                        if pad_offset > 0:
+                            twm = {k + pad_offset: v for k, v in twm.items()}
+                        token_word_maps[idx] = twm
 
         res = []
         eos_token_id = self.model.config.eos_token_id
@@ -101,6 +176,8 @@ class BaseModel:
                 result['attention'] = torch.stack(attention_weights)
             else:
                 result['attention'] = None
+
+            result['input_token_offsets'] = token_word_maps[i]
 
             res.append(result)
         return res

@@ -220,11 +220,14 @@ class TestHugoGenerate:
 
         # Track what encode was called with
         encode_calls = []
-        fake_encoded = MagicMock()
+        fake_encoded = MagicMock(estimated_duration=1.0)
 
         class FakeNarro:
             def __init__(self):
                 pass
+
+            def _preprocess_text(self, texts):
+                return [(t, 0, 0, t) for t in texts]
 
             def encode(self, text, **kwargs):
                 encode_calls.append(text)
@@ -281,11 +284,14 @@ class TestHugoGenerate:
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ffmpeg")
 
         encode_calls = []
-        fake_encoded = MagicMock()
+        fake_encoded = MagicMock(estimated_duration=1.0)
 
         class FakeNarro:
             def __init__(self):
                 pass
+
+            def _preprocess_text(self, texts):
+                return [(t, 0, 0, t) for t in texts]
 
             def encode(self, text, **kwargs):
                 encode_calls.append(text)
@@ -325,11 +331,14 @@ class TestHugoGenerate:
         (site / "content" / "post" / "done" / "narration.opus").write_bytes(b"\x00")
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ffmpeg")
 
-        fake_encoded = MagicMock()
+        fake_encoded = MagicMock(estimated_duration=1.0)
 
         class FakeNarro:
             def __init__(self):
                 pass
+
+            def _preprocess_text(self, texts):
+                return [(t, 0, 0, t) for t in texts]
 
             def encode(self, text, **kwargs):
                 return fake_encoded
@@ -370,11 +379,14 @@ class TestHugoGenerate:
 
         # Track which slugs were attempted
         encode_slugs = []
-        fake_encoded = MagicMock()
+        fake_encoded = MagicMock(estimated_duration=1.0)
 
         class FakeNarro:
             def __init__(self):
                 pass
+
+            def _preprocess_text(self, texts):
+                return [(t, 0, 0, t) for t in texts]
 
             def encode(self, text, **kwargs):
                 # First call always fails (aaa-fail sorts first via os.walk)
