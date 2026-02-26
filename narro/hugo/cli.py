@@ -266,29 +266,31 @@ def cmd_hugo_generate(
                 print(f"  Skipped: no speakable text in {p['slug']}", file=sys.stderr)
                 continue
 
-            # Encode with attention for alignment
+            # Count sentences for progress
+            sentence_count = len(tts._preprocess_text([prose]))
+            print(f"  Encoding {sentence_count} sentences...", flush=True)
             encoded = tts.encode(prose, include_attention=True)
+            est_duration = encoded.estimated_duration
+            print(f"  Encoding done ({est_duration:.1f}s audio). Decoding...", flush=True)
 
-            # Decode to WAV
             tts.decode_to_wav(encoded, wav_path)
+            print(f"  Extracting alignment...", flush=True)
 
-            # Extract and save alignment
             alignment = extract_alignment_from_encoded(encoded)
             save_alignment(alignment, json_path)
 
-            # Convert WAV -> Opus
+            print(f"  Converting to Opus...", flush=True)
             subprocess.run(
                 ["ffmpeg", "-i", wav_path, "-c:a", "libopus", "-b:a", "32k", "-y", opus_path],
                 check=True,
                 capture_output=True,
             )
 
-            # Clean up WAV
             if os.path.isfile(wav_path):
                 os.remove(wav_path)
 
             generated += 1
-            print(f"  Done: {opus_path}")
+            print(f"  Done: narration.opus + narration.json")
 
         except Exception as e:
             errors += 1
