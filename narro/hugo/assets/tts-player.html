@@ -1,0 +1,14 @@
+{{/* TTS Player — installed by narro hugo install */}}
+{{ if .Params.tts }}
+  {{ $audio := .Resources.GetMatch "narration.opus" }}
+  {{ $align := .Resources.GetMatch "narration.json" }}
+  {{ if $audio }}
+    <link rel="stylesheet" href="{{ "css/tts-player.css" | relURL }}">
+    <div class="tts-player" {{ if $align }}data-align="{{ $align.RelPermalink }}"{{ end }}>
+      <audio src="{{ $audio.RelPermalink }}" preload="metadata"></audio>
+      <button class="tts-play" aria-label="Play narration">&#9654; Listen</button>
+      <span class="tts-time"></span>
+    </div>
+    <script src="{{ "js/tts-player.js" | relURL }}" defer></script>
+  {{ end }}
+{{ end }}
