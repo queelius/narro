@@ -10,6 +10,7 @@ class TransformersModel(BaseModel):
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             torch_dtype=torch.float32,
+            attn_implementation="eager",
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.model.eval()
