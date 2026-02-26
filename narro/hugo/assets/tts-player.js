@@ -17,6 +17,7 @@
   var wordSpans = [];
   var activeIdx = -1;
   var rafId = null;
+  var lastScrollTime = 0;
 
   // --- Initialization ---
 
@@ -33,18 +34,34 @@
   }
 
   /**
-   * Normalize a word for matching: lowercase, strip punctuation.
+   * Elements whose text should NOT be wrapped for highlighting.
+   * These are stripped by extract_prose() and absent from alignment data.
    */
-  function normalizeWord(w) {
-    return w.toLowerCase().replace(/[^a-z0-9']/g, "");
+  var SKIP_TAGS = {
+    H1:1, H2:1, H3:1, H4:1, H5:1, H6:1,
+    PRE:1, CODE:1, SCRIPT:1, STYLE:1, NAV:1,
+    FIGCAPTION:1, BUTTON:1, SUMMARY:1
+  };
+
+  /**
+   * Check if a node is inside an element that should be skipped.
+   */
+  function isInsideSkipped(node) {
+    var el = node.parentNode;
+    while (el && el !== document.body) {
+      if (SKIP_TAGS[el.tagName]) return true;
+      el = el.parentNode;
+    }
+    return false;
   }
 
   /**
-   * Walk text nodes in the article, wrap each word in a <span>.
-   * Match words to alignment entries by normalized text comparison.
+   * Walk text nodes in the article content, wrap each word in a <span>.
+   * Only wraps text inside prose elements (skips headings, code, nav).
+   * Words are matched sequentially to alignment entries.
    */
   function wrapWords() {
-    var article = document.querySelector("article") || document.querySelector(".content");
+    var article = document.querySelector(".content") || document.querySelector("article");
     if (!article || alignment.length === 0) return;
 
     var alignIdx = 0;
@@ -56,6 +73,7 @@
       var node = textNodes[i];
       var text = node.textContent;
       if (!text.trim()) continue;
+      if (isInsideSkipped(node)) continue;
 
       var frag = document.createDocumentFragment();
       var parts = text.split(/(\s+)/);
@@ -71,15 +89,10 @@
         var span = document.createElement("span");
         span.className = "tts-word";
 
-        // Match DOM word to alignment entry by normalized text
         if (alignIdx < alignment.length) {
-          var domNorm = normalizeWord(part);
-          var alignNorm = normalizeWord(alignment[alignIdx].word);
-          if (domNorm === alignNorm || domNorm.indexOf(alignNorm) >= 0 || alignNorm.indexOf(domNorm) >= 0) {
-            span.dataset.idx = alignIdx;
-            wordSpans[alignIdx] = span;
-            alignIdx++;
-          }
+          span.dataset.idx = alignIdx;
+          wordSpans[alignIdx] = span;
+          alignIdx++;
         }
 
         span.textContent = part;
@@ -144,14 +157,18 @@
   }
 
   /**
-   * Gently scroll to keep the active word visible.
+   * Scroll to keep the active word visible — only when truly off-screen,
+   * with a cooldown to prevent constant jumping.
    */
   function scrollToWord(span) {
+    var now = Date.now();
+    if (now - lastScrollTime < 5000) return; // 5s cooldown between scrolls
     var rect = span.getBoundingClientRect();
     var viewH = window.innerHeight;
-    // Only scroll if the word is outside the middle 60% of the viewport
-    if (rect.top < viewH * 0.2 || rect.bottom > viewH * 0.8) {
+    // Only scroll if the word is fully outside the viewport
+    if (rect.bottom < 0 || rect.top > viewH) {
       span.scrollIntoView({ behavior: "smooth", block: "center" });
+      lastScrollTime = now;
     }
   }
 
