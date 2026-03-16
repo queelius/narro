@@ -10,7 +10,6 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from .tts import SAMPLE_RATE, TOKEN_SIZE
 
 # ---------------------------------------------------------------------------
 # Benchmark corpus
@@ -84,7 +83,7 @@ def run_benchmark(
         for _ in range(num_runs):
             # Preprocessing
             t0 = time.perf_counter()
-            sentence_data = tts._preprocess_text([text])
+            tts._preprocess_text([text])
             preprocess_ms = (time.perf_counter() - t0) * 1000
 
             # Encode
@@ -93,7 +92,7 @@ def run_benchmark(
             encode_ms = (time.perf_counter() - t0) * 1000
 
             tokens = encoded.total_tokens
-            audio_duration_s = encoded.estimated_duration  # tokens * TOKEN_SIZE / SAMPLE_RATE
+            audio_duration_s = encoded.estimated_duration
 
             # Decode
             t0 = time.perf_counter()
