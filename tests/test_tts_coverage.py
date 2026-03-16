@@ -2011,3 +2011,66 @@ class TestTransformersModelInit:
             mock_tok_cls.from_pretrained.assert_called_once_with('/custom/model')
 
 
+# ---------------------------------------------------------------------------
+# TransformersModel device parameter tests
+# ---------------------------------------------------------------------------
+
+class TestTransformersModelDevice:
+    """Test device parameter on TransformersModel.__init__."""
+
+    def test_init_defaults_to_cpu(self):
+        """TransformersModel() default device should be 'cpu', stored as self.device."""
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+
+            from narro.backends.transformers import TransformersModel
+            tm = TransformersModel(compile=False, quantize=False)
+
+            assert tm.device == 'cpu'
+            mock_model.to.assert_called_once_with('cpu')
+
+    def test_init_accepts_device_parameter(self):
+        """TransformersModel(device='cuda') should store device and call .to('cuda')."""
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+
+            from narro.backends.transformers import TransformersModel
+            tm = TransformersModel(compile=False, quantize=False, device='cuda')
+
+            assert tm.device == 'cuda'
+            mock_model.to.assert_called_once_with('cuda')
+
+    def test_quantize_skipped_on_non_cpu_device(self):
+        """quantize_dynamic should NOT be called when device != 'cpu'."""
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+             patch('torch.quantization.quantize_dynamic') as mock_quantize:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+
+            from narro.backends.transformers import TransformersModel
+            tm = TransformersModel(compile=False, quantize=True, device='cuda')
+
+            mock_quantize.assert_not_called()
+
+    def test_quantize_still_runs_on_cpu(self):
+        """quantize_dynamic should still be called when device == 'cpu'."""
+        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
+             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls, \
+             patch('torch.quantization.quantize_dynamic') as mock_quantize:
+            mock_model = MagicMock()
+            mock_model_cls.from_pretrained.return_value = mock_model
+            mock_tok_cls.from_pretrained.return_value = MagicMock()
+            mock_quantize.return_value = mock_model
+
+            from narro.backends.transformers import TransformersModel
+            tm = TransformersModel(compile=False, quantize=True, device='cpu')
+
+            mock_quantize.assert_called_once()
