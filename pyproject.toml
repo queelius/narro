@@ -31,6 +31,9 @@ license = {file = "LICENSE"}
 Homepage = "https://github.com/queelius/narro"
 Issues = "https://github.com/queelius/narro/issues"
 
+[project.optional-dependencies]
+server = ["fastapi", "uvicorn"]
+
 [tool.setuptools.packages.find]
 include = ["narro*"]
 
