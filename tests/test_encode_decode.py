@@ -704,6 +704,7 @@ class TestCLISubcommands:
             quantize=False,
             num_threads=None,
             include_attention=False,
+            device='auto',
         )
 
         with patch('narro.Narro') as mock_tts_cls, \

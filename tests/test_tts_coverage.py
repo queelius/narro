@@ -683,6 +683,7 @@ class TestCLI:
                 quantize=False,
                 decoder_batch_size=4,
                 num_threads=None,
+                device='auto',
             )
             mock_instance.infer.assert_called_once_with(
                 'Hello world', out_path='output.wav'

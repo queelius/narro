@@ -16,6 +16,9 @@ def _add_common_args(parser):
                         help='Enable INT8 quantization (faster but lower quality)')
     parser.add_argument('--num-threads', '-t', type=int,
                         help='Number of CPU threads for inference')
+    parser.add_argument('--device', '-d', default='auto',
+                        choices=['auto', 'cpu', 'cuda', 'mps'],
+                        help='Compute device (default: auto)')
 
 
 def cmd_speak(args):
@@ -27,6 +30,7 @@ def cmd_speak(args):
         quantize=args.quantize,
         decoder_batch_size=args.decoder_batch_size,
         num_threads=args.num_threads,
+        device=args.device,
     )
     logger.info("Generating speech for: '%s'", args.text)
 
@@ -50,6 +54,7 @@ def cmd_encode(args):
         compile=not args.no_compile,
         quantize=args.quantize,
         num_threads=args.num_threads,
+        device=args.device,
     )
     logger.info("Encoding: '%s'", args.text)
     encoded = tts.encode(args.text, include_attention=args.include_attention)
@@ -104,7 +109,7 @@ def main():
 
     # Default to 'speak' when first arg isn't a known subcommand.
     # This lets `narro "Hello world"` work as shorthand for `narro speak "Hello world"`.
-    _subcommands = {'speak', 'encode', 'decode', 'hugo'}
+    _subcommands = {'speak', 'encode', 'decode', 'hugo', 'serve', 'bench'}
     if len(sys.argv) > 1 and sys.argv[1] not in _subcommands and sys.argv[1] not in ('-h', '--help'):
         sys.argv.insert(1, 'speak')
 
