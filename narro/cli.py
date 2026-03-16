@@ -110,6 +110,19 @@ def cmd_hugo(args):
         args._hugo_parser.print_help()
 
 
+def cmd_serve(args):
+    """Start the TTS API server."""
+    from narro.server import serve
+    serve(
+        host=args.host,
+        port=args.port,
+        device=args.device,
+        model_path=args.model_path,
+        compile=not args.no_compile,
+        quantize=args.quantize,
+    )
+
+
 def _add_speak_args(parser):
     """Add speak-specific args (text, output, batch size, alignment)."""
     parser.add_argument('text', help='Text to synthesize')
@@ -193,6 +206,13 @@ def main():
     # hugo status
     stat_parser = hugo_subparsers.add_parser('status', help='Show TTS status')
     stat_parser.add_argument('site_root', help='Path to Hugo site root')
+
+    # --- serve ---
+    serve_parser = subparsers.add_parser('serve', help='Start TTS API server')
+    serve_parser.add_argument('--host', default='0.0.0.0', help='Bind host (default: 0.0.0.0)')
+    serve_parser.add_argument('--port', '-p', type=int, default=8000, help='Bind port (default: 8000)')
+    _add_common_args(serve_parser)
+    serve_parser.set_defaults(func=cmd_serve)
 
     # --- bench ---
     bench_parser = subparsers.add_parser('bench', help='Run performance benchmarks')
