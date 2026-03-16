@@ -2196,3 +2196,137 @@ class TestTransformersModelDevice:
             tm = TransformersModel(compile=False, quantize=True, device='cpu')
 
             mock_quantize.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Device auto-detection tests (Task 3)
+# ---------------------------------------------------------------------------
+
+class TestDeviceAutoDetection:
+    """Test that Narro and load_decoder properly handle device parameters."""
+
+    def test_narro_accepts_device_parameter(self):
+        """Narro constructor should accept device='cpu' without error."""
+        with patch('narro.tts.TransformersModel') as mock_tm_cls, \
+             patch('narro.decode_only.load_decoder') as mock_load_dec:
+            mock_pipeline = MagicMock()
+            mock_tm_cls.return_value = mock_pipeline
+            mock_decoder = MagicMock()
+            mock_load_dec.return_value = mock_decoder
+
+            tts = Narro(compile=False, device='cpu')
+
+            assert tts.device == 'cpu'
+            # Verify TransformersModel was called with device='cpu'
+            _, call_kwargs = mock_tm_cls.call_args
+            assert call_kwargs['device'] == 'cpu'
+
+    def test_narro_auto_detects_cpu(self):
+        """device='auto' should resolve to 'cpu' when no GPU available."""
+        with patch('narro.tts.TransformersModel') as mock_tm_cls, \
+             patch('narro.decode_only.load_decoder') as mock_load_dec, \
+             patch('torch.cuda.is_available', return_value=False), \
+             patch('torch.backends.mps.is_available', return_value=False):
+            mock_pipeline = MagicMock()
+            mock_tm_cls.return_value = mock_pipeline
+            mock_decoder = MagicMock()
+            mock_load_dec.return_value = mock_decoder
+
+            tts = Narro(compile=False, device='auto')
+
+            assert tts.device == 'cpu'
+
+    def test_narro_auto_detects_cuda(self):
+        """device='auto' should resolve to 'cuda' when CUDA is available."""
+        with patch('narro.tts.TransformersModel') as mock_tm_cls, \
+             patch('narro.decode_only.load_decoder') as mock_load_dec, \
+             patch('torch.cuda.is_available', return_value=True):
+            mock_pipeline = MagicMock()
+            mock_tm_cls.return_value = mock_pipeline
+            mock_decoder = MagicMock()
+            mock_load_dec.return_value = mock_decoder
+
+            tts = Narro(compile=False, device='auto')
+
+            assert tts.device == 'cuda'
+
+    def test_load_decoder_accepts_device(self):
+        """load_decoder should accept a device parameter and call .to(device)."""
+        with patch('narro.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
+             patch('torch.load', return_value={}), \
+             patch('narro.decode_only.load_with_migration', return_value={}), \
+             patch('narro.decode_only.SopranoDecoder') as mock_decoder_cls:
+            mock_decoder = MagicMock()
+            mock_decoder_cls.return_value = mock_decoder
+            mock_decoder.to.return_value = mock_decoder
+
+            from narro.decode_only import load_decoder
+            result = load_decoder(device='cpu')
+
+            mock_decoder.to.assert_called_once_with('cpu')
+
+    def test_load_decoder_device_default(self):
+        """load_decoder should default device to 'cpu'."""
+        with patch('narro.decode_only.hf_hub_download', return_value='/fake/decoder.pth'), \
+             patch('torch.load', return_value={}), \
+             patch('narro.decode_only.load_with_migration', return_value={}), \
+             patch('narro.decode_only.SopranoDecoder') as mock_decoder_cls:
+            mock_decoder = MagicMock()
+            mock_decoder_cls.return_value = mock_decoder
+            mock_decoder.to.return_value = mock_decoder
+
+            from narro.decode_only import load_decoder
+            result = load_decoder()
+
+            mock_decoder.to.assert_called_once_with('cpu')
+
+    def test_narro_passes_device_to_load_decoder(self):
+        """Narro should pass its resolved device to load_decoder."""
+        with patch('narro.tts.TransformersModel') as mock_tm_cls, \
+             patch('narro.decode_only.load_decoder') as mock_load_dec:
+            mock_pipeline = MagicMock()
+            mock_tm_cls.return_value = mock_pipeline
+            mock_decoder = MagicMock()
+            mock_load_dec.return_value = mock_decoder
+
+            tts = Narro(compile=False, device='cpu')
+
+            _, call_kwargs = mock_load_dec.call_args
+            assert call_kwargs['device'] == 'cpu'
+
+    def test_decode_creates_tensors_on_decoder_device(self):
+        """decode() should create batch_hidden_states on the decoder's device."""
+        import numpy as np
+        from narro.decode_only import decode
+        from narro.encoded import EncodedSpeech, SentenceEncoding
+
+        # Create a minimal EncodedSpeech
+        hidden = np.random.randn(5, HIDDEN_DIM).astype(np.float32)
+        sentence = SentenceEncoding(
+            hidden_states=hidden,
+            token_ids=np.zeros(5, dtype=np.int32),
+            token_entropy=np.zeros(5, dtype=np.float32),
+            finish_reason='stop',
+            text='hello',
+            text_index=0,
+            sentence_index=0,
+        )
+        encoded = EncodedSpeech(
+            sentences=[sentence],
+            model_id='test',
+            sample_rate=SAMPLE_RATE,
+            token_audio_samples=TOKEN_SIZE,
+            hidden_dim=HIDDEN_DIM,
+        )
+
+        # Mock decoder with a parameter that reports its device
+        mock_decoder = MagicMock()
+        mock_param = torch.zeros(1)  # cpu param
+        mock_decoder.parameters.return_value = iter([mock_param])
+        mock_decoder.return_value = torch.randn(1, 1, 5 * TOKEN_SIZE)
+
+        result = decode(encoded, decoder=mock_decoder, decoder_batch_size=4)
+
+        # Verify decoder was called with a tensor on cpu
+        call_args = mock_decoder.call_args[0][0]
+        assert call_args.device.type == 'cpu'

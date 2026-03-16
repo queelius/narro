@@ -40,13 +40,15 @@ class Narro:
         quantize: Enable INT8 quantization for faster CPU inference (default: False, degrades quality)
         decoder_batch_size: Batch size for decoder (default: 4)
         num_threads: Number of CPU threads for inference (None = auto-detect)
+        device: Device for inference ('auto', 'cpu', 'cuda', 'mps'). 'auto' detects best available.
     """
     def __init__(self,
             model_path=None,
             compile=True,
             quantize=False,
             decoder_batch_size=4,
-            num_threads=None):
+            num_threads=None,
+            device='auto'):
         # Configure threading before model load
         if num_threads is not None:
             torch.set_num_threads(num_threads)
@@ -57,18 +59,29 @@ class Narro:
 
         torch.set_float32_matmul_precision('high')
 
+        # Resolve device
+        if device == 'auto':
+            if torch.cuda.is_available():
+                device = 'cuda'
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
+        self.device = device
+
         self.model_id = model_path if model_path else MODEL_ID
-        self.pipeline = TransformersModel(model_path=model_path, compile=compile, quantize=quantize)
+        self.pipeline = TransformersModel(model_path=model_path, compile=compile,
+                                          quantize=quantize, device=device)
 
         from .decode_only import load_decoder
-        self.decoder = load_decoder(model_path=model_path, compile=compile)
+        self.decoder = load_decoder(model_path=model_path, compile=compile, device=device)
         self.decoder_batch_size = decoder_batch_size
 
         # Warmup decoder directly with synthetic tensors (no LLM needed).
         if compile:
             for warmup_len in [10, 20, 50]:
                 with torch.inference_mode():
-                    self.decoder(torch.zeros(1, HIDDEN_DIM, warmup_len))
+                    self.decoder(torch.zeros(1, HIDDEN_DIM, warmup_len, device=device))
 
     def _preprocess_text(self, texts, min_length=30):
         res = []

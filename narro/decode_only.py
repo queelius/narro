@@ -28,12 +28,13 @@ from .vocos.migrate_weights import load_with_migration
 logger = logging.getLogger(__name__)
 
 
-def load_decoder(model_path=None, compile=False):
+def load_decoder(model_path=None, compile=False, device='cpu'):
     """Load and return a standalone Vocos decoder.
 
     Args:
         model_path: Path to local model directory. If None, downloads from HuggingFace.
         compile: Enable torch.compile (default False for lightweight usage).
+        device: Device to place the decoder on (default 'cpu').
 
     Returns:
         SopranoDecoder ready for inference.
@@ -47,6 +48,7 @@ def load_decoder(model_path=None, compile=False):
     state_dict = load_with_migration(state_dict)
     decoder.load_state_dict(state_dict)
     decoder.train(False)
+    decoder = decoder.to(device)
 
     if compile:
         try:
@@ -71,6 +73,13 @@ def decode(encoded, decoder=None, decoder_batch_size=4):
     """
     if decoder is None:
         decoder = load_decoder()
+
+    # Detect decoder device from its parameters
+    try:
+        param_device = next(decoder.parameters()).device
+        device = param_device if isinstance(param_device, torch.device) else torch.device('cpu')
+    except (StopIteration, AttributeError):
+        device = torch.device('cpu')
 
     num_texts = encoded.num_texts
     if num_texts == 0:
@@ -101,7 +110,7 @@ def decode(encoded, decoder=None, decoder_batch_size=4):
         N = len(lengths)
         max_len = lengths[0]
 
-        batch_hidden_states = torch.zeros((N, HIDDEN_DIM, max_len))
+        batch_hidden_states = torch.zeros((N, HIDDEN_DIM, max_len), device=device)
         for i in range(N):
             seq_len = lengths[i]
             batch_hidden_states[i, :, max_len-seq_len:] = batch[i].T
