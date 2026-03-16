@@ -75,6 +75,23 @@ def cmd_decode(args):
     logger.info("Audio saved to: %s", args.output)
 
 
+def cmd_bench(args):
+    """Run benchmark suite and report performance metrics."""
+    from narro.bench import run_benchmark, format_table
+    import json
+    results = run_benchmark(
+        device=args.device,
+        compile=not args.no_compile,
+        quantize=args.quantize,
+        num_runs=args.runs,
+        num_threads=args.num_threads,
+    )
+    if args.json:
+        print(json.dumps(results))
+    else:
+        print(format_table(results))
+
+
 def cmd_hugo(args):
     """Dispatch hugo subcommands."""
     from narro.hugo.cli import cmd_hugo_generate, cmd_hugo_install, cmd_hugo_status
@@ -176,6 +193,15 @@ def main():
     # hugo status
     stat_parser = hugo_subparsers.add_parser('status', help='Show TTS status')
     stat_parser.add_argument('site_root', help='Path to Hugo site root')
+
+    # --- bench ---
+    bench_parser = subparsers.add_parser('bench', help='Run performance benchmarks')
+    bench_parser.add_argument('--runs', type=int, default=3,
+                              help='Number of timed runs per corpus entry (default: 3)')
+    bench_parser.add_argument('--json', action='store_true',
+                              help='Output results as JSON')
+    _add_common_args(bench_parser)
+    bench_parser.set_defaults(func=cmd_bench)
 
     args = parser.parse_args()
 
