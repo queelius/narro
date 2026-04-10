@@ -1,17 +1,22 @@
 """FastAPI TTS server for Narro.
 
-Exposes two endpoints:
+Model-agnostic: any backend implementing :class:`~narro.protocol.TTSModel`
+can be registered and served.  The ``model`` request field selects the
+backend; omit it to use the default (first registered).
+
+Endpoints:
 
   GET  /health              -- liveness probe
-  POST /v1/audio/speech     -- synthesize speech (non-streaming or SSE streaming)
+  GET  /v1/models           -- list available models
+  POST /v1/audio/speech     -- synthesize speech
 
 Usage (programmatic):
-    from narro.server import create_app
-    app = create_app(device='cpu')
+    from narro.server import configure_app
+    from narro.models.soprano import SopranoModel
+    configure_app(models=[SopranoModel(device='cuda')])
 
-Usage (CLI via uvicorn):
-    from narro.server import serve
-    serve(host='0.0.0.0', port=8000)
+Usage (CLI):
+    narro serve --device cuda
 """
 
 import asyncio
@@ -23,45 +28,30 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Optional
+from dataclasses import asdict
 
 import numpy as np
-import torch
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from scipy.io import wavfile
 
-from .tts import INT16_MAX, SAMPLE_RATE, Narro
+from .models import registry
+from .protocol import TTSModel
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Global TTS instance -- lazy, created once at first request (or by create_app)
-# ---------------------------------------------------------------------------
-
-_tts: Optional[Narro] = None
-
-
-def _get_tts() -> Narro:
-    """Return the global Narro TTS instance (must be initialised first)."""
-    if _tts is None:
-        raise RuntimeError(
-            "TTS model not initialised. Call create_app() with model parameters "
-            "or use the serve() convenience function."
-        )
-    return _tts
-
+INT16_MAX = 32767
 
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
 
-
 _MAX_INPUT_LENGTH = 50_000  # characters
+
 
 class SpeechRequest(BaseModel):
     input: str
+    model: str | None = None
     response_format: str = "wav"
     stream: bool = False
     align: bool = False
@@ -72,11 +62,13 @@ class SpeechRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _tensor_to_wav_bytes(audio: torch.Tensor) -> bytes:
-    """Convert a float32 audio tensor to raw WAV bytes (in-memory)."""
-    pcm = (np.clip(audio.cpu().numpy(), -1.0, 1.0) * INT16_MAX).astype(np.int16)
+def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Convert a float32 numpy waveform to raw WAV bytes (in-memory)."""
+    from scipy.io import wavfile
+
+    pcm = (np.clip(audio, -1.0, 1.0) * INT16_MAX).astype(np.int16)
     buf = io.BytesIO()
-    wavfile.write(buf, SAMPLE_RATE, pcm)
+    wavfile.write(buf, sample_rate, pcm)
     return buf.getvalue()
 
 
@@ -109,26 +101,15 @@ def _wav_bytes_to_opus(wav_bytes: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def create_app(
-    device: str = "auto",
-    model_path: Optional[str] = None,
-    compile: bool = True,
-    quantize: bool = False,
-) -> FastAPI:
-    """Create and return a FastAPI application with a loaded Narro model.
+def configure_app(models: list[TTSModel] | None = None) -> FastAPI:
+    """Register models with the module-level FastAPI app and return it.
 
-    Args:
-        device: Compute device ('auto', 'cpu', 'cuda', 'mps').
-        model_path: Path to local model directory (None = HuggingFace).
-        compile: Enable torch.compile for faster inference.
-        quantize: Enable INT8 quantization.
-
-    Returns:
-        Configured FastAPI application instance.
+    If *models* is ``None``, no models are registered -- call
+    :func:`serve` or register them manually via ``registry.register()``.
     """
-    global _tts
-    _tts = Narro(model_path=model_path, compile=compile, quantize=quantize, device=device)
-    logger.info("Narro model loaded on device=%s", _tts.device)
+    if models:
+        for m in models:
+            registry.register(m)
     return app
 
 
@@ -136,18 +117,30 @@ def create_app(
 # FastAPI app (module-level, importable for testing)
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Narro TTS Server", version="1.0.0")
+app = FastAPI(title="Narro TTS Server", version="2.0.0")
 _inference_lock = asyncio.Lock()
 
 
 @app.get("/health")
 async def health():
     """Liveness probe -- returns model info if loaded."""
-    tts = _get_tts()
+    models = registry.list_models()
+    if not models:
+        raise HTTPException(status_code=503, detail="No models loaded")
+    default = registry.default_model_id
     return {
         "status": "ok",
-        "device": str(tts.device),
-        "model": tts.model_id,
+        "default_model": default,
+        "models": [m.id for m in models],
+    }
+
+
+@app.get("/v1/models")
+async def list_models():
+    """List available TTS models."""
+    return {
+        "object": "list",
+        "data": [asdict(m) for m in registry.list_models()],
     }
 
 
@@ -158,9 +151,7 @@ async def speech(req: SpeechRequest):
     Supports:
     - Non-streaming WAV or Opus response
     - SSE streaming of raw PCM chunks (base64-encoded)
-    - Optional paragraph-level alignment in X-Alignment response header
-
-    Returns HTTP 400 for empty input, HTTP 422 if Opus requested without ffmpeg.
+    - Model-specific features via the model's metadata (e.g. alignment)
     """
     if not req.input.strip():
         raise HTTPException(status_code=400, detail="'input' must be non-empty text.")
@@ -183,64 +174,71 @@ async def speech(req: SpeechRequest):
             detail="Opus output requires ffmpeg, which was not found on PATH.",
         )
 
-    tts = _get_tts()
+    try:
+        model = registry.get(req.model)
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if req.stream:
-        return _streaming_response(tts, req)
-
-    return await _non_streaming_response(tts, req)
-
-
-async def _non_streaming_response(tts: Narro, req: SpeechRequest) -> Response:
-    """Encode + decode the full input and return a WAV or Opus response."""
-    async with _inference_lock:
+        if req.response_format != "wav":
+            raise HTTPException(
+                status_code=422,
+                detail="Streaming only supports response_format='wav' (raw PCM).",
+            )
         if req.align:
-            from .alignment import extract_paragraph_alignment
+            raise HTTPException(
+                status_code=422,
+                detail="Alignment is not supported with streaming.",
+            )
+        return _streaming_response(model, req)
 
-            paragraphs = [p.strip() for p in req.input.split("\n\n") if p.strip()]
-            if not paragraphs:
-                paragraphs = [req.input]
+    return await _non_streaming_response(model, req)
 
-            encoded = tts.encode_batch(paragraphs)
-            audio_list = tts.decode(encoded)
-            audio = torch.cat(audio_list) if audio_list else torch.zeros(0)
-            alignment = extract_paragraph_alignment(encoded)
-        else:
-            audio = tts.infer(req.input)
-            alignment = None
 
-    wav_bytes = _tensor_to_wav_bytes(audio)
+async def _non_streaming_response(model: TTSModel, req: SpeechRequest) -> Response:
+    """Synthesize the full input and return a WAV or Opus response."""
+    loop = asyncio.get_event_loop()
+    async with _inference_lock:
+        result = await loop.run_in_executor(
+            None, lambda: model.synthesize(req.input, align=req.align)
+        )
+
+    wav_bytes = _audio_to_wav_bytes(result.audio, result.sample_rate)
 
     if req.response_format == "opus":
-        content = _wav_bytes_to_opus(wav_bytes)
-        media_type = "audio/ogg; codecs=opus"
+        content, media_type = _wav_bytes_to_opus(wav_bytes), "audio/ogg; codecs=opus"
     else:
-        content = wav_bytes
-        media_type = "audio/wav"
+        content, media_type = wav_bytes, "audio/wav"
 
     headers = {}
+    alignment = result.metadata.get("alignment")
     if alignment is not None:
         headers["X-Alignment"] = json.dumps(alignment)
 
     return Response(content=content, media_type=media_type, headers=headers)
 
 
-def _streaming_response(tts: Narro, req: SpeechRequest) -> StreamingResponse:
+def _streaming_response(model: TTSModel, req: SpeechRequest) -> StreamingResponse:
     """Return a Server-Sent Events stream of base64-encoded PCM chunks."""
 
     async def event_generator():
-        # Send format metadata as first event
         meta = json.dumps({
             "type": "speech.audio.start",
             "format": "pcm_s16le",
-            "sample_rate": SAMPLE_RATE,
+            "sample_rate": model.sample_rate,
         })
         yield f"data: {meta}\n\n"
 
-        # Stream inference chunks -- held under lock to protect Torch GIL
+        # Run the synchronous generator in a thread so we don't block
+        # the event loop during inference.  We collect one chunk at a
+        # time via asyncio.to_thread to keep memory bounded.
         async with _inference_lock:
-            for chunk in tts.infer_stream(req.input):
-                pcm = (np.clip(chunk.cpu().numpy(), -1.0, 1.0) * INT16_MAX).astype(np.int16)
+            stream_iter = iter(model.synthesize_stream(req.input))
+            while True:
+                chunk = await asyncio.to_thread(next, stream_iter, None)
+                if chunk is None:
+                    break
+                pcm = (np.clip(chunk.audio, -1.0, 1.0) * INT16_MAX).astype(np.int16)
                 encoded = base64.b64encode(pcm.tobytes()).decode("ascii")
                 payload = json.dumps({"type": "speech.audio.delta", "audio": encoded})
                 yield f"data: {payload}\n\n"
@@ -259,8 +257,9 @@ def _streaming_response(tts: Narro, req: SpeechRequest) -> StreamingResponse:
 def serve(
     host: str = "0.0.0.0",
     port: int = 8000,
+    model: str = "soprano",
     device: str = "auto",
-    model_path: Optional[str] = None,
+    model_path: str | None = None,
     compile: bool = True,
     quantize: bool = False,
     log_level: str = "info",
@@ -268,9 +267,10 @@ def serve(
     """Start the Narro TTS server.
 
     Args:
-        host: Network interface to bind (default '0.0.0.0').
-        port: TCP port to listen on (default 8000).
-        device: Compute device ('auto', 'cpu', 'cuda', 'mps').
+        host: Network interface to bind.
+        port: TCP port to listen on.
+        model: Model backend to load (currently: ``'soprano'``).
+        device: Compute device.
         model_path: Path to local model directory (None = HuggingFace).
         compile: Enable torch.compile.
         quantize: Enable INT8 quantization.
@@ -278,5 +278,24 @@ def serve(
     """
     import uvicorn
 
-    create_app(device=device, model_path=model_path, compile=compile, quantize=quantize)
+    backend = _load_model(model, device=device, model_path=model_path,
+                          compile=compile, quantize=quantize)
+    configure_app(models=[backend])
     uvicorn.run(app, host=host, port=port, log_level=log_level)
+
+
+_MODEL_FACTORIES = {
+    "soprano": "narro.models.soprano.SopranoModel",
+}
+
+
+def _load_model(name: str, **kwargs) -> TTSModel:
+    """Instantiate a model backend by name."""
+    qualified = _MODEL_FACTORIES.get(name)
+    if qualified is None:
+        available = ", ".join(sorted(_MODEL_FACTORIES))
+        raise ValueError(f"Unknown model: {name!r}. Available: {available}")
+    module_path, cls_name = qualified.rsplit(".", 1)
+    import importlib
+    mod = importlib.import_module(module_path)
+    return getattr(mod, cls_name)(**kwargs)

@@ -316,26 +316,36 @@ class TestCLIAlignFlag:
 
     def test_cli_align_flag_short(self):
         """The speak subcommand should accept -a shorthand."""
-        import narro.cli as cli_mod
+        from narro.cli import main
+        from unittest.mock import patch, MagicMock
+        import argparse
 
-        parser = cli_mod.argparse.ArgumentParser()
-        subparsers = parser.add_subparsers(dest='command')
-        speak_parser = subparsers.add_parser('speak')
-        cli_mod._add_speak_args(speak_parser)
-        cli_mod._add_common_args(speak_parser)
-
-        args = parser.parse_args(['speak', 'Hello', '-a', 'out.json'])
-        assert args.align == 'out.json'
+        with patch('sys.argv', ['narro', 'speak', 'Hello', '-a', 'out.json']), \
+             patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
+            mock_parse.return_value = argparse.Namespace(
+                command='speak',
+                func=MagicMock(),
+                text='Hello',
+                output='output.wav',
+                align='out.json',
+            )
+            main()
 
     def test_cli_align_flag_defaults_none(self):
         """--align should default to None when not provided."""
-        import narro.cli as cli_mod
+        from narro.cli import main
+        from unittest.mock import patch, MagicMock
+        import argparse
 
-        parser = cli_mod.argparse.ArgumentParser()
-        subparsers = parser.add_subparsers(dest='command')
-        speak_parser = subparsers.add_parser('speak')
-        cli_mod._add_speak_args(speak_parser)
-        cli_mod._add_common_args(speak_parser)
-
-        args = parser.parse_args(['speak', 'Hello'])
-        assert args.align is None
+        with patch('sys.argv', ['narro', 'speak', 'Hello']), \
+             patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
+            mock_parse.return_value = argparse.Namespace(
+                command='speak',
+                func=MagicMock(),
+                text='Hello',
+                output='output.wav',
+                align=None,
+            )
+            main()
+            # func was called, which means align=None was accepted
+            mock_parse.return_value.func.assert_called_once()

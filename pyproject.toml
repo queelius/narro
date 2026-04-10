@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "narro"
-version = "0.5.0"
+version = "0.6.0"
 authors = [
   { name="Alex Towell", email="lex@metafunctor.com" },
 ]
-description = "Narro: lightweight text-to-speech with GPU server support"
+description = "Narro: model-agnostic text-to-speech server and client"
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
@@ -17,13 +17,13 @@ classifiers = [
 ]
 dependencies = [
   "huggingface_hub",
+  "inflect",
   "numpy",
-  "pyyaml",
+  "requests",
   "scipy",
   "torch>=2.1.0",
   "transformers>=4.51.0",
   "unidecode",
-  "inflect"
 ]
 license = {file = "LICENSE"}
 

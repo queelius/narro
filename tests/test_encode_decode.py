@@ -685,66 +685,6 @@ class TestBaseModelEnrichedOutput:
         assert 'token_entropy' in tokens[0]
 
 
-# ---------------------------------------------------------------------------
-# CLI encode/decode tests
-# ---------------------------------------------------------------------------
-
-class TestCLISubcommands:
-
-    def test_encode_subcommand(self):
-        """encode subcommand should call tts.encode and save."""
-        from narro.cli import cmd_encode
-        import argparse
-
-        args = argparse.Namespace(
-            text='Hello world',
-            output='/tmp/test.soprano',
-            model_path=None,
-            no_compile=True,
-            quantize=False,
-            num_threads=None,
-            include_attention=False,
-            device='auto',
-        )
-
-        with patch('narro.Narro') as mock_tts_cls, \
-             patch('narro.encoded.save') as mock_save:
-            mock_tts = MagicMock()
-            mock_tts_cls.return_value = mock_tts
-            mock_encoded = MagicMock()
-            mock_encoded.total_tokens = 50
-            mock_encoded.estimated_duration = 3.2
-            mock_tts.encode.return_value = mock_encoded
-
-            cmd_encode(args)
-
-            mock_tts.encode.assert_called_once_with('Hello world', include_attention=False)
-            mock_save.assert_called_once_with(mock_encoded, '/tmp/test.soprano')
-
-    def test_decode_subcommand(self):
-        """decode subcommand should call load and decode_to_wav."""
-        from narro.cli import cmd_decode
-        import argparse
-
-        args = argparse.Namespace(
-            input='/tmp/test.soprano',
-            output='/tmp/test.wav',
-            model_path=None,
-            no_compile=True,
-            quantize=False,
-            num_threads=None,
-            decoder_batch_size=4,
-        )
-
-        with patch('narro.encoded.load') as mock_load, \
-             patch('narro.decode_only.load_decoder') as mock_load_decoder, \
-             patch('narro.decode_only.decode_to_wav') as mock_decode_wav:
-            mock_encoded = MagicMock()
-            mock_load.return_value = mock_encoded
-            mock_decoder = MagicMock()
-            mock_load_decoder.return_value = mock_decoder
-
-            cmd_decode(args)
-
-            mock_load.assert_called_once_with('/tmp/test.soprano')
-            mock_decode_wav.assert_called_once()
+# CLI encode/decode subcommands were removed in the API-first refactoring.
+# The library functions (encoded.save/load, decode_only) are still tested
+# above via TestEncodedSpeechRoundTrip and related classes.

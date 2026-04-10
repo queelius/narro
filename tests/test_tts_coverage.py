@@ -666,70 +666,43 @@ class TestBaseModelDeviceInfer:
 # ---------------------------------------------------------------------------
 
 class TestCLI:
-    """Test the CLI argument parsing and main() function."""
+    """Test the CLI argument parsing and main() function.
 
-    def test_cli_argument_parser_defaults(self):
-        """CLI should parse required text arg with correct defaults."""
+    The CLI is now client-first: ``narro speak`` requires a server URL.
+    Model flags (--device, --quantize, etc.) live on ``narro serve``.
+    """
+
+    def test_speak_requires_server(self):
+        """speak without NARRO_SERVER or --server should exit."""
         from narro.cli import main
+        import os
 
-        with patch('sys.argv', ['narro', 'Hello world', '-o', 'output.wav']), \
-             patch('narro.Narro') as mock_tts:
-            mock_instance = MagicMock()
-            mock_tts.return_value = mock_instance
+        env = {k: v for k, v in os.environ.items() if k != 'NARRO_SERVER'}
+        with patch('sys.argv', ['narro', 'speak', 'Hello']), \
+             patch.dict(os.environ, env, clear=True), \
+             pytest.raises(SystemExit):
             main()
 
-            mock_tts.assert_called_once_with(
-                model_path=None,
-                compile=True,
-                quantize=False,
-                decoder_batch_size=4,
-                num_threads=None,
-                device='auto',
-            )
-            mock_instance.infer.assert_called_once_with(
-                'Hello world', out_path='output.wav'
-            )
-
-    def test_cli_no_compile_flag(self):
-        """--no-compile should pass compile=False to Narro."""
+    def test_speak_calls_client(self):
+        """speak with --server should call NarroClient.infer."""
         from narro.cli import main
 
-        with patch('sys.argv', ['narro', 'Test', '--no-compile']), \
-             patch('narro.Narro') as mock_tts:
-            mock_tts.return_value = MagicMock()
+        mock_client = MagicMock()
+        with patch('sys.argv', ['narro', 'speak', 'Hello', '-s', 'http://localhost:8000']), \
+             patch('narro.client.NarroClient', return_value=mock_client):
             main()
-            assert mock_tts.call_args[1]['compile'] is False
+            mock_client.infer.assert_called_once()
 
-    def test_cli_quantize_flag(self):
-        """--quantize should pass quantize=True to Narro."""
+    def test_speak_shorthand(self):
+        """'narro "text"' should auto-insert 'speak' subcommand."""
         from narro.cli import main
 
-        with patch('sys.argv', ['narro', 'Test', '--quantize']), \
-             patch('narro.Narro') as mock_tts:
-            mock_tts.return_value = MagicMock()
+        mock_client = MagicMock()
+        with patch('sys.argv', ['narro', 'Hello world']), \
+             patch.dict('os.environ', {'NARRO_SERVER': 'http://localhost:8000'}), \
+             patch('narro.client.NarroClient', return_value=mock_client):
             main()
-            assert mock_tts.call_args[1]['quantize'] is True
-
-    def test_cli_custom_threads_and_batch_size(self):
-        """--num-threads and --decoder-batch-size should be passed through."""
-        from narro.cli import main
-
-        with patch('sys.argv', ['narro', 'Test', '-t', '4', '-bs', '8']), \
-             patch('narro.Narro') as mock_tts:
-            mock_tts.return_value = MagicMock()
-            main()
-            assert mock_tts.call_args[1]['decoder_batch_size'] == 8
-            assert mock_tts.call_args[1]['num_threads'] == 4
-
-    def test_cli_model_path(self):
-        """--model-path should be passed through to Narro."""
-        from narro.cli import main
-
-        with patch('sys.argv', ['narro', 'Test', '-m', '/tmp/my_model']), \
-             patch('narro.Narro') as mock_tts:
-            mock_tts.return_value = MagicMock()
-            main()
-            assert mock_tts.call_args[1]['model_path'] == '/tmp/my_model'
+            mock_client.infer.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -2005,13 +1978,13 @@ class TestCLIDispatch:
         import argparse
 
         mock_func = MagicMock()
-        with patch('sys.argv', ['narro', 'encode', 'Hello']), \
+        with patch('sys.argv', ['narro', 'speak', 'Hello']), \
              patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
             mock_parse.return_value = argparse.Namespace(
-                command='encode',
+                command='speak',
                 func=mock_func,
                 text='Hello',
-                output='out.soprano',
+                output='output.wav',
             )
             main()
             mock_func.assert_called_once()

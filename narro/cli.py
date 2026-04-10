@@ -1,133 +1,75 @@
 #!/usr/bin/env python3
-"""Narro TTS Command Line Interface"""
+"""Narro TTS Command Line Interface.
+
+The CLI is a thin client against a Narro TTS server.  ``narro serve``
+starts the server; ``narro speak`` talks to it.
+"""
+
 import argparse
 import logging
+import os
+import sys
 
 logger = logging.getLogger(__name__)
 
 
-def _add_common_args(parser):
-    """Add model/compile/quantize args shared across subcommands."""
-    parser.add_argument('--server', '-s',
-                        help='Narro server URL (or set NARRO_SERVER env var)')
-    parser.add_argument('--model-path', '-m',
-                        help='Path to local model directory (optional)')
-    parser.add_argument('--no-compile', action='store_true',
-                        help='Disable torch.compile optimization')
-    parser.add_argument('--quantize', action='store_true',
-                        help='Enable INT8 quantization (faster but lower quality)')
-    parser.add_argument('--num-threads', '-t', type=int,
-                        help='Number of CPU threads for inference')
-    parser.add_argument('--device', '-d', default='auto',
-                        choices=['auto', 'cpu', 'cuda', 'mps'],
-                        help='Compute device (default: auto)')
+def _require_server(args) -> str:
+    """Return the server URL from --server / NARRO_SERVER, or exit."""
+    url = getattr(args, "server", None) or os.environ.get("NARRO_SERVER")
+    if not url:
+        print(
+            "Error: No server URL configured.\n"
+            "\n"
+            "  Set NARRO_SERVER or pass --server:\n"
+            "    export NARRO_SERVER=http://localhost:8000\n"
+            "    narro speak \"Hello world\"\n"
+            "\n"
+            "  Or start a local server first:\n"
+            "    narro serve",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return url
+
+
+# ---------------------------------------------------------------------------
+# speak
+# ---------------------------------------------------------------------------
 
 
 def cmd_speak(args):
-    """Default command: encode + decode text to WAV."""
-    import os
-    server_url = getattr(args, 'server', None) or os.environ.get('NARRO_SERVER')
-    if server_url:
-        from narro.client import NarroClient
-        client = NarroClient(server_url)
-        client.infer(args.text, out_path=args.output)
-        logger.info("Audio saved to: %s", args.output)
-        return
+    """Synthesize speech via the TTS server."""
+    from narro.client import NarroClient
 
-    from narro import Narro
-    tts = Narro(
-        model_path=args.model_path,
-        compile=not args.no_compile,
-        quantize=args.quantize,
-        decoder_batch_size=args.decoder_batch_size,
-        num_threads=args.num_threads,
-        device=args.device,
-    )
-    logger.info("Generating speech for: '%s'", args.text)
+    url = _require_server(args)
+    client = NarroClient(url)
 
     if args.align:
-        from narro.alignment import extract_alignment_from_encoded, save_alignment
-        encoded = tts.encode(args.text, include_attention=True)
-        tts.decode_to_wav(encoded, args.output)
-        alignment = extract_alignment_from_encoded(encoded)
+        from narro.alignment import save_alignment
+
+        audio_bytes, alignment = client.generate_with_alignment(
+            [args.text], args.output,
+        )
         save_alignment(alignment, args.align)
     else:
-        tts.infer(args.text, out_path=args.output)
-        logger.info("Audio saved to: %s", args.output)
+        client.infer(args.text, out_path=args.output)
 
-
-def cmd_encode(args):
-    """Encode text to .soprano file."""
-    from narro import Narro
-    from narro.encoded import save
-    tts = Narro(
-        model_path=args.model_path,
-        compile=not args.no_compile,
-        quantize=args.quantize,
-        num_threads=args.num_threads,
-        device=args.device,
-    )
-    logger.info("Encoding: '%s'", args.text)
-    encoded = tts.encode(args.text, include_attention=args.include_attention)
-    save(encoded, args.output)
-    logger.info("Encoded %d tokens (est. %.1fs audio) -> %s",
-                encoded.total_tokens, encoded.estimated_duration, args.output)
-
-
-def cmd_decode(args):
-    """Decode .soprano file to WAV."""
-    from narro.encoded import load
-    from narro.decode_only import decode_to_wav, load_decoder
-    logger.info("Loading encoded speech from: %s", args.input)
-    encoded = load(args.input)
-    decoder = load_decoder(model_path=args.model_path, compile=not args.no_compile)
-    decode_to_wav(encoded, args.output, decoder=decoder,
-                  decoder_batch_size=args.decoder_batch_size)
     logger.info("Audio saved to: %s", args.output)
 
 
-def cmd_bench(args):
-    """Run benchmark suite and report performance metrics."""
-    from narro.bench import run_benchmark, format_table
-    import json
-    results = run_benchmark(
-        device=args.device,
-        compile=not args.no_compile,
-        quantize=args.quantize,
-        num_runs=args.runs,
-        num_threads=args.num_threads,
-    )
-    if args.json:
-        print(json.dumps(results))
-    else:
-        print(format_table(results))
-
-
-def cmd_hugo(args):
-    """Dispatch hugo subcommands."""
-    from narro.hugo.cli import cmd_hugo_generate, cmd_hugo_install, cmd_hugo_status
-    if args.hugo_command == 'generate':
-        cmd_hugo_generate(
-            args.site_root,
-            force=args.force,
-            dry_run=args.dry_run,
-            post_slug=args.post,
-            rewrite=getattr(args, 'rewrite', False),
-        )
-    elif args.hugo_command == 'install':
-        cmd_hugo_install(args.site_root)
-    elif args.hugo_command == 'status':
-        cmd_hugo_status(args.site_root)
-    else:
-        args._hugo_parser.print_help()
+# ---------------------------------------------------------------------------
+# serve
+# ---------------------------------------------------------------------------
 
 
 def cmd_serve(args):
     """Start the TTS API server."""
     from narro.server import serve
+
     serve(
         host=args.host,
         port=args.port,
+        model=args.model,
         device=args.device,
         model_path=args.model_path,
         compile=not args.no_compile,
@@ -135,113 +77,84 @@ def cmd_serve(args):
     )
 
 
-def _add_speak_args(parser):
-    """Add speak-specific args (text, output, batch size, alignment)."""
-    parser.add_argument('text', help='Text to synthesize')
-    parser.add_argument('--output', '-o', default='output.wav',
-                        help='Output audio file path')
-    parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,
-                        help='Batch size when decoding audio')
-    parser.add_argument('--align', '-a',
-                        help='Output word-alignment JSON file path')
+# ---------------------------------------------------------------------------
+# Arg parsing
+# ---------------------------------------------------------------------------
 
 
 def main():
-    import sys
-
-    # Default to 'speak' when first arg isn't a known subcommand.
-    # This lets `narro "Hello world"` work as shorthand for `narro speak "Hello world"`.
-    _subcommands = {'speak', 'encode', 'decode', 'hugo', 'serve', 'bench'}
-    if len(sys.argv) > 1 and sys.argv[1] not in _subcommands and sys.argv[1] not in ('-h', '--help'):
-        sys.argv.insert(1, 'speak')
+    if (
+        len(sys.argv) > 1
+        and sys.argv[1] not in {"speak", "serve", "-h", "--help"}
+    ):
+        sys.argv.insert(1, "speak")
 
     parser = argparse.ArgumentParser(
-        description='Narro Text-to-Speech CLI',
+        description="Narro TTS — model-agnostic text-to-speech server and client",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""examples:
-  narro "Hello world" -o output.wav
-  narro encode "Hello world" -o encoded.soprano
-  narro decode encoded.soprano -o output.wav
-  narro hugo generate ~/mysite
-  narro hugo install ~/mysite
-""")
+        epilog="""\
+examples:
+  narro serve                            # start the server
+  narro serve --model soprano --device cuda
+  narro "Hello world" -o output.wav      # synthesize (client)
+""",
+    )
 
-    subparsers = parser.add_subparsers(dest='command')
+    subparsers = parser.add_subparsers(dest="command")
 
     # --- speak ---
-    speak_parser = subparsers.add_parser('speak', help='Synthesize speech (default)')
-    _add_speak_args(speak_parser)
-    _add_common_args(speak_parser)
+    speak_parser = subparsers.add_parser("speak", help="Synthesize speech (default)")
+    speak_parser.add_argument("text", help="Text to synthesize")
+    speak_parser.add_argument(
+        "--output", "-o", default="output.wav", help="Output audio file path"
+    )
+    speak_parser.add_argument(
+        "--align", "-a", help="Output word-alignment JSON file path"
+    )
+    speak_parser.add_argument(
+        "--server", "-s", help="Server URL (or set NARRO_SERVER env var)"
+    )
     speak_parser.set_defaults(func=cmd_speak)
 
-    # --- encode ---
-    encode_parser = subparsers.add_parser('encode', help='Encode text to .soprano file')
-    encode_parser.add_argument('text', help='Text to encode')
-    encode_parser.add_argument('--output', '-o', default='output.soprano',
-                               help='Output .soprano file path')
-    encode_parser.add_argument('--include-attention', action='store_true',
-                               help='Include attention weights (larger file)')
-    _add_common_args(encode_parser)
-    encode_parser.set_defaults(func=cmd_encode)
-
-    # --- decode ---
-    decode_parser = subparsers.add_parser('decode', help='Decode .soprano file to WAV')
-    decode_parser.add_argument('input', help='Input .soprano file path')
-    decode_parser.add_argument('--output', '-o', default='output.wav',
-                               help='Output WAV file path')
-    decode_parser.add_argument('--decoder-batch-size', '-bs', type=int, default=4,
-                               help='Batch size when decoding audio')
-    decode_parser.add_argument('--model-path', '-m',
-                               help='Path to local model directory (optional)')
-    decode_parser.add_argument('--no-compile', action='store_true',
-                               help='Disable torch.compile optimization')
-    decode_parser.set_defaults(func=cmd_decode)
-
-    # --- hugo ---
-    hugo_parser = subparsers.add_parser('hugo', help='Hugo site integration')
-    hugo_subparsers = hugo_parser.add_subparsers(dest='hugo_command')
-    hugo_parser.set_defaults(func=cmd_hugo, _hugo_parser=hugo_parser)
-
-    # hugo generate
-    gen_parser = hugo_subparsers.add_parser('generate', help='Generate TTS for posts')
-    gen_parser.add_argument('site_root', help='Path to Hugo site root')
-    gen_parser.add_argument('--force', action='store_true',
-                            help='Regenerate even if audio exists')
-    gen_parser.add_argument('--dry-run', action='store_true',
-                            help='Show what would be generated')
-    gen_parser.add_argument('--post', help='Generate for a single post slug')
-    gen_parser.add_argument('--rewrite', action='store_true',
-                            help='Rewrite paragraphs via LLM before TTS')
-
-    # hugo install
-    inst_parser = hugo_subparsers.add_parser('install', help='Install player assets')
-    inst_parser.add_argument('site_root', help='Path to Hugo site root')
-
-    # hugo status
-    stat_parser = hugo_subparsers.add_parser('status', help='Show TTS status')
-    stat_parser.add_argument('site_root', help='Path to Hugo site root')
-
     # --- serve ---
-    serve_parser = subparsers.add_parser('serve', help='Start TTS API server')
-    serve_parser.add_argument('--host', default='0.0.0.0', help='Bind host (default: 0.0.0.0)')
-    serve_parser.add_argument('--port', '-p', type=int, default=8000, help='Bind port (default: 8000)')
-    _add_common_args(serve_parser)
+    serve_parser = subparsers.add_parser("serve", help="Start TTS API server")
+    serve_parser.add_argument(
+        "--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)"
+    )
+    serve_parser.add_argument(
+        "--port", "-p", type=int, default=8000, help="Bind port (default: 8000)"
+    )
+    serve_parser.add_argument(
+        "--model",
+        default="soprano",
+        help="Model backend to load (default: soprano)",
+    )
+    serve_parser.add_argument(
+        "--device",
+        "-d",
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Compute device (default: auto)",
+    )
+    serve_parser.add_argument(
+        "--model-path", "-m", help="Path to local model directory"
+    )
+    serve_parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile optimization",
+    )
+    serve_parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Enable INT8 quantization (faster, lower quality)",
+    )
     serve_parser.set_defaults(func=cmd_serve)
 
-    # --- bench ---
-    bench_parser = subparsers.add_parser('bench', help='Run performance benchmarks')
-    bench_parser.add_argument('--runs', type=int, default=3,
-                              help='Number of timed runs per corpus entry (default: 3)')
-    bench_parser.add_argument('--json', action='store_true',
-                              help='Output results as JSON')
-    _add_common_args(bench_parser)
-    bench_parser.set_defaults(func=cmd_bench)
-
     args = parser.parse_args()
-
     logging.basicConfig(level=logging.INFO)
 
-    if args.command is not None:
+    if hasattr(args, "func"):
         args.func(args)
     else:
         parser.print_help()
