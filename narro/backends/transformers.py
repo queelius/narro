@@ -24,7 +24,7 @@ class TransformersModel(BaseModel):
 
         if compile:
             try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
+                self.model = torch.compile(self.model)
             except Exception as e:
                 import warnings
                 warnings.warn(f"torch.compile failed: {e}")

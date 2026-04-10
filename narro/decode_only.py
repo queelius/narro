@@ -52,7 +52,7 @@ def load_decoder(model_path=None, compile=False, device='cpu'):
 
     if compile:
         try:
-            decoder = torch.compile(decoder, mode="reduce-overhead")
+            decoder = torch.compile(decoder)
         except Exception as e:
             import warnings
             warnings.warn(f"torch.compile failed for decoder: {e}")
