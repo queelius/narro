@@ -115,12 +115,13 @@ def pull(model_id: str) -> None:
     logger.info("Pulling %s from %s (~%d MB)...", model_id, entry.hf_repo, entry.size_mb)
 
     from huggingface_hub import snapshot_download
-    snapshot_download(repo_id=entry.hf_repo)
+    local_dir = snapshot_download(repo_id=entry.hf_repo)
 
     catalog = _read_catalog()
     catalog[model_id] = {
         "pulled_at": datetime.now(timezone.utc).isoformat(),
         "hf_repo": entry.hf_repo,
+        "local_dir": local_dir,
     }
     _write_catalog(catalog)
     logger.info("Pulled %s successfully.", model_id)
@@ -155,6 +156,15 @@ def load_backend(model_id: str, **kwargs):
         )
 
     entry = KNOWN_MODELS[model_id]
+    catalog = _read_catalog()
+    local_dir = catalog[model_id].get("local_dir")
+    if not local_dir:
+        # Catalog entry from before local_dir was tracked; resolve it.
+        from huggingface_hub import snapshot_download
+        local_dir = snapshot_download(repo_id=entry.hf_repo, local_files_only=True)
+    if local_dir:
+        kwargs.setdefault("model_path", local_dir)
+
     module_path, cls_name = entry.backend.rsplit(".", 1)
 
     import importlib

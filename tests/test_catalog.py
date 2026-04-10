@@ -41,7 +41,7 @@ class TestPullState:
         assert not is_pulled("soprano-80m")
 
     def test_pull_records_state(self):
-        with patch("huggingface_hub.snapshot_download"):
+        with patch("huggingface_hub.snapshot_download", return_value="/tmp/fake/cache"):
             pull("soprano-80m")
 
         assert is_pulled("soprano-80m")
@@ -59,7 +59,7 @@ class TestPullState:
             remove("soprano-80m")
 
     def test_pull_then_remove(self):
-        with patch("huggingface_hub.snapshot_download"):
+        with patch("huggingface_hub.snapshot_download", return_value="/tmp/fake/cache"):
             pull("soprano-80m")
         assert is_pulled("soprano-80m")
         remove("soprano-80m")
@@ -76,7 +76,7 @@ class TestLoadBackend:
             load_backend("nonexistent")
 
     def test_load_pulled_model(self):
-        with patch("huggingface_hub.snapshot_download"):
+        with patch("huggingface_hub.snapshot_download", return_value="/tmp/fake/cache"):
             pull("soprano-80m")
 
         mock_cls = MagicMock()
