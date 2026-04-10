@@ -52,6 +52,7 @@ _MAX_INPUT_LENGTH = 50_000  # characters
 class SpeechRequest(BaseModel):
     input: str
     model: str | None = None
+    voice: str | None = None
     response_format: str = "wav"
     stream: bool = False
     align: bool = False
@@ -198,9 +199,12 @@ async def speech(req: SpeechRequest):
 async def _non_streaming_response(model: TTSModel, req: SpeechRequest) -> Response:
     """Synthesize the full input and return a WAV or Opus response."""
     loop = asyncio.get_event_loop()
+    kwargs = {"align": req.align}
+    if req.voice:
+        kwargs["voice"] = req.voice
     async with _inference_lock:
         result = await loop.run_in_executor(
-            None, lambda: model.synthesize(req.input, align=req.align)
+            None, lambda: model.synthesize(req.input, **kwargs)
         )
 
     wav_bytes = _audio_to_wav_bytes(result.audio, result.sample_rate)
@@ -233,7 +237,10 @@ def _streaming_response(model: TTSModel, req: SpeechRequest) -> StreamingRespons
         # the event loop during inference.  We collect one chunk at a
         # time via asyncio.to_thread to keep memory bounded.
         async with _inference_lock:
-            stream_iter = iter(model.synthesize_stream(req.input))
+            stream_kwargs = {}
+            if req.voice:
+                stream_kwargs["voice"] = req.voice
+            stream_iter = iter(model.synthesize_stream(req.input, **stream_kwargs))
             while True:
                 chunk = await asyncio.to_thread(next, stream_iter, None)
                 if chunk is None:
@@ -257,45 +264,40 @@ def _streaming_response(model: TTSModel, req: SpeechRequest) -> StreamingRespons
 def serve(
     host: str = "0.0.0.0",
     port: int = 8000,
-    model: str = "soprano",
+    models: list[str] | None = None,
     device: str = "auto",
-    model_path: str | None = None,
     compile: bool = True,
     quantize: bool = False,
     log_level: str = "info",
 ) -> None:
     """Start the Narro TTS server.
 
+    Loads all pulled models by default, or a specific subset if
+    *models* is provided.
+
     Args:
         host: Network interface to bind.
         port: TCP port to listen on.
-        model: Model backend to load (currently: ``'soprano'``).
+        models: Model IDs to load (None = all pulled).
         device: Compute device.
-        model_path: Path to local model directory (None = HuggingFace).
         compile: Enable torch.compile.
         quantize: Enable INT8 quantization.
         log_level: Uvicorn log level string.
     """
     import uvicorn
+    from .catalog import load_backend, pulled_models
 
-    backend = _load_model(model, device=device, model_path=model_path,
-                          compile=compile, quantize=quantize)
-    configure_app(models=[backend])
+    model_ids = models or list(pulled_models().keys())
+    if not model_ids:
+        raise RuntimeError(
+            "No models pulled. Pull a model first:\n"
+            "  narro models pull soprano-80m"
+        )
+
+    backends = []
+    for mid in model_ids:
+        logger.info("Loading model: %s", mid)
+        backends.append(load_backend(mid, device=device, compile=compile, quantize=quantize))
+
+    configure_app(models=backends)
     uvicorn.run(app, host=host, port=port, log_level=log_level)
-
-
-_MODEL_FACTORIES = {
-    "soprano": "narro.models.soprano.SopranoModel",
-}
-
-
-def _load_model(name: str, **kwargs) -> TTSModel:
-    """Instantiate a model backend by name."""
-    qualified = _MODEL_FACTORIES.get(name)
-    if qualified is None:
-        available = ", ".join(sorted(_MODEL_FACTORIES))
-        raise ValueError(f"Unknown model: {name!r}. Available: {available}")
-    module_path, cls_name = qualified.rsplit(".", 1)
-    import importlib
-    mod = importlib.import_module(module_path)
-    return getattr(mod, cls_name)(**kwargs)

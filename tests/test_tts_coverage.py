@@ -668,41 +668,22 @@ class TestBaseModelDeviceInfer:
 class TestCLI:
     """Test the CLI argument parsing and main() function.
 
-    The CLI is now client-first: ``narro speak`` requires a server URL.
-    Model flags (--device, --quantize, etc.) live on ``narro serve``.
+    The CLI exposes ``serve`` and ``models`` subcommands.
     """
 
-    def test_speak_requires_server(self):
-        """speak without NARRO_SERVER or --server should exit."""
+    def test_no_args_prints_help(self):
         from narro.cli import main
-        import os
-
-        env = {k: v for k, v in os.environ.items() if k != 'NARRO_SERVER'}
-        with patch('sys.argv', ['narro', 'speak', 'Hello']), \
-             patch.dict(os.environ, env, clear=True), \
-             pytest.raises(SystemExit):
+        with patch('sys.argv', ['narro']), \
+             patch('narro.cli.argparse.ArgumentParser.print_help') as mock_help:
             main()
+            mock_help.assert_called_once()
 
-    def test_speak_calls_client(self):
-        """speak with --server should call NarroClient.infer."""
+    def test_models_list_runs(self):
         from narro.cli import main
-
-        mock_client = MagicMock()
-        with patch('sys.argv', ['narro', 'speak', 'Hello', '-s', 'http://localhost:8000']), \
-             patch('narro.client.NarroClient', return_value=mock_client):
+        with patch('sys.argv', ['narro', 'models', 'list']), \
+             patch('narro.catalog.KNOWN_MODELS', {"test": MagicMock(id="test", description="Test", size_mb=1, voices=[])}), \
+             patch('narro.catalog.pulled_models', return_value={}):
             main()
-            mock_client.infer.assert_called_once()
-
-    def test_speak_shorthand(self):
-        """'narro "text"' should auto-insert 'speak' subcommand."""
-        from narro.cli import main
-
-        mock_client = MagicMock()
-        with patch('sys.argv', ['narro', 'Hello world']), \
-             patch.dict('os.environ', {'NARRO_SERVER': 'http://localhost:8000'}), \
-             patch('narro.client.NarroClient', return_value=mock_client):
-            main()
-            mock_client.infer.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1978,13 +1959,11 @@ class TestCLIDispatch:
         import argparse
 
         mock_func = MagicMock()
-        with patch('sys.argv', ['narro', 'speak', 'Hello']), \
+        with patch('sys.argv', ['narro', 'models', 'list']), \
              patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
             mock_parse.return_value = argparse.Namespace(
-                command='speak',
+                command='models',
                 func=mock_func,
-                text='Hello',
-                output='output.wav',
             )
             main()
             mock_func.assert_called_once()

@@ -1,60 +1,15 @@
 #!/usr/bin/env python3
 """Narro TTS Command Line Interface.
 
-The CLI is a thin client against a Narro TTS server.  ``narro serve``
-starts the server; ``narro speak`` talks to it.
+``narro serve`` starts the TTS server.  ``narro models`` manages local
+model downloads (pull, list, info, remove).
 """
 
 import argparse
 import logging
-import os
 import sys
 
 logger = logging.getLogger(__name__)
-
-
-def _require_server(args) -> str:
-    """Return the server URL from --server / NARRO_SERVER, or exit."""
-    url = getattr(args, "server", None) or os.environ.get("NARRO_SERVER")
-    if not url:
-        print(
-            "Error: No server URL configured.\n"
-            "\n"
-            "  Set NARRO_SERVER or pass --server:\n"
-            "    export NARRO_SERVER=http://localhost:8000\n"
-            "    narro speak \"Hello world\"\n"
-            "\n"
-            "  Or start a local server first:\n"
-            "    narro serve",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    return url
-
-
-# ---------------------------------------------------------------------------
-# speak
-# ---------------------------------------------------------------------------
-
-
-def cmd_speak(args):
-    """Synthesize speech via the TTS server."""
-    from narro.client import NarroClient
-
-    url = _require_server(args)
-    client = NarroClient(url)
-
-    if args.align:
-        from narro.alignment import save_alignment
-
-        audio_bytes, alignment = client.generate_with_alignment(
-            [args.text], args.output,
-        )
-        save_alignment(alignment, args.align)
-    else:
-        client.infer(args.text, out_path=args.output)
-
-    logger.info("Audio saved to: %s", args.output)
 
 
 # ---------------------------------------------------------------------------
@@ -63,18 +18,80 @@ def cmd_speak(args):
 
 
 def cmd_serve(args):
-    """Start the TTS API server."""
+    """Start the TTS API server, loading all pulled models."""
     from narro.server import serve
+
+    models = None
+    if args.model:
+        models = [m.strip() for m in args.model.split(",")]
 
     serve(
         host=args.host,
         port=args.port,
-        model=args.model,
+        models=models,
         device=args.device,
-        model_path=args.model_path,
         compile=not args.no_compile,
         quantize=args.quantize,
     )
+
+
+# ---------------------------------------------------------------------------
+# models
+# ---------------------------------------------------------------------------
+
+
+def cmd_models_list(args):
+    """List known models and their pull status."""
+    from narro.catalog import KNOWN_MODELS, pulled_models
+
+    pulled = pulled_models()
+    for mid, entry in sorted(KNOWN_MODELS.items()):
+        status = "pulled" if mid in pulled else "not pulled"
+        voices = f"  voices: {', '.join(entry.voices)}" if entry.voices else ""
+        print(f"  {mid:<20} {status:<14} {entry.size_mb:>4} MB  {entry.description}{voices}")
+
+
+def cmd_models_pull(args):
+    """Download a model's weights."""
+    from narro.catalog import pull
+    pull(args.name)
+    print(f"Pulled {args.name}.")
+
+
+def cmd_models_info(args):
+    """Show detailed info about a model."""
+    from narro.catalog import KNOWN_MODELS, is_pulled, voices_dir
+
+    entry = KNOWN_MODELS.get(args.name)
+    if entry is None:
+        available = ", ".join(sorted(KNOWN_MODELS))
+        print(f"Unknown model: {args.name!r}. Available: {available}", file=sys.stderr)
+        sys.exit(1)
+
+    status = "pulled" if is_pulled(args.name) else "not pulled"
+    print(f"Model:       {entry.id}")
+    print(f"Status:      {status}")
+    print(f"Description: {entry.description}")
+    print(f"HF repo:     {entry.hf_repo}")
+    print(f"Backend:     {entry.backend}")
+    print(f"Sample rate: {entry.sample_rate} Hz")
+    print(f"Size:        ~{entry.size_mb} MB")
+
+    if entry.voices:
+        print(f"Voices:      {', '.join(entry.voices)}")
+
+    # Show custom voices if any
+    vdir = voices_dir(args.name)
+    custom = [f.stem for f in vdir.iterdir() if f.suffix == ".npz"]
+    if custom:
+        print(f"Custom:      {', '.join(sorted(custom))}")
+
+
+def cmd_models_remove(args):
+    """Remove a model from the local catalog."""
+    from narro.catalog import remove
+    remove(args.name)
+    print(f"Removed {args.name} from catalog.")
 
 
 # ---------------------------------------------------------------------------
@@ -83,38 +100,19 @@ def cmd_serve(args):
 
 
 def main():
-    if (
-        len(sys.argv) > 1
-        and sys.argv[1] not in {"speak", "serve", "-h", "--help"}
-    ):
-        sys.argv.insert(1, "speak")
-
     parser = argparse.ArgumentParser(
-        description="Narro TTS — model-agnostic text-to-speech server and client",
+        description="Narro: model-agnostic text-to-speech server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  narro serve                            # start the server
-  narro serve --model soprano --device cuda
-  narro "Hello world" -o output.wav      # synthesize (client)
+  narro models pull soprano-80m           # download model
+  narro models list                       # show available models
+  narro serve                             # serve all pulled models
+  narro serve --model soprano-80m         # serve specific model
 """,
     )
 
     subparsers = parser.add_subparsers(dest="command")
-
-    # --- speak ---
-    speak_parser = subparsers.add_parser("speak", help="Synthesize speech (default)")
-    speak_parser.add_argument("text", help="Text to synthesize")
-    speak_parser.add_argument(
-        "--output", "-o", default="output.wav", help="Output audio file path"
-    )
-    speak_parser.add_argument(
-        "--align", "-a", help="Output word-alignment JSON file path"
-    )
-    speak_parser.add_argument(
-        "--server", "-s", help="Server URL (or set NARRO_SERVER env var)"
-    )
-    speak_parser.set_defaults(func=cmd_speak)
 
     # --- serve ---
     serve_parser = subparsers.add_parser("serve", help="Start TTS API server")
@@ -126,8 +124,7 @@ examples:
     )
     serve_parser.add_argument(
         "--model",
-        default="soprano",
-        help="Model backend to load (default: soprano)",
+        help="Model(s) to load, comma-separated (default: all pulled)",
     )
     serve_parser.add_argument(
         "--device",
@@ -135,9 +132,6 @@ examples:
         default="auto",
         choices=["auto", "cpu", "cuda", "mps"],
         help="Compute device (default: auto)",
-    )
-    serve_parser.add_argument(
-        "--model-path", "-m", help="Path to local model directory"
     )
     serve_parser.add_argument(
         "--no-compile",
@@ -150,6 +144,32 @@ examples:
         help="Enable INT8 quantization (faster, lower quality)",
     )
     serve_parser.set_defaults(func=cmd_serve)
+
+    # --- models ---
+    models_parser = subparsers.add_parser("models", help="Manage TTS models")
+    models_sub = models_parser.add_subparsers(dest="models_command")
+
+    # models list
+    list_parser = models_sub.add_parser("list", help="List available models")
+    list_parser.set_defaults(func=cmd_models_list)
+
+    # models pull
+    pull_parser = models_sub.add_parser("pull", help="Download a model")
+    pull_parser.add_argument("name", help="Model ID (e.g. soprano-80m)")
+    pull_parser.set_defaults(func=cmd_models_pull)
+
+    # models info
+    info_parser = models_sub.add_parser("info", help="Show model details")
+    info_parser.add_argument("name", help="Model ID")
+    info_parser.set_defaults(func=cmd_models_info)
+
+    # models remove
+    rm_parser = models_sub.add_parser("remove", help="Remove a model from catalog")
+    rm_parser.add_argument("name", help="Model ID")
+    rm_parser.set_defaults(func=cmd_models_remove)
+
+    # Default: show help for models subcommand
+    models_parser.set_defaults(func=lambda a: models_parser.print_help())
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)

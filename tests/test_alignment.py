@@ -294,58 +294,6 @@ class TestExtractParagraphAlignment:
 # CLI --align flag tests
 # ---------------------------------------------------------------------------
 
-class TestCLIAlignFlag:
-
-    def test_cli_accepts_align_flag(self):
-        """The speak subcommand should accept --align."""
-        from narro.cli import main
-        from unittest.mock import patch, MagicMock
-
-        with patch('sys.argv', ['narro', 'speak', 'Hello world', '--align', 'output.json']), \
-             patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            import argparse
-            mock_parse.return_value = argparse.Namespace(
-                command='speak',
-                func=MagicMock(),
-                text='Hello world',
-                output='output.wav',
-                align='output.json',
-            )
-            main()
-            mock_parse.return_value.func.assert_called_once()
-
-    def test_cli_align_flag_short(self):
-        """The speak subcommand should accept -a shorthand."""
-        from narro.cli import main
-        from unittest.mock import patch, MagicMock
-        import argparse
-
-        with patch('sys.argv', ['narro', 'speak', 'Hello', '-a', 'out.json']), \
-             patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            mock_parse.return_value = argparse.Namespace(
-                command='speak',
-                func=MagicMock(),
-                text='Hello',
-                output='output.wav',
-                align='out.json',
-            )
-            main()
-
-    def test_cli_align_flag_defaults_none(self):
-        """--align should default to None when not provided."""
-        from narro.cli import main
-        from unittest.mock import patch, MagicMock
-        import argparse
-
-        with patch('sys.argv', ['narro', 'speak', 'Hello']), \
-             patch('narro.cli.argparse.ArgumentParser.parse_args') as mock_parse:
-            mock_parse.return_value = argparse.Namespace(
-                command='speak',
-                func=MagicMock(),
-                text='Hello',
-                output='output.wav',
-                align=None,
-            )
-            main()
-            # func was called, which means align=None was accepted
-            mock_parse.return_value.func.assert_called_once()
+# CLI --align flag was removed along with the speak subcommand.
+# Alignment is now accessed via the HTTP API (align: true in the request)
+# and via NarroClient.generate_with_alignment().

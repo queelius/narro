@@ -15,7 +15,7 @@ Usage::
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from narro.protocol import TTSModel
 
@@ -27,6 +27,7 @@ class ModelInfo:
     """Public metadata for a registered model."""
     id: str
     sample_rate: int
+    voices: list[str] = field(default_factory=list)
 
 
 class ModelRegistry:
@@ -61,10 +62,13 @@ class ModelRegistry:
 
     def list_models(self) -> list[ModelInfo]:
         """Return public metadata for all registered models."""
-        return [
-            ModelInfo(id=m.model_id, sample_rate=m.sample_rate)
-            for m in self._models.values()
-        ]
+        infos = []
+        for m in self._models.values():
+            voices = getattr(m, "VOICES", [])
+            if hasattr(m, "list_voices"):
+                voices = m.list_voices()
+            infos.append(ModelInfo(id=m.model_id, sample_rate=m.sample_rate, voices=voices))
+        return infos
 
     @property
     def default_model_id(self) -> str | None:
