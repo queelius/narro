@@ -14,7 +14,7 @@ class TransformersModel(BaseModel):
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             torch_dtype=dtype,
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.model.eval()

@@ -2065,7 +2065,7 @@ class TestTransformersModelInit:
 
             mock_model_cls.from_pretrained.assert_called_once_with(
                 'ekwek/Soprano-1.1-80M', torch_dtype=torch.float32,
-                attn_implementation="eager")
+                attn_implementation="sdpa")
             mock_model.eval.assert_called_once()
 
     def test_init_with_quantize(self):
@@ -2113,7 +2113,7 @@ class TestTransformersModelInit:
 
             mock_model_cls.from_pretrained.assert_called_once_with(
                 '/custom/model', torch_dtype=torch.float32,
-                attn_implementation="eager")
+                attn_implementation="sdpa")
             mock_tok_cls.from_pretrained.assert_called_once_with('/custom/model')
 
 
