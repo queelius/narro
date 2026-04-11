@@ -317,7 +317,7 @@ class Narro:
         audio_list = self.decode(encoded)
         write_wav(torch.cat(audio_list), out_path)
 
-    def infer_stream(self, text, chunk_size=1, top_p=0.95, temperature=0.0, repetition_penalty=1.2):
+    def infer_stream(self, text, chunk_size=8, top_p=0.95, temperature=0.0, repetition_penalty=1.2):
         start_time = time.time()
         sentence_data = self._preprocess_text([text])
 
