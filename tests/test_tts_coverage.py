@@ -2083,36 +2083,22 @@ class TestTransformersModelInit:
 
             mock_quantize.assert_called_once()
 
-    def test_init_with_compile(self):
-        """TransformersModel with compile=True should call torch.compile."""
+    def test_init_does_not_compile_llm(self):
+        """TransformersModel should NOT torch.compile the LLM (breaks streaming)."""
         with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
              patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls, \
              patch('torch.compile') as mock_compile:
             mock_model = MagicMock()
             mock_model_cls.from_pretrained.return_value = mock_model
             mock_tok_cls.from_pretrained.return_value = MagicMock()
-            mock_compile.return_value = mock_model
 
             from narro.backends.transformers import TransformersModel
             tm = TransformersModel(compile=True, quantize=False)
 
-            mock_compile.assert_called_once()
+            mock_compile.assert_not_called()
 
-    def test_init_compile_failure_warns(self):
-        """TransformersModel should warn if torch.compile fails."""
-        import warnings
-        with patch('narro.backends.transformers.AutoModelForCausalLM') as mock_model_cls, \
-             patch('narro.backends.transformers.AutoTokenizer') as mock_tok_cls, \
-             patch('torch.compile', side_effect=RuntimeError("not supported")):
-            mock_model = MagicMock()
-            mock_model_cls.from_pretrained.return_value = mock_model
-            mock_tok_cls.from_pretrained.return_value = MagicMock()
-
-            from narro.backends.transformers import TransformersModel
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                tm = TransformersModel(compile=True, quantize=False)
-                assert any("torch.compile failed" in str(warning.message) for warning in w)
+    # test_init_compile_failure_warns removed: LLM is no longer compiled
+    # (torch.compile breaks streaming inference with dynamic KV cache shapes)
 
     def test_init_custom_model_path(self):
         """TransformersModel with model_path should use that path."""

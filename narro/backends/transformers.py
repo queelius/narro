@@ -4,7 +4,7 @@ from .base import BaseModel
 
 
 class TransformersModel(BaseModel):
-    def __init__(self, model_path=None, compile=True, quantize=True, device='cpu'):
+    def __init__(self, model_path=None, compile=True, quantize=True, device='cpu'):  # noqa: ARG002 (compile kept for API compat)
         model_name_or_path = model_path if model_path else 'ekwek/Soprano-1.1-80M'
         self.device = device
 
@@ -22,9 +22,8 @@ class TransformersModel(BaseModel):
                 self.model, {torch.nn.Linear}, dtype=torch.qint8
             )
 
-        if compile:
-            try:
-                self.model = torch.compile(self.model)
-            except Exception as e:
-                import warnings
-                warnings.warn(f"torch.compile failed: {e}")
+        # torch.compile is not used on the LLM: streaming inference
+        # alternates between full-sequence and single-token-with-KV-cache
+        # call patterns, which causes torch.compile to hang or crash on
+        # recompilation.  The Vocos decoder (fixed input shape) is still
+        # compiled in tts.py / decode_only.py.
