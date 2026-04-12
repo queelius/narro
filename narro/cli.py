@@ -47,8 +47,8 @@ def cmd_models_list(args):
     pulled = pulled_models()
     for mid, entry in sorted(KNOWN_MODELS.items()):
         status = "pulled" if mid in pulled else "not pulled"
-        voices = f"  voices: {', '.join(entry.voices)}" if entry.voices else ""
-        print(f"  {mid:<20} {status:<14} {entry.size_mb:>4} MB  {entry.description}{voices}")
+        voice_info = f"  ({len(entry.voices)} voices)" if entry.voices else ""
+        print(f"  {mid:<20} {status:<14} {entry.size_mb:>4} MB  {entry.description}{voice_info}")
 
 
 def cmd_models_pull(args):
