@@ -68,6 +68,32 @@ KNOWN_MODELS: dict[str, ModelEntry] = {
         sample_rate=32000,
         size_mb=374,
     ),
+    "bark": ModelEntry(
+        id="bark",
+        description="Bark: multilingual TTS with voice cloning (24kHz, 13 languages)",
+        hf_repo="suno/bark",
+        backend="narro.models.bark.BarkModel",
+        sample_rate=24000,
+        size_mb=1500,
+        voices=[
+            f"v2/{lang}_speaker_{i}"
+            for lang in ("en", "de", "es", "fr", "hi", "it", "ja", "ko", "pl", "pt", "ru", "tr", "zh")
+            for i in range(10)
+        ],
+    ),
+    "bark-small": ModelEntry(
+        id="bark-small",
+        description="Bark Small: lighter Bark variant with voice cloning (24kHz)",
+        hf_repo="suno/bark-small",
+        backend="narro.models.bark.BarkModel",
+        sample_rate=24000,
+        size_mb=600,
+        voices=[
+            f"v2/{lang}_speaker_{i}"
+            for lang in ("en", "de", "es", "fr", "hi", "it", "ja", "ko", "pl", "pt", "ru", "tr", "zh")
+            for i in range(10)
+        ],
+    ),
 }
 
 
