@@ -54,3 +54,17 @@ class TestKokoroModel:
         assert "af_heart" in KOKORO_VOICES
         assert "am_adam" in KOKORO_VOICES
         assert len(KOKORO_VOICES) > 50
+
+
+def test_kokoro_has_lowercase_voices_property():
+    """routes.py + registry look for `voices` (lowercase); KokoroModel must satisfy."""
+    from muse.audio.speech.backends.kokoro import KokoroModel
+
+    assert "voices" in dir(KokoroModel), "KokoroModel must expose a `voices` attribute/property"
+
+    # Verify via an instance (bypassing __init__) that it returns the VOICES list
+    adapter = object.__new__(KokoroModel)
+    assert hasattr(adapter, "voices")
+    assert isinstance(adapter.voices, list)
+    assert len(adapter.voices) > 0
+    assert adapter.voices is KokoroModel.VOICES

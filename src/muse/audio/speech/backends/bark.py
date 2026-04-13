@@ -1,7 +1,7 @@
 """Bark TTS model backend.
 
 Wraps Suno's Bark model (via HuggingFace transformers) to implement
-the :class:`~narro.protocol.TTSModel` protocol.  Supports voice
+the :class:`~muse.audio.speech.protocol.TTSModel` protocol.  Supports voice
 presets and voice cloning from ``.npz`` history prompts.
 
 Bark generates complete audio in one shot (no native streaming).
@@ -42,6 +42,11 @@ class BarkModel:
     """
 
     VOICES = VOICE_PRESETS
+
+    @property
+    def voices(self) -> list[str]:
+        """Lowercase alias so registry / routes see the voice list."""
+        return self.VOICES
 
     def __init__(
         self,

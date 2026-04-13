@@ -1,7 +1,7 @@
 """Soprano TTS model backend.
 
 Wraps the Soprano-1.1-80M model (Qwen3 LLM + Vocos decoder) to
-implement the :class:`~narro.protocol.TTSModel` protocol.
+implement the :class:`~muse.audio.speech.protocol.TTSModel` protocol.
 
 The encode/decode split, hidden-state IR (``.soprano`` files), and
 Vocos decoder are all internal to this backend -- the server and

@@ -4,8 +4,11 @@ Codes against the standard API contract -- works with any server that
 implements ``/v1/audio/speech`` and ``/v1/models``.
 """
 
+from __future__ import annotations
+
 import json
 import logging
+import os
 
 import requests
 
@@ -20,8 +23,9 @@ class SpeechClient:
         model: Default model ID to use for synthesis requests.
     """
 
-    def __init__(self, server_url: str, model: str | None = None):
-        self.server_url = server_url.rstrip("/")
+    def __init__(self, server_url: str | None = None, model: str | None = None):
+        url = server_url or os.environ.get("MUSE_SERVER", "http://localhost:8000")
+        self.server_url = url.rstrip("/")
         self.model = model
 
     # -- Probes ------------------------------------------------------------

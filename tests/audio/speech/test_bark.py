@@ -157,3 +157,18 @@ class TestBarkVoiceCloning:
 
         call_kwargs = adapter._processor.call_args[1]
         assert "alex.npz" in call_kwargs["voice_preset"]
+
+
+def test_bark_has_lowercase_voices_property():
+    """routes.py + registry look for `voices` (lowercase); BarkModel must satisfy."""
+    from muse.audio.speech.backends.bark import BarkModel
+
+    assert "voices" in dir(BarkModel), "BarkModel must expose a `voices` attribute/property"
+
+    # Verify via an instance (bypassing __init__) that it returns the VOICES list
+    adapter = object.__new__(BarkModel)
+    adapter._is_small = False
+    assert hasattr(adapter, "voices")
+    assert isinstance(adapter.voices, list)
+    assert len(adapter.voices) > 0
+    assert adapter.voices is BarkModel.VOICES

@@ -46,7 +46,7 @@ class AudioChunk:
 
 @runtime_checkable
 class TTSModel(Protocol):
-    """Contract that any Narro TTS backend must satisfy.
+    """Contract that any Muse TTS backend must satisfy.
 
     Models are loaded once and registered with the server.  The server
     routes requests to models by ``model_id``.  Each model owns its

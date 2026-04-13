@@ -162,3 +162,27 @@ def test_images_route_with_empty_registry_returns_openai_404():
     assert "error" in body, f"Expected OpenAI envelope, got: {body}"
     assert "detail" not in body
     assert body["error"]["code"] == "model_not_found"
+
+
+def test_validation_error_uses_openai_envelope():
+    """422 for invalid input must use OpenAI shape, not FastAPI default."""
+    from pydantic import BaseModel, Field
+
+    router = APIRouter()
+
+    class Req(BaseModel):
+        value: int = Field(..., ge=0, le=10)
+
+    @router.post("/validate")
+    def validate(r: Req):
+        return {"ok": True}
+
+    app = create_app(registry=ModalityRegistry(), routers={"v": router})
+    client = TestClient(app)
+    r = client.post("/validate", json={"value": 999})
+    assert r.status_code == 422
+    body = r.json()
+    assert "error" in body, f"Expected OpenAI envelope, got: {body}"
+    assert "detail" not in body
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["code"] == "invalid_request"

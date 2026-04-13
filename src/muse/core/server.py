@@ -10,6 +10,7 @@ import logging
 from typing import Mapping
 
 from fastapi import APIRouter, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from muse.core.errors import ModelNotFoundError
@@ -34,6 +35,23 @@ def create_app(
     @app.exception_handler(ModelNotFoundError)
     async def _model_not_found_handler(request: Request, exc: ModelNotFoundError):
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(request: Request, exc: RequestValidationError):
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in e.get('loc', []))}: {e.get('msg', '')}"
+            for e in exc.errors()
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "invalid_request",
+                    "message": details or str(exc),
+                    "type": "invalid_request_error",
+                }
+            },
+        )
 
     @app.get("/health")
     def health():

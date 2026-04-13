@@ -1,4 +1,4 @@
-"""Intermediate representation for Narro TTS encoder/decoder pipeline.
+"""Intermediate representation for Muse Soprano TTS encoder/decoder pipeline.
 
 The IR decouples the LLM encoder from the Vocos decoder, enabling:
 - Offline encoding (encode once, decode many times)

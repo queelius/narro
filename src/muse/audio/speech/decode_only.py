@@ -1,4 +1,4 @@
-"""Lightweight decode-only module for Narro TTS.
+"""Lightweight decode-only module for Muse Soprano TTS.
 
 Loads only the Vocos decoder (~5MB) without the LLM (~374MB).
 Useful for decoding pre-encoded .soprano files on resource-constrained devices.

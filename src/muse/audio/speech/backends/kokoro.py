@@ -1,7 +1,7 @@
 """Kokoro TTS model backend.
 
 Wraps hexgrad/Kokoro-82M via the ``kokoro`` package to implement
-the :class:`~narro.protocol.TTSModel` protocol.  Lightweight (82M),
+the :class:`~muse.audio.speech.protocol.TTSModel` protocol.  Lightweight (82M),
 fast, with 54 voices across 6 languages. Sentence-level streaming.
 
 Requires: ``pip install kokoro soundfile`` and system ``espeak-ng``.
@@ -56,6 +56,11 @@ class KokoroModel:
 
     MODEL_ID = "kokoro-82m"
     VOICES = KOKORO_VOICES
+
+    @property
+    def voices(self) -> list[str]:
+        """Lowercase alias so registry / routes see the voice list."""
+        return self.VOICES
 
     def __init__(
         self,
