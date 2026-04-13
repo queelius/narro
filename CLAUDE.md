@@ -1,77 +1,133 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working on Muse.
 
-## Project Overview
+## Project overview
 
-Narro is a model-agnostic text-to-speech server and client. It defines a `TTSModel` protocol that any TTS backend can implement, a model registry for multi-model serving, and an HTTP API (OpenAI-compatible `/v1/audio/speech`). The first supported backend is Soprano-1.1-80M (80M params, 32kHz audio, Qwen3 LLM + Vocos decoder).
+Muse is a multi-modality generation server and client. It currently supports
+two modalities:
+
+- **audio.speech**: text-to-speech via `/v1/audio/speech` (Soprano, Kokoro, Bark)
+- **images.generations**: text-to-image via `/v1/images/generations` (SD-Turbo)
+
+The package structure mirrors OpenAI's URL hierarchy. Each modality owns its
+protocol, routes, CLI subcommands, and backends. A modality-agnostic core
+holds the registry, HF downloader, pip auto-install, and FastAPI app factory.
 
 ## Architecture
 
-### Three-Layer Design
-
 ```
-HTTP API (/v1/audio/speech, /v1/models)     ← client.py talks to this
-    ↓
-Server (server.py) + Model Registry          ← model-agnostic
-    ↓
-Model Backends (models/soprano.py, ...)      ← implement TTSModel protocol
+HTTP API (/v1/audio/speech, /v1/images/generations, /v1/models, /health)
+    |
+    v
+muse.core.server   (FastAPI factory, mounts per-modality routers)
+    |
+    v
+muse.core.registry (ModalityRegistry: {modality: {model_id: Model}})
+    |
+    v
+Modality backends implementing modality-specific protocols
 ```
 
-- **Protocol** (`protocol.py`): `TTSModel` Protocol with `synthesize()` and `synthesize_stream()`. Returns `AudioResult` (numpy float32 audio + metadata dict) or yields `AudioChunk`.
-- **Registry** (`models/__init__.py`): `ModelRegistry` singleton. First registered model is the default. Models looked up by `model_id`.
-- **Server** (`server.py`): FastAPI app, model-agnostic. Routes requests to models via registry. `configure_app()` registers models; `serve()` is the CLI entry point.
-- **Client** (`client.py`): Thin HTTP client against the API contract. Works with any compatible server.
-- **CLI** (`cli.py`): `narro serve` (starts server), `narro speak` (client, requires server).
+### Key modules
 
-### Soprano Backend (models/soprano.py)
+- `muse.core.registry.ModalityRegistry`: keyed by `(modality, model_id)`.
+  First registered model per modality is the default for that modality. No
+  shared protocol base across modalities.
+- `muse.core.catalog.KNOWN_MODELS`: static dict of `CatalogEntry`. Each entry
+  carries `modality`, `backend_path`, `hf_repo`, `pip_extras`,
+  `system_packages`. `pull()` installs pip deps, warns on missing system
+  packages, and downloads weights from HF. Catalog state lives at
+  `~/.muse/catalog.json` (or `MUSE_CATALOG_DIR` env override); writes are
+  atomic (write-then-rename).
+- `muse.core.server.create_app(registry, routers)`: builds the FastAPI app
+  with shared `/health` and `/v1/models`, mounts per-modality routers, and
+  registers the `ModelNotFoundError` exception handler so 404s use the
+  OpenAI-style `{"error":{...}}` envelope instead of FastAPI's `{"detail":...}`.
 
-Wraps the `Narro` class from `tts.py` to implement `TTSModel`. Model ID: `soprano-80m`.
+### Modality conventions
 
-The Soprano inference pipeline (internal to the backend):
+Each modality subpackage contains:
+- `protocol.py`: Protocol + Result dataclass(es) for this modality
+- `routes.py`: `build_router(registry) -> APIRouter`
+- `client.py`: HTTP client for this modality's endpoints
+- `codec.py`: modality-specific encoding (wav/opus for audio; png/jpeg for images)
+- `backends/`: concrete model adapters
 
-1. **Text preprocessing** (`tts.py:_preprocess_text`): `clean_text()` normalizes numbers/abbreviations/special chars, `split_and_recombine_text()` splits into sentences, short sentences are merged (min 30 chars). Each sentence is wrapped as `[STOP][TEXT]...[START]`.
+Each backend class:
+- Satisfies the modality's Protocol structurally (no base class required)
+- Accepts `hf_repo=`, `local_dir=`, `device=`, `**_` in its constructor (the
+  catalog loader calls with those kwargs; `**_` absorbs future additions)
+- Prefers `local_dir` over `hf_repo` when loading weights
+- Defers heavy imports (transformers, diffusers) to module top-level behind a
+  try/except so `muse --help` stays instant
 
-2. **LLM backbone** (`backends/transformers.py`): HuggingFace causal LM (`ekwek/Soprano-1.1-80M`) generates hidden states (not text tokens). Shape: `(seq_len, 512)`. Supports batch inference and streaming.
+### No shared supertype across modalities
 
-3. **Vocos decoder** (`vocos/`): ConvNeXt blocks process hidden states, then `ISTFTHead` predicts magnitude + phase for inverse STFT. Each hidden state token maps to 2048 audio samples at 32kHz.
+`AudioResult` and `ImageResult` do NOT share a common base. Streaming semantics
+differ (audio chunks are time-ordered and playable immediately; diffusion steps
+are progressive refinement of one frame). A `GenerationModel` abstract base
+would be a leaky abstraction. Instead, `ModalityRegistry` treats models as
+`Any`, and each modality's router + codec knows its own types.
 
-### Key Constants (in `tts.py`)
-
-- `SAMPLE_RATE = 32000`: output audio sample rate
-- `TOKEN_SIZE = 2048`: audio samples per decoder token
-- `HIDDEN_DIM = 512`: LLM hidden state dimension
-- `RECEPTIVE_FIELD = 4`: decoder context window for streaming
-
-## Development Commands
+## Development commands
 
 ```bash
-# Install for development
-pip install -e ".[server]"
+# Install (dev)
+pip install -e ".[dev,server,audio,images]"
 
-# Run tests
+# Run all tests
 pytest tests/
 
-# Run with coverage
-pytest tests/ --cov=narro
+# Run tests for one modality
+pytest tests/audio/speech/
+pytest tests/images/generations/
+
+# Coverage
+pytest tests/ --cov=muse
 
 # Start server
-narro serve --device cuda
+muse serve --device cuda
 
-# Synthesize (requires running server)
-export NARRO_SERVER=http://localhost:8000
-narro "Hello world" -o output.wav
+# End-to-end (requires running server)
+muse speak "hello" -o out.wav
+muse imagine "a cat" -o cat.png
 ```
 
-## Testing
+## Project-specific conventions
 
-Tests use `pytest` with `unittest.mock`. Server tests use `FakeModel` (a plain class satisfying the `TTSModel` protocol): no real model loading. The `_clean_registry` autouse fixture ensures test isolation. Benchmark tests are `@pytest.mark.skip` by default.
+- **Deferred imports:** `src/muse/__init__.py` and `src/muse/cli.py` MUST NOT
+  import heavy libs (torch, diffusers, transformers). Each backend imports
+  its heavy deps at module top-level inside a try/except so import of the
+  backend module succeeds even without the deps. Tests mock at the module
+  path where the library is imported. `muse --help` and `muse pull` work
+  without any ML deps installed; pulling a model installs them on demand.
+- **FakeModel-pattern tests:** Server and router tests use plain classes that
+  satisfy the modality protocol, no real weights. Backend tests also mock
+  heavy libs (see `tests/images/generations/test_sd_turbo.py`).
+- **Registry is a singleton at module level** (`muse.core.registry.registry`),
+  but tests create their own `ModalityRegistry()` instances to avoid coupling.
+- **Audio is float32 in `[-1, 1]`** at the protocol boundary; codec converts
+  to int16 PCM at output. Scaling uses `* 32768` + `np.clip` to reach full
+  int16 range `[-32768, 32767]`.
+- **Images are `Any`** at the protocol boundary; codec normalizes PIL / numpy /
+  torch to PIL before encoding.
+- **OpenAI error envelopes:** Use `raise ModelNotFoundError(model_id, modality)`
+  from `muse.core.errors`, not `HTTPException(detail=...)`. The former gives
+  `{"error":{"code","message","type"}}`; the latter gives `{"detail":...}`.
+- **Streaming uses producer thread + `asyncio.Queue`**, not `list(generator)`.
+  Synthesis chunks must dispatch as they're produced, not after full generation.
+- **Env vars:** `MUSE_SERVER` (client base URL), `MUSE_CATALOG_DIR` (catalog
+  location, defaults `~/.muse/`), `MUSE_HOME` (voices dir base).
 
-## Project-Specific Conventions
+## Adding a new modality
 
-- The `Narro` constructor runs a warmup inference (`self.infer("Hello world!")`): tests that construct it must mock this or patch the class.
-- Audio is float32 `[-1, 1]` internally (numpy arrays at the protocol boundary); converted to int16 PCM at output (WAV files).
-- The `ISTFTHead.forward` is decorated with `@torch.compiler.disable` because torch.compile doesn't support complex FFT operations.
-- `temperature=0.0` in the public API is silently clamped to `0.001` in the backend to avoid division by zero.
-- Synchronous model inference runs in `run_in_executor` / `asyncio.to_thread` to avoid blocking the event loop.
-- The `.soprano` file format and `encoded.py` / `decode_only.py` are Soprano-internal: not exposed via CLI or API.
+1. Create `src/muse/<family>/<op>/` (e.g., `muse/audio/transcriptions/`).
+2. Write `protocol.py` with the backend Protocol and Result dataclass.
+3. Write `routes.py` exposing `build_router(registry) -> APIRouter`.
+4. Write `client.py` with an HTTP client.
+5. Add backends under `backends/`.
+6. Add `CatalogEntry`s to `muse.core.catalog.KNOWN_MODELS`.
+7. Wire up the CLI subtree in `src/muse/cli.py`.
+8. Wire the router into `src/muse/cli_impl/serve.py`.
+9. Add matching tests in `tests/<family>/<op>/`.

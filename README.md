@@ -1,78 +1,72 @@
-# Narro
+# Muse
 
-Lightweight CPU text-to-speech. Wraps the [Soprano-1.1-80M](https://huggingface.co/ekwek/Soprano-1.1-80M) model for fast, expressive speech synthesis.
+Model-agnostic multi-modality generation server and client. Speaks
+OpenAI-compatible HTTP: text-to-speech on `/v1/audio/speech`, text-to-image
+on `/v1/images/generations`. Add a modality by dropping in a router,
+a protocol, and a catalog entry (no shared base class, no coupling
+between modalities).
 
-- Up to **20x** real-time on CPU
-- **<1 GB** memory, 80M parameters
-- **32kHz** audio output
-- Infinite length via automatic text splitting
-
-## Installation
-
-```bash
-pip install narro
-```
-
-Or from source:
+## Install
 
 ```bash
-git clone https://github.com/ekwek1/soprano.git
-cd soprano
-pip install -e .
+pip install -e ".[server,audio,images]"
 ```
 
-## Usage
+Optional extras:
+- `audio`: PyTorch + transformers for TTS backends
+- `audio-kokoro`: Kokoro TTS (needs system `espeak-ng`)
+- `images`: diffusers + Pillow for SD-Turbo and future image backends
+- `server`: FastAPI + uvicorn + sse-starlette (only needed on the serving host)
+- `dev`: pytest + coverage tools
 
-### CLI
+## Quick start
 
 ```bash
-narro "Hello world" -o output.wav
+# Pull a model (installs pip deps, downloads HF weights, records in catalog)
+muse pull soprano-80m
+muse pull sd-turbo
+
+# Start the server (loads all pulled models; serves matching modality endpoints)
+muse serve --host 0.0.0.0 --port 8000
+
+# Synthesize speech (defaults to localhost:8000; override with MUSE_SERVER env var)
+muse speak "Hello world" -o hello.wav
+
+# Generate an image
+muse imagine "a cat on mars, cinematic" -o cat.png
 ```
 
-Options:
+## CLI hierarchy
 
-```
---output, -o              Output audio file path (default: output.wav)
---model-path, -m          Path to local model directory (optional)
---no-compile              Disable torch.compile optimization
---no-quantize             Disable INT8 quantization
---decoder-batch-size, -bs Decoder batch size (default: 4)
---num-threads, -t         Number of CPU threads for inference
-```
+| Command | Description |
+|---|---|
+| `muse serve` | start HTTP server |
+| `muse pull <model-id>` | download weights + install deps |
+| `muse audio speech models list` | list audio.speech models |
+| `muse audio speech models info <id>` | show catalog metadata |
+| `muse audio speech create "text" -o f.wav` | generate speech (long form) |
+| `muse images generations models list` | list images.generations models |
+| `muse images generations create "prompt" -o f.png` | generate image (long form) |
+| `muse speak` / `muse imagine` | short-form aliases for the create commands |
 
-> **Note:** The CLI reloads the model on each invocation. For repeated inference, use the Python API.
+## HTTP endpoints
 
-### Python API
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | liveness + enabled modalities |
+| `GET /v1/models` | all registered models, aggregated |
+| `POST /v1/audio/speech` | synthesize speech (OpenAI-compatible) |
+| `GET /v1/audio/speech/voices` | list voices for the current model |
+| `POST /v1/images/generations` | generate images (OpenAI-compatible) |
 
-```python
-from narro import Narro
+## Architecture
 
-model = Narro(decoder_batch_size=4)
+- `muse.core`: modality-agnostic registry, catalog, HF downloader + pip auto-install, FastAPI app factory
+- `muse.audio.speech`: text-to-speech (Soprano, Kokoro, Bark backends)
+- `muse.images.generations`: text-to-image (SD-Turbo backend)
 
-# Basic inference
-out = model.infer("Hello world.")
-
-# Save to file
-out = model.infer("Hello world.", out_path="out.wav")
-
-# Custom sampling parameters
-out = model.infer("Hello world.", temperature=0.3, top_p=0.95, repetition_penalty=1.2)
-
-# Batched inference
-out = model.infer_batch(["Hello world."] * 10)
-
-# Streaming inference (yields float32 tensors in [-1, 1])
-for chunk in model.infer_stream("Hello world.", chunk_size=1):
-    process_audio(chunk)
-```
-
-## Usage Tips
-
-- Use double quotes instead of single quotes when quoting.
-- Best results with sentences between 2 and 30 seconds long.
-- Spell out numbers and special characters phonetically for best pronunciation (e.g., `1+1` -> `one plus one`).
-- Unsatisfactory results? Regenerate or adjust sampling settings.
+See `CLAUDE.md` for implementation details and contribution guide.
 
 ## License
 
-Apache-2.0. See `LICENSE` for details.
+MIT
