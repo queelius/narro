@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass
 class ModelInfo:
     """Registry metadata for a loaded model."""
     modality: str
@@ -37,16 +37,28 @@ class ModalityRegistry:
 
     def get(self, modality: str, model_id: str | None = None) -> Any:
         if modality not in self._models or not self._models[modality]:
-            raise KeyError(f"no models registered for modality {modality!r}")
+            known = sorted(self._models)
+            raise KeyError(
+                f"no models registered for modality {modality!r}; "
+                f"known modalities: {known}"
+            )
         if model_id is None:
             model_id = self._defaults[modality]
         if model_id not in self._models[modality]:
-            raise KeyError(f"model {model_id!r} not registered under {modality!r}")
+            available = sorted(self._models[modality])
+            raise KeyError(
+                f"model {model_id!r} not registered under {modality!r}; "
+                f"available: {available}"
+            )
         return self._models[modality][model_id]
 
     def set_default(self, modality: str, model_id: str) -> None:
         if model_id not in self._models.get(modality, {}):
-            raise KeyError(f"model {model_id!r} not registered under {modality!r}")
+            available = sorted(self._models.get(modality, {}))
+            raise KeyError(
+                f"model {model_id!r} not registered under {modality!r}; "
+                f"available: {available}"
+            )
         self._defaults[modality] = model_id
 
     def list_models(self, modality: str) -> list[ModelInfo]:
@@ -64,10 +76,6 @@ class ModalityRegistry:
     def modalities(self) -> list[str]:
         return list(self._models.keys())
 
-    def clear(self) -> None:
-        """Test helper: reset all state."""
-        self._models.clear()
-        self._defaults.clear()
 
 
 def _extra(model: Any) -> dict:

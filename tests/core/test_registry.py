@@ -96,3 +96,18 @@ def test_duplicate_registration_overwrites(reg):
     reg.register("audio.speech", a1)
     reg.register("audio.speech", a2)
     assert reg.get("audio.speech", "tts") is a2
+    # Default lookup must also reflect the overwrite
+    assert reg.get("audio.speech") is a2
+
+
+def test_get_error_messages_include_available_options(reg):
+    """Errors should tell the operator what's actually available."""
+    reg.register("audio.speech", FakeAudioModel(model_id="tts-1"))
+
+    # Missing modality → lists known modalities
+    with pytest.raises(KeyError, match="known modalities"):
+        reg.get("video.clips")
+
+    # Wrong model_id in a valid modality → lists available in that modality
+    with pytest.raises(KeyError, match="available.*tts-1"):
+        reg.get("audio.speech", "tts-99")
