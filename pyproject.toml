@@ -3,12 +3,12 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "narro"
-version = "0.8.0"
+name = "muse"
+version = "0.9.0"
 authors = [
   { name="Alex Towell", email="lex@metafunctor.com" },
 ]
-description = "Narro: model-agnostic text-to-speech server and client"
+description = "Muse: model-agnostic multi-modality generation server (audio, images)"
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
@@ -17,26 +17,47 @@ classifiers = [
 ]
 dependencies = [
   "huggingface_hub",
-  "inflect",
   "numpy",
   "requests",
-  "scipy",
-  "torch>=2.1.0",
-  "transformers>=4.51.0",
-  "unidecode",
 ]
 license = {file = "LICENSE"}
 
 [project.urls]
-Homepage = "https://github.com/queelius/narro"
-Issues = "https://github.com/queelius/narro/issues"
+Homepage = "https://github.com/queelius/muse"
+Issues = "https://github.com/queelius/muse/issues"
 
 [project.optional-dependencies]
+# Server runtime
 server = ["fastapi", "uvicorn"]
-kokoro = ["kokoro", "soundfile", "misaki[en]"]
 
-[tool.setuptools.packages.find]
-include = ["narro*"]
+# Audio modality (TTS)
+audio = [
+  "torch>=2.1.0",
+  "transformers>=4.51.0",
+  "scipy",
+  "inflect",
+  "unidecode",
+]
+audio-kokoro = ["kokoro", "soundfile", "misaki[en]"]
+
+# Images modality (diffusion)
+images = [
+  "torch>=2.1.0",
+  "diffusers>=0.27.0",
+  "accelerate",
+  "Pillow",
+  "safetensors",
+]
+
+# Development
+dev = ["pytest", "pytest-cov", "pytest-asyncio", "httpx"]
 
 [project.scripts]
-narro = "narro.cli:main"
+muse = "muse.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["muse*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
