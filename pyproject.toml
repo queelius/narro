@@ -33,12 +33,12 @@ server = ["fastapi", "uvicorn"]
 # Audio modality (TTS)
 audio = [
   "torch>=2.1.0",
-  "transformers>=4.51.0",
+  "transformers>=4.36.0",
   "scipy",
   "inflect",
   "unidecode",
 ]
-audio-kokoro = ["kokoro", "soundfile", "misaki[en]"]
+audio-kokoro = ["muse[audio]", "kokoro", "soundfile", "misaki[en]"]
 
 # Images modality (diffusion)
 images = [
@@ -61,3 +61,5 @@ include = ["muse*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ["--import-mode=importlib"]
