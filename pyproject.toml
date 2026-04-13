@@ -34,9 +34,6 @@ Issues = "https://github.com/queelius/narro/issues"
 [project.optional-dependencies]
 server = ["fastapi", "uvicorn"]
 kokoro = ["kokoro", "soundfile", "misaki[en]"]
-parler = ["parler-tts"]
-xtts = ["TTS"]
-all = ["narro[server,kokoro,parler,xtts]"]
 
 [tool.setuptools.packages.find]
 include = ["narro*"]

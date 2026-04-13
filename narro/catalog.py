@@ -112,29 +112,6 @@ KNOWN_MODELS: dict[str, ModelEntry] = {
         pip_extras=["kokoro", "soundfile", "misaki[en]"],
         system_packages=["espeak-ng"],
     ),
-    "parler-tts": ModelEntry(
-        id="parler-tts",
-        description="Parler-TTS Mini: voice-described TTS (44.1kHz, text prompt controls voice)",
-        hf_repo="parler-tts/parler-tts-mini-v1",
-        backend="narro.models.parler.ParlerModel",
-        sample_rate=44100,
-        size_mb=600,
-        voices=["Jon", "Laura", "Gary", "Lea", "Karen", "Rick", "Brenda", "David",
-                "Eileen", "Jordan", "Mike", "Yolanda", "Patrick", "Rose", "Jerry",
-                "Jenna", "Bill", "Tom", "Carol", "Barbara", "Rebecca", "Anna",
-                "Bruce", "Emily"],
-        pip_extras=["parler-tts"],
-    ),
-    "xtts-v2": ModelEntry(
-        id="xtts-v2",
-        description="XTTS v2: zero-shot voice cloning TTS (24kHz, 16 languages)",
-        hf_repo="coqui/XTTS-v2",
-        backend="narro.models.xtts.XttsModel",
-        sample_rate=24000,
-        size_mb=1800,
-        pip_extras=["TTS"],
-        system_packages=["espeak-ng"],
-    ),
 }
 
 
