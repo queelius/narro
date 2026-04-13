@@ -1,5 +1,6 @@
-from .tts import Narro as Narro
-from .encoded import EncodedSpeech as EncodedSpeech
-from .encoded import SentenceEncoding as SentenceEncoding
-from .encoded import save as save
-from .encoded import load as load
+"""Narro: model-agnostic text-to-speech server and client.
+
+Heavy imports (torch, transformers) are deferred to avoid slow CLI startup.
+Use ``from narro.tts import Narro`` or ``from narro.client import NarroClient``
+for direct library access.
+"""
