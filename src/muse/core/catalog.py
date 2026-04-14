@@ -87,6 +87,40 @@ KNOWN_MODELS: dict[str, CatalogEntry] = {
         pip_extras=("torch>=2.1.0", "sentence-transformers>=2.2.0"),
         extra={"dimensions": 384},
     ),
+    "qwen3-embedding-0.6b": CatalogEntry(
+        model_id="qwen3-embedding-0.6b",
+        modality="embeddings",
+        backend_path="muse.embeddings.backends.qwen3_embedding:Qwen3Embedding06BBackend",
+        hf_repo="Qwen/Qwen3-Embedding-0.6B",
+        description="Qwen3-Embedding 0.6B: 1024 dims (matryoshka), 32K context, Apache 2.0",
+        pip_extras=(
+            "torch>=2.1.0",
+            "sentence-transformers>=4.0.0",
+            "transformers>=4.51.0",
+        ),
+        extra={"dimensions": 1024, "context_length": 32768, "matryoshka": True},
+    ),
+    "nv-embed-v2": CatalogEntry(
+        model_id="nv-embed-v2",
+        modality="embeddings",
+        backend_path="muse.embeddings.backends.nv_embed_v2:NVEmbedV2Backend",
+        hf_repo="nvidia/NV-Embed-v2",
+        description=(
+            "NVIDIA NV-Embed-v2: 4096 dims, 32K context, SotA MTEB "
+            "(LICENSE: CC-BY-NC-4.0, non-commercial only)"
+        ),
+        pip_extras=(
+            "torch>=2.1.0",
+            "transformers>=4.42.4",
+            "sentence-transformers>=2.7.0",
+            "einops",
+        ),
+        extra={
+            "dimensions": 4096,
+            "context_length": 32768,
+            "license": "CC-BY-NC-4.0",
+        },
+    ),
 }
 
 

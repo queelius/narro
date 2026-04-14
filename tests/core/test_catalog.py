@@ -36,6 +36,8 @@ def test_known_models_seeded_with_required_entries():
     assert "bark-small" in KNOWN_MODELS
     assert "sd-turbo" in KNOWN_MODELS
     assert "all-minilm-l6-v2" in KNOWN_MODELS
+    assert "qwen3-embedding-0.6b" in KNOWN_MODELS
+    assert "nv-embed-v2" in KNOWN_MODELS
 
 
 def test_list_known_filters_by_modality():
