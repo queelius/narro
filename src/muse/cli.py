@@ -131,7 +131,7 @@ def _cmd_models_list(args):
     for e in entries:
         if is_pulled(e.model_id):
             from muse.core.catalog import is_enabled
-            status = "pulled" if is_enabled(e.model_id) else "disabled"
+            status = "enabled" if is_enabled(e.model_id) else "disabled"
         else:
             status = "available"
         print(f"  {e.model_id:20s} [{status:9s}] {e.modality:22s} {e.description}")
