@@ -29,12 +29,24 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WorkerSpec:
-    """Everything needed to spawn one worker subprocess."""
+    """Everything needed to spawn and supervise one worker subprocess.
+
+    Fields mutated by the monitor thread (after startup):
+      - process: replaced on restart
+      - restart_count: total restart attempts (caps at _MAX_RESTARTS)
+      - failure_count: consecutive unhealthy polls
+      - last_spawn_at: time.monotonic() of most recent spawn (for backoff)
+      - status: pending -> running -> unhealthy -> dead
+    """
     models: list[str]
     python_path: str
     port: int
-    # Populated after subprocess.Popen in Task E2
+    device: str = "auto"
     process: object = field(default=None)
+    restart_count: int = 0
+    failure_count: int = 0
+    last_spawn_at: float = 0.0
+    status: str = "pending"
 
 
 def plan_workers(port_start: int = 9001, port_end: int = 9999) -> list[WorkerSpec]:
@@ -88,9 +100,11 @@ def plan_workers(port_start: int = 9001, port_end: int = 9999) -> list[WorkerSpe
 def spawn_worker(spec: WorkerSpec, *, device: str) -> None:
     """Start a worker subprocess using its venv's Python.
 
-    Mutates spec.process with the Popen handle so the supervisor can
-    manage the subprocess later (wait_for_ready, shutdown).
+    Persists `device` onto the spec so the monitor thread can respawn
+    with the same settings on restart. Records last_spawn_at for the
+    backoff timer in _attempt_restart.
     """
+    spec.device = device
     cmd = [
         spec.python_path, "-m", "muse.cli", "_worker",
         "--host", "127.0.0.1",
@@ -101,6 +115,7 @@ def spawn_worker(spec: WorkerSpec, *, device: str) -> None:
         cmd.extend(["--model", m])
     logger.info("spawning worker: %s", " ".join(cmd))
     spec.process = subprocess.Popen(cmd)
+    spec.last_spawn_at = time.monotonic()
 
 
 def wait_for_ready(

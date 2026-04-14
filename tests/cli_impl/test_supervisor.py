@@ -260,3 +260,26 @@ class TestRunSupervisor:
                 run_supervisor(host="0.0.0.0", port=8000, device="cpu")
 
             mock_shutdown.assert_called_once()
+
+
+class TestWorkerSpecExtensions:
+    def test_worker_spec_has_device_field_with_default(self):
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        assert spec.device == "auto"
+
+    def test_worker_spec_accepts_explicit_device(self):
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cuda")
+        assert spec.device == "cuda"
+
+    def test_worker_spec_default_status_is_pending(self):
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        assert spec.status == "pending"
+
+    def test_worker_spec_default_restart_and_failure_counts(self):
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        assert spec.restart_count == 0
+        assert spec.failure_count == 0
+
+    def test_worker_spec_has_last_spawn_at_default(self):
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        assert spec.last_spawn_at == 0.0
