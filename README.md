@@ -1,10 +1,8 @@
 # Muse
 
-Model-agnostic multi-modality generation server and client. Speaks
-OpenAI-compatible HTTP: text-to-speech on `/v1/audio/speech`, text-to-image
-on `/v1/images/generations`. Add a modality by dropping in a router,
-a protocol, and a catalog entry (no shared base class, no coupling
-between modalities).
+Model-agnostic multi-modality generation server. OpenAI-compatible HTTP is the canonical interface: text-to-speech on `/v1/audio/speech`, text-to-image on `/v1/images/generations`, more modalities landing the same way (embeddings, transcriptions, video). Add a modality by dropping in a router, a protocol, and a catalog entry (no shared base class, no coupling between modalities).
+
+The CLI is deliberately admin-only (`serve`, `pull`, `models`). Generation is reached via the HTTP API, consumed by Python clients, `curl`, or future wrappers like `muse mcp`.
 
 ## Install
 
@@ -22,32 +20,46 @@ Optional extras:
 ## Quick start
 
 ```bash
-# Pull a model (installs pip deps, downloads HF weights, records in catalog)
+# Admin: pull models into the catalog + venv + HF cache
 muse pull soprano-80m
 muse pull sd-turbo
 
-# Start the server (loads all pulled models; serves matching modality endpoints)
+# Admin: list what's in the catalog
+muse models list
+
+# Start the server (loads pulled models; serves OpenAI-compatible endpoints)
 muse serve --host 0.0.0.0 --port 8000
-
-# Synthesize speech (defaults to localhost:8000; override with MUSE_SERVER env var)
-muse speak "Hello world" -o hello.wav
-
-# Generate an image
-muse imagine "a cat on mars, cinematic" -o cat.png
 ```
 
-## CLI hierarchy
+From any client, generation is an HTTP call:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"Hello world","model":"soprano-80m"}' \
+  --output hello.wav
+```
+
+```python
+from muse.audio.speech import SpeechClient
+from muse.images.generations import GenerationsClient
+
+# MUSE_SERVER env var sets the base URL for remote use; default http://localhost:8000
+wav_bytes = SpeechClient().infer("Hello world")
+pngs = GenerationsClient().generate("a cat on mars, cinematic", n=1)
+```
+
+## CLI (admin-only)
 
 | Command | Description |
 |---|---|
-| `muse serve` | start HTTP server |
+| `muse serve` | start the HTTP server |
 | `muse pull <model-id>` | download weights + install deps |
-| `muse audio speech models list` | list audio.speech models |
-| `muse audio speech models info <id>` | show catalog metadata |
-| `muse audio speech create "text" -o f.wav` | generate speech (long form) |
-| `muse images generations models list` | list images.generations models |
-| `muse images generations create "prompt" -o f.png` | generate image (long form) |
-| `muse speak` / `muse imagine` | short-form aliases for the create commands |
+| `muse models list [--modality X]` | list known/pulled models |
+| `muse models info <model-id>` | show catalog entry |
+| `muse models remove <model-id>` | unregister from catalog |
+
+No per-modality subcommands (`muse speak`, `muse audio ...`). Those would be hardcoded modality-to-verb mappings that grow with every new modality. Keeping the CLI modality-agnostic means embeddings, transcriptions, and video land without CLI churn.
 
 ## HTTP endpoints
 
@@ -56,8 +68,10 @@ muse imagine "a cat on mars, cinematic" -o cat.png
 | `GET /health` | liveness + enabled modalities |
 | `GET /v1/models` | all registered models, aggregated |
 | `POST /v1/audio/speech` | synthesize speech (OpenAI-compatible) |
-| `GET /v1/audio/speech/voices` | list voices for the current model |
+| `GET /v1/audio/speech/voices` | list voices for a model |
 | `POST /v1/images/generations` | generate images (OpenAI-compatible) |
+
+Error shape is uniform: `{"error": {"code", "message", "type"}}` across 404 (model not found) and 422 (validation). Matches OpenAI's envelope so clients written against their API work against muse.
 
 ## Architecture
 

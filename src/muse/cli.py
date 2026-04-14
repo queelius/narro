@@ -1,13 +1,24 @@
-"""`muse` CLI entrypoint.
+"""`muse` CLI — admin commands only.
 
-Subcommands mirror the URL hierarchy:
-    muse serve                               start HTTP server
-    muse pull <model-id>                     download + install a model
-    muse audio speech models list            list audio.speech models
-    muse audio speech models info <id>       show catalog entry
-    muse audio speech create "text" -o f.wav (alias: muse speak)
-    muse images generations models list
-    muse images generations create "prompt"  (alias: muse imagine)
+The CLI surface is deliberately minimal and modality-agnostic:
+
+    muse serve                    start the HTTP server
+    muse pull <model-id>          download weights + install deps
+    muse models list              list known/pulled models (all modalities)
+    muse models info <model-id>   show catalog entry
+    muse models remove <model-id> unregister from catalog
+
+Generation endpoints are reached via HTTP (the canonical interface):
+    - Python: muse.audio.speech.SpeechClient,
+              muse.images.generations.GenerationsClient
+    - Shell:  curl -X POST http://host:8000/v1/audio/speech ...
+    - LLMs:   muse mcp (future — MCP server over HTTP)
+
+Deliberate non-goals:
+    - Per-modality CLI subcommands (e.g., `muse speak`, `muse audio ...`).
+      They'd require hardcoded modality→verb mappings that grow every
+      time a new modality lands. Keeping the CLI modality-agnostic means
+      embeddings / transcriptions / video all work without CLI changes.
 
 Heavy imports (torch, diffusers) are kept out of this module so
 `muse --help` stays instant. Command implementations live in
@@ -23,7 +34,10 @@ log = logging.getLogger("muse")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="muse", description="Multi-modality generation server + client")
+    p = argparse.ArgumentParser(
+        prog="muse",
+        description="Multi-modality generation server + admin CLI",
+    )
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     sub = p.add_subparsers(dest="cmd", required=False)
@@ -45,84 +59,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp_pull.add_argument("model_id")
     sp_pull.set_defaults(func=_cmd_pull)
 
-    # aliases: speak / imagine
-    sp_speak = sub.add_parser("speak", help="generate speech (alias for `audio speech create`)")
-    _add_speak_args(sp_speak)
-    sp_speak.set_defaults(func=_cmd_speak)
+    # models (catalog admin)
+    sp_models = sub.add_parser("models", help="manage the model catalog")
+    models_sub = sp_models.add_subparsers(dest="models_cmd", required=True)
 
-    sp_imagine = sub.add_parser("imagine", help="generate an image (alias for `images generations create`)")
-    _add_imagine_args(sp_imagine)
-    sp_imagine.set_defaults(func=_cmd_imagine)
+    sp_list = models_sub.add_parser("list", help="list known models across all modalities")
+    sp_list.add_argument("--modality", default=None,
+                         help="filter by modality (e.g., audio.speech)")
+    sp_list.set_defaults(func=_cmd_models_list)
 
-    # audio subtree
-    sp_audio = sub.add_parser("audio", help="audio modality commands")
-    audio_sub = sp_audio.add_subparsers(dest="audio_cmd", required=True)
+    sp_info = models_sub.add_parser("info", help="show catalog entry for a model")
+    sp_info.add_argument("model_id")
+    sp_info.set_defaults(func=_cmd_models_info)
 
-    sp_audio_speech = audio_sub.add_parser("speech", help="text-to-speech (speech modality)")
-    speech_sub = sp_audio_speech.add_subparsers(dest="speech_cmd", required=True)
-
-    speech_models = speech_sub.add_parser("models", help="manage audio.speech models")
-    _add_models_subparser(speech_models, "audio.speech")
-
-    sp_speech_create = speech_sub.add_parser("create", help="synthesize speech to file")
-    _add_speak_args(sp_speech_create)
-    sp_speech_create.set_defaults(func=_cmd_speak)
-
-    # images subtree
-    sp_images = sub.add_parser("images", help="image modality commands")
-    images_sub = sp_images.add_subparsers(dest="images_cmd", required=True)
-
-    sp_images_gen = images_sub.add_parser("generations", help="text-to-image (generations modality)")
-    gen_sub = sp_images_gen.add_subparsers(dest="gen_cmd", required=True)
-
-    gen_models = gen_sub.add_parser("models", help="manage images.generations models")
-    _add_models_subparser(gen_models, "images.generations")
-
-    sp_images_create = gen_sub.add_parser("create", help="generate image to file")
-    _add_imagine_args(sp_images_create)
-    sp_images_create.set_defaults(func=_cmd_imagine)
+    sp_remove = models_sub.add_parser("remove", help="unregister a model from the catalog")
+    sp_remove.add_argument("model_id")
+    sp_remove.set_defaults(func=_cmd_models_remove)
 
     return p
-
-
-def _add_models_subparser(parser: argparse.ArgumentParser, modality: str) -> None:
-    sub = parser.add_subparsers(dest="models_cmd", required=True)
-
-    sp_list = sub.add_parser("list")
-    sp_list.set_defaults(func=_cmd_models_list, modality=modality)
-
-    sp_info = sub.add_parser("info")
-    sp_info.add_argument("model_id")
-    sp_info.set_defaults(func=_cmd_models_info, modality=modality)
-
-    sp_pull = sub.add_parser("pull")
-    sp_pull.add_argument("model_id")
-    sp_pull.set_defaults(func=_cmd_models_pull, modality=modality)
-
-    sp_remove = sub.add_parser("remove")
-    sp_remove.add_argument("model_id")
-    sp_remove.set_defaults(func=_cmd_models_remove, modality=modality)
-
-
-def _add_speak_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("text")
-    p.add_argument("-o", "--output", required=True)
-    p.add_argument("--model", default=None)
-    p.add_argument("--voice", default=None)
-    p.add_argument("--server", default=None)
-
-
-def _add_imagine_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("prompt")
-    p.add_argument("-o", "--output", required=True)
-    p.add_argument("--model", default=None)
-    p.add_argument("--size", default="512x512")
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--negative", default=None)
-    p.add_argument("--steps", type=int, default=None)
-    p.add_argument("--guidance", type=float, default=None)
-    p.add_argument("-n", type=int, default=1)
-    p.add_argument("--server", default=None)
 
 
 # Command implementations (deferred imports for fast startup)
@@ -150,11 +104,13 @@ def _cmd_models_list(args):
     from muse.core.catalog import is_pulled, list_known
     entries = list_known(args.modality)
     if not entries:
-        print(f"no known models for {args.modality}")
+        msg = (f"no known models for modality {args.modality!r}"
+               if args.modality else "no known models")
+        print(msg)
         return 0
     for e in entries:
         status = "pulled" if is_pulled(e.model_id) else "available"
-        print(f"  {e.model_id:20s} [{status:9s}]  {e.description}")
+        print(f"  {e.model_id:20s} [{status:9s}] {e.modality:22s} {e.description}")
     return 0
 
 
@@ -164,12 +120,6 @@ def _cmd_models_info(args):
         print(f"error: unknown model {args.model_id!r}", file=sys.stderr)
         return 2
     e = KNOWN_MODELS[args.model_id]
-    if e.modality != args.modality:
-        print(
-            f"error: model {args.model_id} is in modality {e.modality}, not {args.modality}",
-            file=sys.stderr,
-        )
-        return 2
     print(f"model_id:     {e.model_id}")
     print(f"modality:     {e.modality}")
     print(f"hf_repo:      {e.hf_repo}")
@@ -181,25 +131,11 @@ def _cmd_models_info(args):
     return 0
 
 
-def _cmd_models_pull(args):
-    return _cmd_pull(args)
-
-
 def _cmd_models_remove(args):
     from muse.core.catalog import remove
     remove(args.model_id)
     print(f"removed {args.model_id} from catalog")
     return 0
-
-
-def _cmd_speak(args):
-    from muse.cli_impl.speak import run_speak
-    return run_speak(args)
-
-
-def _cmd_imagine(args):
-    from muse.cli_impl.imagine import run_imagine
-    return run_imagine(args)
 
 
 def main(argv: list[str] | None = None) -> int:

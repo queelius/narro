@@ -89,9 +89,16 @@ pytest tests/ --cov=muse
 # Start server
 muse serve --device cuda
 
-# End-to-end (requires running server)
-muse speak "hello" -o out.wav
-muse imagine "a cat" -o cat.png
+# Generation is over HTTP (Python client, curl, or future muse mcp).
+# There are deliberately no `muse speak` / `muse imagine` subcommands.
+# The CLI is admin-only (serve / pull / models) so new modalities land
+# without CLI churn.
+python - <<'PY'
+from muse.audio.speech import SpeechClient
+from muse.images.generations import GenerationsClient
+SpeechClient().infer("hello")           # → WAV bytes (MUSE_SERVER env sets base URL)
+GenerationsClient().generate("a cat")   # → list[bytes] (PNGs)
+PY
 ```
 
 ## Project-specific conventions

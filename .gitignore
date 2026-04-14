@@ -13,3 +13,4 @@ examples-backend.py
 .coverage
 .playwright-mcp/
 node_modules/
+.claude/
