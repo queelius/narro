@@ -20,7 +20,7 @@ Optional extras:
 ## Quick start
 
 ```bash
-# Admin: pull models into the catalog + venv + HF cache
+# Pull a model (creates a dedicated venv + installs its pip deps + downloads HF weights)
 muse pull soprano-80m
 muse pull sd-turbo
 
@@ -75,9 +75,12 @@ Error shape is uniform: `{"error": {"code", "message", "type"}}` across 404 (mod
 
 ## Architecture
 
-- `muse.core`: modality-agnostic registry, catalog, HF downloader + pip auto-install, FastAPI app factory
+- `muse.core`: modality-agnostic registry, catalog, venv management, HF downloader, pip auto-install, FastAPI app factory
+- `muse.cli_impl`: `serve` (supervisor), `worker` (single-venv process), `gateway` (HTTP proxy by model-id)
 - `muse.audio.speech`: text-to-speech (Soprano, Kokoro, Bark backends)
 - `muse.images.generations`: text-to-image (SD-Turbo backend)
+
+`muse serve` is a supervisor process. It spawns one worker subprocess per venv (each model has its own venv with its own deps) and runs a gateway that proxies requests by the request's `model` field. Dep conflicts between models are structurally impossible.
 
 See `CLAUDE.md` for implementation details and contribution guide.
 

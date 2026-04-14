@@ -44,6 +44,10 @@ Modality backends implementing modality-specific protocols
   with shared `/health` and `/v1/models`, mounts per-modality routers, and
   registers the `ModelNotFoundError` exception handler so 404s use the
   OpenAI-style `{"error":{...}}` envelope instead of FastAPI's `{"detail":...}`.
+- `muse.core.venv`: venv creation (`create_venv`, `install_into_venv`, `find_free_port`). Each `muse pull` creates `~/.muse/venvs/<model-id>/`; catalog records the `python_path`.
+- `muse.cli_impl.worker`: single-worker mode (runs one uvicorn in one venv). Invoked via `muse _worker` (hidden subcommand).
+- `muse.cli_impl.gateway`: FastAPI proxy app. Routes by `model` field in request body/query; aggregates `/v1/models` and `/health` across workers.
+- `muse.cli_impl.supervisor`: orchestrates workers + gateway. `plan_workers` groups catalog by venv; `spawn_worker` + `wait_for_ready` manage subprocess lifecycle; `run_supervisor` is the entrypoint `muse serve` delegates to.
 
 ### Modality conventions
 
@@ -69,6 +73,40 @@ differ (audio chunks are time-ordered and playable immediately; diffusion steps
 are progressive refinement of one frame). A `GenerationModel` abstract base
 would be a leaky abstraction. Instead, `ModalityRegistry` treats models as
 `Any`, and each modality's router + codec knows its own types.
+
+## Process model
+
+`muse serve` is a **supervisor**, not a single process:
+
+```
+User request
+    |
+    v
+muse serve (supervisor, port 8000)
+  ├── gateway FastAPI app (in-process)
+  │    routes by request body `model` field
+  │
+  └── subprocess per venv group:
+       ├── worker (port 9001, venv-A) hosts soprano-80m, kokoro-82m
+       ├── worker (port 9002, venv-B) hosts bark-small
+       └── worker (port 9003, venv-C) hosts sd-turbo
+```
+
+Each pulled model gets its own venv at `~/.muse/venvs/<model-id>/`
+with exactly the pip_extras it declares. Workers run the existing
+`muse.cli_impl.worker.run_worker` logic via `muse _worker`
+(hidden subcommand). The supervisor spawns them with each venv's
+Python interpreter, polls `/health` until ready, then runs the gateway.
+
+The gateway extracts `model` from the request body (POST) or query
+(GET), looks up which worker hosts it, and forwards the request,
+streaming SSE through without buffering. `/v1/models` and `/health`
+are aggregated across all workers via parallel httpx calls.
+
+This gives you dep isolation (transformers 4.46 for parler-tts
+coexists with transformers 5.x for newer models), crash isolation
+(a segfault in one worker does not kill the rest), and a uniform
+HTTP surface (clients hit one port, do not care about internal venvs).
 
 ## Development commands
 
@@ -138,3 +176,7 @@ PY
 7. Wire up the CLI subtree in `src/muse/cli.py`.
 8. Wire the router into `src/muse/cli_impl/serve.py`.
 9. Add matching tests in `tests/<family>/<op>/`.
+
+No gateway changes are needed when adding a new modality: the gateway routes
+by the `model` field in the request body and forwards to whichever worker
+loaded that model. New modalities are transparent to the proxy layer.
