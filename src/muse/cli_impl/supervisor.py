@@ -296,8 +296,9 @@ def _shutdown_workers(specs: list[WorkerSpec], grace: float = 5.0) -> None:
 def run_supervisor(*, host: str, port: int, device: str) -> int:
     """Entry point for `muse serve`.
 
-    Plans workers from catalog, spawns them, waits for ready, then runs
-    the gateway on (host, port). Guarantees worker cleanup on exit.
+    Plans workers from catalog, spawns them, waits for ready, then starts
+    the auto-restart monitor thread + gateway. Guarantees clean shutdown
+    of workers and monitor on exit.
     """
     from muse.cli_impl.gateway import WorkerRoute, build_gateway
 
@@ -308,6 +309,9 @@ def run_supervisor(*, host: str, port: int, device: str) -> int:
             "Pull a model first: `muse pull <model-id>`"
         )
 
+    stop_event = threading.Event()
+    monitor_thread: threading.Thread | None = None
+
     try:
         for spec in specs:
             spawn_worker(spec, device=device)
@@ -315,6 +319,23 @@ def run_supervisor(*, host: str, port: int, device: str) -> int:
         for spec in specs:
             logger.info("waiting for worker on port %d (%s)", spec.port, spec.models)
             wait_for_ready(port=spec.port)
+            spec.status = "running"
+
+        # Start the auto-restart monitor AFTER all workers are ready so
+        # the initial wait_for_ready isn't racing with the monitor's own
+        # readiness tracking.
+        if specs:
+            monitor_thread = threading.Thread(
+                target=_monitor_workers,
+                args=(specs, stop_event),
+                daemon=True,
+                name="muse-monitor",
+            )
+            monitor_thread.start()
+            logger.info(
+                "auto-restart monitor running (interval=%.1fs, threshold=%d, budget=%d)",
+                _MONITOR_INTERVAL, _FAILURE_THRESHOLD, _MAX_RESTARTS,
+            )
 
         routes: list[WorkerRoute] = []
         for spec in specs:
@@ -328,5 +349,10 @@ def run_supervisor(*, host: str, port: int, device: str) -> int:
     except KeyboardInterrupt:
         logger.info("shutting down (SIGINT)")
     finally:
+        # Tell the monitor to stop BEFORE killing workers. Otherwise the
+        # monitor could spawn a restart while we're terminating processes.
+        stop_event.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=5.0)
         _shutdown_workers(specs)
     return 0

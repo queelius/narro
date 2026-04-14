@@ -499,3 +499,67 @@ class TestCheckWorkerHealth:
         with patch("muse.cli_impl.supervisor.httpx.get") as mock_get:
             mock_get.side_effect = httpx.TimeoutException("slow", request=None)
             assert check_worker_health(port=9001) is False
+
+
+class TestRunSupervisorMonitor:
+    def test_run_supervisor_starts_monitor_thread(self, tmp_catalog):
+        _seed_catalog({
+            "model-a": {
+                "pulled_at": "...", "hf_repo": "a", "local_dir": "/a",
+                "venv_path": "/venvs/a",
+                "python_path": "/venvs/a/bin/python",
+                "enabled": True,
+            },
+        })
+        from muse.cli_impl.supervisor import run_supervisor
+
+        with patch("muse.cli_impl.supervisor.spawn_worker"), \
+             patch("muse.cli_impl.supervisor.wait_for_ready"), \
+             patch("muse.cli_impl.supervisor.uvicorn") as mock_uvicorn, \
+             patch("muse.cli_impl.supervisor._shutdown_workers"), \
+             patch("muse.cli_impl.supervisor.threading.Thread") as mock_thread_cls:
+            mock_uvicorn.run.side_effect = KeyboardInterrupt()
+            mock_thread = MagicMock()
+            mock_thread_cls.return_value = mock_thread
+
+            run_supervisor(host="0.0.0.0", port=8000, device="cpu")
+
+            # A daemon thread was created and started
+            mock_thread_cls.assert_called_once()
+            kwargs = mock_thread_cls.call_args.kwargs
+            assert kwargs.get("daemon") is True
+            assert kwargs.get("target") is not None
+            mock_thread.start.assert_called_once()
+
+    def test_run_supervisor_sets_stop_event_on_exit(self, tmp_catalog):
+        """On shutdown path, the monitor must be told to stop."""
+        _seed_catalog({
+            "model-a": {
+                "pulled_at": "...", "hf_repo": "a", "local_dir": "/a",
+                "venv_path": "/venvs/a",
+                "python_path": "/venvs/a/bin/python",
+                "enabled": True,
+            },
+        })
+        from muse.cli_impl.supervisor import run_supervisor
+        import threading
+
+        captured_events = []
+        real_event_cls = threading.Event
+        def capture_event(*a, **kw):
+            e = real_event_cls(*a, **kw)
+            captured_events.append(e)
+            return e
+
+        with patch("muse.cli_impl.supervisor.spawn_worker"), \
+             patch("muse.cli_impl.supervisor.wait_for_ready"), \
+             patch("muse.cli_impl.supervisor.uvicorn") as mock_uvicorn, \
+             patch("muse.cli_impl.supervisor._shutdown_workers"), \
+             patch("muse.cli_impl.supervisor.threading.Event", side_effect=capture_event), \
+             patch("muse.cli_impl.supervisor.threading.Thread"):
+            mock_uvicorn.run.side_effect = KeyboardInterrupt()
+            run_supervisor(host="0.0.0.0", port=8000, device="cpu")
+
+        # The shutdown Event was set
+        assert captured_events, "no threading.Event was created"
+        assert any(e.is_set() for e in captured_events)
