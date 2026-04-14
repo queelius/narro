@@ -1,8 +1,14 @@
 """Known-models catalog: what can be pulled, what's been pulled.
 
 Structure:
-    KNOWN_MODELS: dict[model_id, CatalogEntry]  — static at import time
-    catalog.json (on disk): dict[model_id, {pulled_at, hf_repo, local_dir}]
+    KNOWN_MODELS: dict[model_id, CatalogEntry] -- static at import time
+    catalog.json (on disk): dict[model_id, {
+        pulled_at,                     # ISO 8601 timestamp
+        hf_repo,                       # original HF repo id
+        local_dir,                     # HF snapshot_download cache path
+        venv_path,                     # dedicated venv for this model
+        python_path,                   # <venv_path>/bin/python for workers
+    }]
 """
 from __future__ import annotations
 
@@ -136,7 +142,8 @@ def pull(model_id: str) -> None:
     venvs_root = _catalog_dir() / "venvs"
     venv_path = venvs_root / model_id
 
-    # Idempotent: if the venv already exists, create_venv reuses it
+    # Skip creation if the venv dir already exists; pip_extras are
+    # (re-)installed below regardless to pick up any catalog updates.
     if not venv_path.exists():
         create_venv(venv_path)
 

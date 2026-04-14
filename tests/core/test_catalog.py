@@ -144,7 +144,7 @@ def test_write_catalog_is_atomic_no_tmp_leftover(tmp_catalog):
 def test_pull_creates_venv_under_muse_catalog_dir(tmp_catalog):
     """pull() must create a venv at <MUSE_CATALOG_DIR>/venvs/<model-id>/."""
     with patch("muse.core.catalog.create_venv") as mock_create, \
-         patch("muse.core.catalog.install_into_venv") as mock_install, \
+         patch("muse.core.catalog.install_into_venv"), \
          patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
          patch("muse.core.catalog.check_system_packages", return_value=[]):
         pull("soprano-80m")
