@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 
 import httpx
+import uvicorn
 
 from muse.core.catalog import _read_catalog
 from muse.core.venv import find_free_port
@@ -117,3 +118,64 @@ def wait_for_ready(
         f"worker on port {port} did not become ready within {timeout}s "
         f"(last error: {last_err})"
     )
+
+
+def _shutdown_workers(specs: list[WorkerSpec], grace: float = 5.0) -> None:
+    """SIGTERM all workers; SIGKILL any that don't exit within `grace` seconds."""
+    for spec in specs:
+        if spec.process is None:
+            continue
+        try:
+            spec.process.terminate()
+        except Exception as e:
+            logger.warning("failed to SIGTERM worker on port %d: %s", spec.port, e)
+
+    for spec in specs:
+        if spec.process is None:
+            continue
+        try:
+            spec.process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            logger.warning("worker on port %d did not exit in %ds; killing", spec.port, grace)
+            spec.process.kill()
+        except Exception as e:
+            logger.warning("error waiting for worker on port %d: %s", spec.port, e)
+
+
+def run_supervisor(*, host: str, port: int, device: str) -> int:
+    """Entry point for `muse serve`.
+
+    Plans workers from catalog, spawns them, waits for ready, then runs
+    the gateway on (host, port). Guarantees worker cleanup on exit.
+    """
+    from muse.cli_impl.gateway import WorkerRoute, build_gateway
+
+    specs = plan_workers()
+    if not specs:
+        logger.warning(
+            "no pulled models with a venv - server will start empty. "
+            "Pull a model first: `muse pull <model-id>`"
+        )
+
+    try:
+        for spec in specs:
+            spawn_worker(spec, device=device)
+
+        for spec in specs:
+            logger.info("waiting for worker on port %d (%s)", spec.port, spec.models)
+            wait_for_ready(port=spec.port)
+
+        routes: list[WorkerRoute] = []
+        for spec in specs:
+            worker_url = f"http://127.0.0.1:{spec.port}"
+            for m in spec.models:
+                routes.append(WorkerRoute(model_id=m, worker_url=worker_url))
+        app = build_gateway(routes)
+
+        logger.info("starting gateway on %s:%d", host, port)
+        uvicorn.run(app, host=host, port=port, log_config=None)
+    except KeyboardInterrupt:
+        logger.info("shutting down (SIGINT)")
+    finally:
+        _shutdown_workers(specs)
+    return 0

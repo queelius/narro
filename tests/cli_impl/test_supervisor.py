@@ -172,3 +172,56 @@ class TestWaitForReady:
             ]
             wait_for_ready(port=9001, timeout=5.0, poll_interval=0.001)
             assert mock_get.call_count == 3
+
+
+class TestRunSupervisor:
+    def test_supervisor_spawns_all_workers_and_waits_for_all_ready(self, tmp_catalog):
+        _seed_catalog({
+            "model-a": {
+                "pulled_at": "...", "hf_repo": "a", "local_dir": "/a",
+                "venv_path": "/venvs/a",
+                "python_path": "/venvs/a/bin/python",
+            },
+            "model-b": {
+                "pulled_at": "...", "hf_repo": "b", "local_dir": "/b",
+                "venv_path": "/venvs/b",
+                "python_path": "/venvs/b/bin/python",
+            },
+        })
+        from muse.cli_impl.supervisor import run_supervisor
+
+        with patch("muse.cli_impl.supervisor.spawn_worker") as mock_spawn, \
+             patch("muse.cli_impl.supervisor.wait_for_ready") as mock_wait, \
+             patch("muse.cli_impl.supervisor.uvicorn") as mock_uvicorn, \
+             patch("muse.cli_impl.supervisor._shutdown_workers") as mock_shutdown:
+            # Simulate graceful shutdown by raising KeyboardInterrupt from uvicorn.run
+            mock_uvicorn.run.side_effect = KeyboardInterrupt()
+
+            run_supervisor(host="0.0.0.0", port=8000, device="cpu")
+
+            # Two workers planned, so spawn + wait called twice
+            assert mock_spawn.call_count == 2
+            assert mock_wait.call_count == 2
+            mock_uvicorn.run.assert_called_once()
+            mock_shutdown.assert_called_once()
+
+    def test_supervisor_tears_down_workers_if_gateway_fails(self, tmp_catalog):
+        _seed_catalog({
+            "model-a": {
+                "pulled_at": "...", "hf_repo": "a", "local_dir": "/a",
+                "venv_path": "/venvs/a",
+                "python_path": "/venvs/a/bin/python",
+            },
+        })
+        from muse.cli_impl.supervisor import run_supervisor
+
+        with patch("muse.cli_impl.supervisor.spawn_worker"), \
+             patch("muse.cli_impl.supervisor.wait_for_ready"), \
+             patch("muse.cli_impl.supervisor.uvicorn") as mock_uvicorn, \
+             patch("muse.cli_impl.supervisor._shutdown_workers") as mock_shutdown:
+            mock_uvicorn.run.side_effect = RuntimeError("uvicorn died")
+
+            with pytest.raises(RuntimeError, match="uvicorn died"):
+                run_supervisor(host="0.0.0.0", port=8000, device="cpu")
+
+            mock_shutdown.assert_called_once()
