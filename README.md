@@ -58,6 +58,9 @@ pngs = GenerationsClient().generate("a cat on mars, cinematic", n=1)
 vectors = EmbeddingsClient().embed(["alpha", "beta"])   # list[list[float]]
 ```
 
+`muse serve` auto-restarts crashed worker processes with exponential backoff.
+Individual model failures don't take down the server or other modalities.
+
 ## CLI (admin-only)
 
 | Command | Description |
@@ -67,6 +70,8 @@ vectors = EmbeddingsClient().embed(["alpha", "beta"])   # list[list[float]]
 | `muse models list [--modality X]` | list known/pulled models |
 | `muse models info <model-id>` | show catalog entry |
 | `muse models remove <model-id>` | unregister from catalog |
+| `muse models enable <model-id>` | mark a pulled model active (load on next serve) |
+| `muse models disable <model-id>` | mark a pulled model inactive (skip on next serve) |
 
 No per-modality subcommands (`muse speak`, `muse audio ...`). Those would be hardcoded modality-to-verb mappings that grow with every new modality. Keeping the CLI modality-agnostic means embeddings, transcriptions, and video land without CLI churn.
 

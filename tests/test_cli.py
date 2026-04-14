@@ -116,3 +116,38 @@ def test_worker_subcommand_accepts_port_and_model():
     combined = r.stdout + r.stderr
     assert "--port" in combined
     assert "--model" in combined
+
+
+def test_models_enable_subcommand_parses():
+    r = _run("models", "enable", "soprano-80m", "--help")
+    assert r.returncode == 0
+    combined = r.stdout + r.stderr
+    assert "enable" in combined.lower()
+
+
+def test_models_disable_subcommand_parses():
+    r = _run("models", "disable", "soprano-80m", "--help")
+    assert r.returncode == 0
+    combined = r.stdout + r.stderr
+    assert "disable" in combined.lower()
+
+
+def test_models_enable_unknown_model_nonzero_exit():
+    """enable on a non-pulled model should nonzero with a clear message."""
+    r = _run("models", "enable", "bogus-model-xyz")
+    assert r.returncode != 0
+    combined = (r.stdout + r.stderr).lower()
+    assert "not pulled" in combined or "error" in combined
+
+
+def test_models_disable_unknown_model_nonzero_exit():
+    r = _run("models", "disable", "bogus-model-xyz")
+    assert r.returncode != 0
+
+
+def test_models_list_shows_known_model_regardless_of_pull_status():
+    """List includes soprano-80m with whatever status it has."""
+    r = _run("models", "list")
+    assert r.returncode == 0
+    combined = r.stdout + r.stderr
+    assert "soprano-80m" in combined

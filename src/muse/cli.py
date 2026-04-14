@@ -83,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp_remove.add_argument("model_id")
     sp_remove.set_defaults(func=_cmd_models_remove)
 
+    sp_enable = models_sub.add_parser("enable", help="enable a pulled model for serving")
+    sp_enable.add_argument("model_id")
+    sp_enable.set_defaults(func=_cmd_models_enable)
+
+    sp_disable = models_sub.add_parser("disable", help="disable a pulled model (stays in catalog, not loaded by muse serve)")
+    sp_disable.add_argument("model_id")
+    sp_disable.set_defaults(func=_cmd_models_disable)
+
     return p
 
 
@@ -121,7 +129,11 @@ def _cmd_models_list(args):
         print(msg)
         return 0
     for e in entries:
-        status = "pulled" if is_pulled(e.model_id) else "available"
+        if is_pulled(e.model_id):
+            from muse.core.catalog import is_enabled
+            status = "pulled" if is_enabled(e.model_id) else "disabled"
+        else:
+            status = "available"
         print(f"  {e.model_id:20s} [{status:9s}] {e.modality:22s} {e.description}")
     return 0
 
@@ -147,6 +159,28 @@ def _cmd_models_remove(args):
     from muse.core.catalog import remove
     remove(args.model_id)
     print(f"removed {args.model_id} from catalog")
+    return 0
+
+
+def _cmd_models_enable(args):
+    from muse.core.catalog import set_enabled
+    try:
+        set_enabled(args.model_id, True)
+    except KeyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"enabled {args.model_id}")
+    return 0
+
+
+def _cmd_models_disable(args):
+    from muse.core.catalog import set_enabled
+    try:
+        set_enabled(args.model_id, False)
+    except KeyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"disabled {args.model_id}")
     return 0
 
 

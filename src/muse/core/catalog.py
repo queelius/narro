@@ -106,10 +106,15 @@ def _read_catalog() -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except json.JSONDecodeError:
         logger.warning("catalog at %s corrupt; resetting", p)
         return {}
+    # Backfill enabled=True for pre-enable-flag entries (migration path).
+    # Non-destructive: only affects the in-memory dict on read.
+    for entry in data.values():
+        entry.setdefault("enabled", True)
+    return data
 
 
 def _write_catalog(data: dict) -> None:
@@ -178,6 +183,7 @@ def pull(model_id: str) -> None:
         "local_dir": str(local_dir),
         "venv_path": str(venv_path),
         "python_path": str(venv_python(venv_path)),
+        "enabled": True,
     }
     _write_catalog(catalog)
 
@@ -186,6 +192,27 @@ def remove(model_id: str) -> None:
     """Unregister from catalog (does not delete HF cache)."""
     catalog = _read_catalog()
     catalog.pop(model_id, None)
+    _write_catalog(catalog)
+
+
+def is_enabled(model_id: str) -> bool:
+    """Return True if model is pulled AND enabled in the catalog."""
+    catalog = _read_catalog()
+    if model_id not in catalog:
+        return False
+    return catalog[model_id].get("enabled", True)
+
+
+def set_enabled(model_id: str, enabled: bool) -> None:
+    """Toggle the `enabled` flag for a pulled model.
+
+    Raises KeyError if the model is not in the catalog (not pulled).
+    Other catalog fields are preserved.
+    """
+    catalog = _read_catalog()
+    if model_id not in catalog:
+        raise KeyError(f"model {model_id!r} is not pulled")
+    catalog[model_id]["enabled"] = bool(enabled)
     _write_catalog(catalog)
 
 

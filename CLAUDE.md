@@ -109,6 +109,19 @@ coexists with transformers 5.x for newer models), crash isolation
 (a segfault in one worker does not kill the rest), and a uniform
 HTTP surface (clients hit one port, do not care about internal venvs).
 
+The supervisor also runs an auto-restart monitor thread. Every 5
+seconds it polls each worker's /health and checks for process death
+via Popen.poll. After 3 consecutive failures (or immediate process
+exit), the monitor terminates the existing process and respawns it
+with exponential backoff (1s, 2s, 4s, ..., capped at 30s). After 10
+unsuccessful restart attempts the worker is marked dead; /health
+reports "degraded" and /v1/models skips its entries.
+
+Use `muse models disable <id>` to mark a pulled model as inactive
+(supervisor skips it at plan_workers time, freeing its venv's memory
+budget). `muse models enable <id>` re-enables it. Neither command
+restarts the server; the change takes effect next `muse serve`.
+
 ## Development commands
 
 ```bash
@@ -167,6 +180,8 @@ PY
   Synthesis chunks must dispatch as they're produced, not after full generation.
 - **Env vars:** `MUSE_SERVER` (client base URL), `MUSE_CATALOG_DIR` (catalog
   location, defaults `~/.muse/`), `MUSE_HOME` (voices dir base).
+- **Auto-restart is always on.** No --no-autorestart flag in this iteration. Workers that can't stay up through 10 restart attempts are marked dead; manual restart via `Ctrl+C` + `muse serve` is required to reset the counter.
+- **Enable/disable is catalog state**, not runtime state. `muse serve` reads the catalog at startup. Changing a model's enabled bit while the server is running has no effect until the next restart.
 
 ## Adding a new modality
 

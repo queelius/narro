@@ -192,3 +192,81 @@ def test_pull_does_not_call_system_install_pip_extras(tmp_catalog):
          patch("muse.core.catalog.check_system_packages", return_value=[]):
         pull("soprano-80m")
     mock_system_install.assert_not_called()
+
+
+def test_pull_records_enabled_true_by_default(tmp_catalog):
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+    catalog = _read_catalog()
+    assert catalog["soprano-80m"]["enabled"] is True
+
+
+def test_read_catalog_backfills_enabled_for_legacy_entries(tmp_catalog):
+    """Old catalog.json entries without `enabled` are treated as enabled.
+
+    This is the migration path: no destructive writes, just a default
+    when reading. Existing entries stay valid after the schema change.
+    """
+    import json
+    from muse.core.catalog import _catalog_path
+    p = _catalog_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # Write a legacy entry (no `enabled` field)
+    p.write_text(json.dumps({
+        "legacy-model": {
+            "pulled_at": "...",
+            "hf_repo": "x",
+            "local_dir": "/x",
+            "venv_path": "/v",
+            "python_path": "/v/bin/python",
+        },
+    }))
+
+    catalog = _read_catalog()
+    assert catalog["legacy-model"]["enabled"] is True
+
+
+def test_is_enabled_helper_returns_true_for_entry_with_flag(tmp_catalog):
+    from muse.core.catalog import is_enabled
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+    assert is_enabled("soprano-80m") is True
+
+
+def test_is_enabled_helper_returns_false_after_set_enabled_false(tmp_catalog):
+    from muse.core.catalog import is_enabled, set_enabled
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+    set_enabled("soprano-80m", False)
+    assert is_enabled("soprano-80m") is False
+
+
+def test_set_enabled_raises_on_unknown_model(tmp_catalog):
+    from muse.core.catalog import set_enabled
+    with pytest.raises(KeyError, match="not pulled"):
+        set_enabled("not-pulled-model", True)
+
+
+def test_set_enabled_preserves_other_fields(tmp_catalog):
+    from muse.core.catalog import set_enabled
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+    before = _read_catalog()["soprano-80m"]
+    set_enabled("soprano-80m", False)
+    after = _read_catalog()["soprano-80m"]
+    # Everything except `enabled` is preserved
+    for key in ("pulled_at", "hf_repo", "local_dir", "venv_path", "python_path"):
+        assert before[key] == after[key]
+    assert after["enabled"] is False
