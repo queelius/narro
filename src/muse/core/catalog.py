@@ -18,6 +18,7 @@ from typing import Any
 from huggingface_hub import snapshot_download
 
 from muse.core.install import check_system_packages, install_pip_extras
+from muse.core.venv import create_venv, install_into_venv, venv_python
 
 logger = logging.getLogger(__name__)
 
@@ -121,13 +122,27 @@ def list_known(modality: str | None = None) -> list[CatalogEntry]:
 
 
 def pull(model_id: str) -> None:
-    """Install deps + download weights from HF. Records pulled status."""
+    """Create per-model venv, install deps into it, download weights, record state.
+
+    Each pulled model gets `<MUSE_CATALOG_DIR>/venvs/<model-id>/` with its
+    `pip_extras` installed inside. The catalog records the venv's Python path
+    so `muse serve` can spawn workers with the right interpreter.
+    """
     if model_id not in KNOWN_MODELS:
         raise KeyError(f"unknown model {model_id!r}; known: {sorted(KNOWN_MODELS)}")
     entry = KNOWN_MODELS[model_id]
 
+    # Venv lives under the catalog dir so MUSE_CATALOG_DIR controls everything
+    venvs_root = _catalog_dir() / "venvs"
+    venv_path = venvs_root / model_id
+
+    # Idempotent: if the venv already exists, create_venv reuses it
+    if not venv_path.exists():
+        create_venv(venv_path)
+
+    # Install pip_extras INTO the venv, not the supervisor's env
     if entry.pip_extras:
-        install_pip_extras(list(entry.pip_extras))
+        install_into_venv(venv_path, list(entry.pip_extras))
 
     if entry.system_packages:
         missing = check_system_packages(list(entry.system_packages))
@@ -145,6 +160,8 @@ def pull(model_id: str) -> None:
         "pulled_at": datetime.now(timezone.utc).isoformat(),
         "hf_repo": entry.hf_repo,
         "local_dir": str(local_dir),
+        "venv_path": str(venv_path),
+        "python_path": str(venv_python(venv_path)),
     }
     _write_catalog(catalog)
 

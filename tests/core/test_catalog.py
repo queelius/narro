@@ -12,6 +12,7 @@ from muse.core.catalog import (
     list_known,
     load_backend,
     remove,
+    _read_catalog,
 )
 
 
@@ -57,12 +58,14 @@ def test_is_pulled_false_when_not_in_catalog(tmp_catalog):
 
 
 def test_pull_installs_pip_downloads_and_writes_catalog(tmp_catalog):
-    with patch("muse.core.catalog.install_pip_extras") as mock_pip, \
+    with patch("muse.core.catalog.create_venv") as mock_create, \
+         patch("muse.core.catalog.install_into_venv") as mock_install, \
          patch("muse.core.catalog.snapshot_download") as mock_download, \
          patch("muse.core.catalog.check_system_packages", return_value=[]):
         mock_download.return_value = "/fake/cache/soprano"
         pull("soprano-80m")
-        mock_pip.assert_called_once()
+        mock_create.assert_called_once()
+        mock_install.assert_called_once()
         mock_download.assert_called_once()
         assert is_pulled("soprano-80m")
 
@@ -75,7 +78,8 @@ def test_pull_unknown_raises():
 def test_pull_warns_on_missing_system_packages(tmp_catalog, caplog):
     import logging
     caplog.set_level(logging.WARNING)
-    with patch("muse.core.catalog.install_pip_extras"), \
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
          patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
          patch("muse.core.catalog.check_system_packages", return_value=["espeak-ng"]):
         pull("kokoro-82m")
@@ -83,7 +87,8 @@ def test_pull_warns_on_missing_system_packages(tmp_catalog, caplog):
 
 
 def test_remove_clears_from_catalog(tmp_catalog):
-    with patch("muse.core.catalog.install_pip_extras"), \
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
          patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
          patch("muse.core.catalog.check_system_packages", return_value=[]):
         pull("soprano-80m")
@@ -98,7 +103,8 @@ def test_load_backend_raises_when_not_pulled(tmp_catalog):
 
 
 def test_load_backend_imports_and_constructs(tmp_catalog):
-    with patch("muse.core.catalog.install_pip_extras"), \
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
          patch("muse.core.catalog.snapshot_download", return_value="/fake/local"), \
          patch("muse.core.catalog.check_system_packages", return_value=[]):
         pull("soprano-80m")
@@ -122,7 +128,8 @@ def test_load_backend_raises_keyerror_on_unknown_model(tmp_catalog):
 
 
 def test_write_catalog_is_atomic_no_tmp_leftover(tmp_catalog):
-    with patch("muse.core.catalog.install_pip_extras"), \
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
          patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
          patch("muse.core.catalog.check_system_packages", return_value=[]):
         pull("soprano-80m")
@@ -132,3 +139,55 @@ def test_write_catalog_is_atomic_no_tmp_leftover(tmp_catalog):
     # And catalog.json must have the entry
     catalog_file = tmp_catalog / "catalog.json"
     assert catalog_file.exists()
+
+
+def test_pull_creates_venv_under_muse_catalog_dir(tmp_catalog):
+    """pull() must create a venv at <MUSE_CATALOG_DIR>/venvs/<model-id>/."""
+    with patch("muse.core.catalog.create_venv") as mock_create, \
+         patch("muse.core.catalog.install_into_venv") as mock_install, \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+        mock_create.assert_called_once()
+        venv_target = mock_create.call_args[0][0]
+        expected = tmp_catalog / "venvs" / "soprano-80m"
+        assert venv_target == expected
+
+
+def test_pull_installs_pip_extras_into_venv_not_system(tmp_catalog):
+    """pip_extras go into the venv, never the supervisor's env."""
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv") as mock_install, \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+        mock_install.assert_called_once()
+        venv_arg, packages_arg = mock_install.call_args[0]
+        assert venv_arg == tmp_catalog / "venvs" / "soprano-80m"
+        # transformers and scipy are in soprano-80m's pip_extras
+        assert any("transformers" in p for p in packages_arg)
+
+
+def test_pull_records_venv_path_and_python_in_catalog(tmp_catalog):
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+    catalog = _read_catalog()
+    entry = catalog["soprano-80m"]
+    assert "venv_path" in entry
+    assert entry["venv_path"] == str(tmp_catalog / "venvs" / "soprano-80m")
+    assert "python_path" in entry
+    assert entry["python_path"] == str(tmp_catalog / "venvs" / "soprano-80m" / "bin" / "python")
+
+
+def test_pull_does_not_call_system_install_pip_extras(tmp_catalog):
+    """The old system-wide install_pip_extras must NOT be called; it's venv-scoped now."""
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.install_pip_extras") as mock_system_install, \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+    mock_system_install.assert_not_called()
