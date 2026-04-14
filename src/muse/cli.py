@@ -59,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp_pull.add_argument("model_id")
     sp_pull.set_defaults(func=_cmd_pull)
 
+    # _worker (hidden; invoked by supervisor via subprocess)
+    sp_worker = sub.add_parser("_worker", help="internal: run a single worker (invoked by muse serve)")
+    sp_worker.add_argument("--host", default="127.0.0.1",
+                           help="bind address (default: 127.0.0.1, workers are internal)")
+    sp_worker.add_argument("--port", type=int, required=True)
+    sp_worker.add_argument("--model", action="append", default=[], required=True,
+                           help="model to load (repeatable; one worker can host multiple compatible models)")
+    sp_worker.add_argument("--device", default="auto",
+                           choices=["auto", "cpu", "cuda", "mps"])
+    sp_worker.set_defaults(func=_cmd_worker)
+
     # models (catalog admin)
     sp_models = sub.add_parser("models", help="manage the model catalog")
     models_sub = sp_models.add_subparsers(dest="models_cmd", required=True)
@@ -98,6 +109,14 @@ def _cmd_pull(args):
         return 2
     print(f"pulled {args.model_id}")
     return 0
+
+
+def _cmd_worker(args):
+    from muse.cli_impl.worker import run_worker
+    return run_worker(
+        host=args.host, port=args.port,
+        models=args.model, device=args.device,
+    )
 
 
 def _cmd_models_list(args):

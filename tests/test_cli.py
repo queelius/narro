@@ -107,3 +107,12 @@ def test_help_is_fast(tmp_path):
     elapsed = time.time() - start
     assert r.returncode in (0, 2)
     assert elapsed < 5.0, f"muse --help took {elapsed:.1f}s; heavy imports leaked into CLI"
+
+
+def test_worker_subcommand_accepts_port_and_model():
+    """`muse _worker --port N --model X` must parse without error."""
+    r = _run("_worker", "--port", "9999", "--model", "soprano-80m", "--help")
+    assert r.returncode == 0
+    combined = r.stdout + r.stderr
+    assert "--port" in combined
+    assert "--model" in combined
