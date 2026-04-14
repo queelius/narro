@@ -40,13 +40,22 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output hello.wav
 ```
 
+```bash
+# Embeddings (accepts single string or list)
+curl -X POST http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":"hello world","model":"all-minilm-l6-v2"}'
+```
+
 ```python
 from muse.audio.speech import SpeechClient
 from muse.images.generations import GenerationsClient
+from muse.embeddings import EmbeddingsClient
 
 # MUSE_SERVER env var sets the base URL for remote use; default http://localhost:8000
 wav_bytes = SpeechClient().infer("Hello world")
 pngs = GenerationsClient().generate("a cat on mars, cinematic", n=1)
+vectors = EmbeddingsClient().embed(["alpha", "beta"])   # list[list[float]]
 ```
 
 ## CLI (admin-only)
@@ -70,6 +79,7 @@ No per-modality subcommands (`muse speak`, `muse audio ...`). Those would be har
 | `POST /v1/audio/speech` | synthesize speech (OpenAI-compatible) |
 | `GET /v1/audio/speech/voices` | list voices for a model |
 | `POST /v1/images/generations` | generate images (OpenAI-compatible) |
+| `POST /v1/embeddings` | text embeddings (OpenAI-compatible) |
 
 Error shape is uniform: `{"error": {"code", "message", "type"}}` across 404 (model not found) and 422 (validation). Matches OpenAI's envelope so clients written against their API work against muse.
 
@@ -79,6 +89,7 @@ Error shape is uniform: `{"error": {"code", "message", "type"}}` across 404 (mod
 - `muse.cli_impl`: `serve` (supervisor), `worker` (single-venv process), `gateway` (HTTP proxy by model-id)
 - `muse.audio.speech`: text-to-speech (Soprano, Kokoro, Bark backends)
 - `muse.images.generations`: text-to-image (SD-Turbo backend)
+- `muse.embeddings`: text-to-vector (MiniLM backend; OpenAI-compatible /v1/embeddings)
 
 `muse serve` is a supervisor process. It spawns one worker subprocess per venv (each model has its own venv with its own deps) and runs a gateway that proxies requests by the request's `model` field. Dep conflicts between models are structurally impossible.
 

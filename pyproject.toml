@@ -49,6 +49,12 @@ images = [
   "safetensors",
 ]
 
+# Embeddings modality
+embeddings = [
+  "torch>=2.1.0",
+  "sentence-transformers>=2.2.0",
+]
+
 # Development
 dev = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-timeout"]
 

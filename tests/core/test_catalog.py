@@ -24,7 +24,7 @@ def tmp_catalog(tmp_path, monkeypatch):
 
 
 def test_known_models_entries_have_valid_modality():
-    valid = {"audio.speech", "images.generations"}
+    valid = {"audio.speech", "images.generations", "embeddings"}
     for model_id, entry in KNOWN_MODELS.items():
         assert entry.modality in valid, \
             f"model {model_id} has invalid modality {entry.modality!r}"
@@ -35,6 +35,7 @@ def test_known_models_seeded_with_required_entries():
     assert "kokoro-82m" in KNOWN_MODELS
     assert "bark-small" in KNOWN_MODELS
     assert "sd-turbo" in KNOWN_MODELS
+    assert "all-minilm-l6-v2" in KNOWN_MODELS
 
 
 def test_list_known_filters_by_modality():

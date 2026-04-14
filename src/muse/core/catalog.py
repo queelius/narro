@@ -78,6 +78,15 @@ KNOWN_MODELS: dict[str, CatalogEntry] = {
         pip_extras=("diffusers>=0.27.0", "accelerate", "Pillow", "safetensors"),
         extra={"default_size": (512, 512)},
     ),
+    "all-minilm-l6-v2": CatalogEntry(
+        model_id="all-minilm-l6-v2",
+        modality="embeddings",
+        backend_path="muse.embeddings.backends.minilm:MiniLMBackend",
+        hf_repo="sentence-transformers/all-MiniLM-L6-v2",
+        description="MiniLM sentence embeddings: 384 dims, 22MB, CPU-friendly",
+        pip_extras=("torch>=2.1.0", "sentence-transformers>=2.2.0"),
+        extra={"dimensions": 384},
+    ),
 }
 
 

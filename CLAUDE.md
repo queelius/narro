@@ -9,6 +9,7 @@ two modalities:
 
 - **audio.speech**: text-to-speech via `/v1/audio/speech` (Soprano, Kokoro, Bark)
 - **images.generations**: text-to-image via `/v1/images/generations` (SD-Turbo)
+- **embeddings**: text-to-vector via `/v1/embeddings` (MiniLM; sentence-transformers)
 
 The package structure mirrors OpenAI's URL hierarchy. Each modality owns its
 protocol, routes, CLI subcommands, and backends. A modality-agnostic core
@@ -134,8 +135,10 @@ muse serve --device cuda
 python - <<'PY'
 from muse.audio.speech import SpeechClient
 from muse.images.generations import GenerationsClient
+from muse.embeddings import EmbeddingsClient
 SpeechClient().infer("hello")           # → WAV bytes (MUSE_SERVER env sets base URL)
 GenerationsClient().generate("a cat")   # → list[bytes] (PNGs)
+EmbeddingsClient().embed(["alpha", "beta"])   # list[list[float]]
 PY
 ```
 
