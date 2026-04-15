@@ -90,6 +90,29 @@ def test_supervisor_spawns_worker_and_gateway_proxies_request(tmp_catalog):
         r = httpx.get("http://127.0.0.1:18765/v1/models")
         assert r.status_code == 200
         assert "data" in r.json()
+
+        # /v1/chat/completions must also be wired through the gateway
+        # to a worker that mounted the chat router (auto-mounted via
+        # discover_modalities). The gateway routes by request body's
+        # `model` field; with an unknown model, it must return an OpenAI-
+        # style error envelope (NOT FastAPI's {"detail": "Not Found"}).
+        # This proves the chat/completion modality is reachable end-to-end.
+        r = httpx.post(
+            "http://127.0.0.1:18765/v1/chat/completions",
+            json={
+                "model": "no-such-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            timeout=5.0,
+        )
+        assert r.status_code in (404, 400), f"expected 404/400, got {r.status_code}: {r.text}"
+        body = r.json()
+        assert "error" in body, f"expected OpenAI envelope, got {body}"
+        assert "detail" not in body
+        # Either model_not_found (worker reachable) or unknown_model
+        # (gateway resolves model -> worker mapping) is acceptable proof
+        # the path is wired and uses our error envelope, not FastAPI's.
+        assert body["error"]["code"] in ("model_not_found", "unknown_model", "model_required")
     finally:
         proc.terminate()
         try:

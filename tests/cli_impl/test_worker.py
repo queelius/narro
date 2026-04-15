@@ -51,22 +51,26 @@ def test_worker_ignores_unknown_model_ids(mock_uvicorn, caplog):
 
 
 @patch("muse.cli_impl.worker.uvicorn")
-def test_worker_mounts_all_three_modality_routers(mock_uvicorn):
-    """Regression guard: all modality routers mounted regardless of registry content.
+def test_worker_mounts_all_bundled_modality_routers(mock_uvicorn):
+    """Regression guard: all bundled modality routers mounted regardless of registry content.
 
     Empty-registry requests must get the OpenAI 404 envelope, not FastAPI's
     default {"detail": "Not Found"}. That requires the router to exist.
+
+    Asserts presence rather than exact count so adding a new bundled
+    modality (chat/completion in v0.10.0; future video, transcriptions)
+    doesn't break this test.
     """
     run_worker(host="127.0.0.1", port=9999, models=[], device="cpu")
 
     mock_uvicorn.run.assert_called_once()
     app = mock_uvicorn.run.call_args.args[0]
-    # Collect all route paths (FastAPI flattens via app.routes)
     route_paths = {getattr(r, "path", "") for r in app.routes}
     paths_str = "\n".join(route_paths)
     assert "/v1/audio/speech" in paths_str
     assert "/v1/images/generations" in paths_str
     assert "/v1/embeddings" in paths_str
+    assert "/v1/chat/completions" in paths_str
 
 
 @patch("muse.cli_impl.worker.uvicorn")
