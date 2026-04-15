@@ -50,10 +50,51 @@ def build_parser() -> argparse.ArgumentParser:
                           choices=["auto", "cpu", "cuda", "mps"])
     sp_serve.set_defaults(func=_cmd_serve)
 
-    # pull
-    sp_pull = sub.add_parser("pull", help="download weights + install deps for a model")
-    sp_pull.add_argument("model_id")
+    # pull (accepts bare model_id OR resolver URI)
+    sp_pull = sub.add_parser(
+        "pull",
+        help=(
+            "download weights + install deps for a model "
+            "(bundled id like `kokoro-82m` OR resolver URI like "
+            "`hf://Qwen/Qwen3-8B-GGUF@q4_k_m`)"
+        ),
+    )
+    sp_pull.add_argument(
+        "identifier",
+        help="bundled model_id OR resolver URI (e.g. hf://org/repo@variant)",
+    )
     sp_pull.set_defaults(func=_cmd_pull)
+
+    # search (HuggingFace + future resolvers)
+    sp_search = sub.add_parser(
+        "search",
+        help="search resolvers (e.g. HuggingFace) for pullable models",
+    )
+    sp_search.add_argument("query", help="search query")
+    sp_search.add_argument(
+        "--modality",
+        choices=["chat/completion", "embedding/text"],
+        default=None,
+        help="filter by modality (omit to search all supported)",
+    )
+    sp_search.add_argument("--limit", type=int, default=20)
+    sp_search.add_argument(
+        "--sort",
+        choices=["downloads", "lastModified", "likes"],
+        default="downloads",
+    )
+    sp_search.add_argument(
+        "--max-size-gb",
+        type=float,
+        default=None,
+        help="filter out rows whose size exceeds this (rows with unknown size pass through)",
+    )
+    sp_search.add_argument(
+        "--backend",
+        default=None,
+        help="resolver backend to use (default: only-registered, or pick when ambiguous)",
+    )
+    sp_search.set_defaults(func=_cmd_search)
 
     # _worker (hidden; invoked by supervisor via subprocess)
     sp_worker = sub.add_parser("_worker", help="internal: run a single worker (invoked by muse serve)")
@@ -103,13 +144,35 @@ def _cmd_serve(args):
 
 def _cmd_pull(args):
     from muse.core.catalog import pull
+    # When the identifier is a resolver URI, ensure the matching
+    # resolver is registered before pull() dispatches. Today only the
+    # HF resolver exists; future schemes get their own lazy import.
+    if "://" in args.identifier:
+        scheme = args.identifier.split("://", 1)[0]
+        if scheme == "hf":
+            import muse.core.resolvers_hf  # noqa: F401  (registers HFResolver on import)
     try:
-        pull(args.model_id)
+        pull(args.identifier)
     except KeyError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    print(f"pulled {args.model_id}")
+    print(f"pulled {args.identifier}")
     return 0
+
+
+def _cmd_search(args):
+    from muse.cli_impl.search import run_search
+    # Register resolver backends. Today only HF; future backends slot in
+    # by importing their resolvers_<scheme> module here.
+    import muse.core.resolvers_hf  # noqa: F401
+    return run_search(
+        query=args.query,
+        modality=args.modality,
+        limit=args.limit,
+        sort=args.sort,
+        max_size_gb=args.max_size_gb,
+        backend=args.backend,
+    )
 
 
 def _cmd_worker(args):
