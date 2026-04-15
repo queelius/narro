@@ -12,7 +12,19 @@ MUSE_REMOTE_SERVER=http://192.168.0.225:8000 pytest tests/integration/ -v
 # All integration tests are also `@pytest.mark.slow`, so the default
 # `-m "not slow"` lane skips them too. Both gates must clear.
 MUSE_REMOTE_SERVER=http://localhost:8000 pytest tests/integration/ -v -m slow
+
+# Test against a different chat model (default: qwen3.5-4b-q4)
+MUSE_REMOTE_SERVER=http://192.168.0.225:8000 \
+MUSE_CHAT_MODEL_ID=qwen3.5-9b-q4 \
+pytest tests/integration/ -v
 ```
+
+## Env vars
+
+| Var | Purpose | Default |
+| --- | --- | --- |
+| `MUSE_REMOTE_SERVER` | URL of the muse server to test | unset (skips all integration tests) |
+| `MUSE_CHAT_MODEL_ID` | Chat model id for chat + tool tests | `qwen3.5-4b-q4` |
 
 ## What gets skipped automatically
 

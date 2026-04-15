@@ -109,10 +109,33 @@ decides to call a function:
 Tool-call quality is the **model's** responsibility, not muse's. muse
 passes `tools` through verbatim to llama-cpp-python's
 `create_chat_completion`, which in turn relies on the model's chat
-template for tool formatting. Models known to work well: Qwen3-Instruct
-family, Hermes-3, Functionary, Llama-3.1-Instruct, Mistral-Nemo-Instruct.
-Models without tool-aware templates may produce garbage tool calls or
-ignore the `tools` field entirely.
+template for tool formatting.
+
+### Tool-use behavior matrix
+
+This is what we've actually observed end-to-end against muse, not
+guesses. The two halves of the round-trip (call out, result back) are
+asymmetric in current llama-cpp-python:
+
+| Capability | What works | What's spotty |
+|---|---|---|
+| Model emits `tool_calls` | Qwen3.5 (all sizes), Hermes-3, Functionary, Llama-3.1+ | base Llama-2, fine-tunes without tool-aware templates |
+| Tool result is incorporated into next response | Qwen3.5-9B and larger, Hermes-3, Functionary | Qwen3.5-4B and smaller (often ignores the result) |
+
+**Why the asymmetry:** llama-cpp-python's `chatml-function-calling`
+chat handler parses tool calls *out* of model responses correctly, but
+formats tool result messages going *into* the model in a way some
+chat templates (notably Qwen's) don't always recognize. Larger models
+tolerate the format mismatch via in-context inference; smaller ones
+don't. Upstream tracking:
+[abetlen/llama-cpp-python#2063](https://github.com/abetlen/llama-cpp-python/issues/2063).
+
+**Recommendation for tool-use today:** use models 9B+ for any agent
+loop that depends on tool-result interpretation. The bundled curated
+list (`muse models list --modality chat/completion`) includes
+`qwen3.5-9b-q4` and `qwen3.5-27b-q4` for this reason.
+
+### supports_tools sniffing
 
 When pulling a GGUF, the resolver sniffs `tokenizer_config.json` for
 `{% if tools %}` markers and writes `capabilities.supports_tools` into

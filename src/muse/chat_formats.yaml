@@ -22,6 +22,15 @@
 #   - add a row here, more-specific patterns above more-general ones
 #   - if uncertain about tool support, set supports_tools: false (will warn)
 
+# Qwen3 / Qwen3.5 caveat:
+# llama-cpp-python doesn't have a Qwen-specific tool handler (see
+# https://github.com/abetlen/llama-cpp-python/issues/2063). chatml-function-
+# calling DOES extract structured tool_calls from Qwen's output (verified
+# end-to-end against Qwen3.5-4B), but it formats tool RESULT messages in a
+# way Qwen's chat template doesn't always recognize, so the model may
+# ignore the tool result on the next turn. Tool-use quality scales with
+# model size: 9B+ handles tool-result messages well; 4B often ignores them.
+# For best tool-use today, prefer Functionary/Hermes-3 models or Qwen3.5-9B+.
 - pattern: qwen3
   chat_format: chatml-function-calling
   supports_tools: true

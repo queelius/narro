@@ -83,7 +83,28 @@ def require_model_fixture(model_id: str):
     return _fixture
 
 
-# Pre-built model gates for the ids we test against. Add new ones as needed.
-qwen3_5_4b = require_model_fixture("qwen3.5-4b-q4")
+# Embedding + audio models are static (one good choice each).
 qwen3_embedding = require_model_fixture("qwen3-embedding-0.6b")
 kokoro_82m = require_model_fixture("kokoro-82m")
+
+
+@pytest.fixture(scope="session")
+def chat_model(remote_health) -> str:
+    """The chat/completion model id integration tests should target.
+
+    Defaults to qwen3.5-4b-q4 (smallest/fastest verified). Override with
+    MUSE_CHAT_MODEL_ID env var to test against a different model:
+
+      MUSE_CHAT_MODEL_ID=qwen3.5-9b-q4 pytest tests/integration/
+
+    The fixture skips the test if the chosen model isn't loaded on the
+    server, so you can keep the env var set across runs without
+    breakage.
+    """
+    model_id = os.environ.get("MUSE_CHAT_MODEL_ID", "qwen3.5-4b-q4")
+    _require_model(remote_health, model_id)
+    return model_id
+
+
+# Backwards-compat alias for the few tests that still want to pin to 4b.
+qwen3_5_4b = require_model_fixture("qwen3.5-4b-q4")

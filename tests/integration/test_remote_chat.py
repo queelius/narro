@@ -36,10 +36,10 @@ def test_models_list_via_sdk(openai_client, remote_health):
     )
 
 
-def test_chat_non_streaming(openai_client, qwen3_5_4b):
+def test_chat_non_streaming(openai_client, chat_model):
     """Basic chat works; finish_reason is sane; usage is populated."""
     r = openai_client.chat.completions.create(
-        model=qwen3_5_4b,
+        model=chat_model,
         messages=[{"role": "user", "content": "Reply with exactly the word 'pong'."}],
         max_tokens=20,
         temperature=0.0,
@@ -49,16 +49,16 @@ def test_chat_non_streaming(openai_client, qwen3_5_4b):
     assert r.usage.total_tokens > 0
     assert r.usage.prompt_tokens > 0
     # The catalog id wins over the GGUF filesystem path (v0.11.4 fix)
-    assert r.model == qwen3_5_4b
+    assert r.model == chat_model
     assert "/" not in r.model.replace("/", "", 1)  # no extra slashes (no path)
     assert ".gguf" not in r.model
 
 
-def test_chat_streaming(openai_client, qwen3_5_4b):
+def test_chat_streaming(openai_client, chat_model):
     """Streaming yields multiple chunks; final chunk has finish_reason set;
     every chunk has model_id == catalog id (v0.11.4 fix per-chunk)."""
     chunks = list(openai_client.chat.completions.create(
-        model=qwen3_5_4b,
+        model=chat_model,
         messages=[{"role": "user", "content": "Count 1 to 3."}],
         max_tokens=30,
         temperature=0.0,
@@ -67,16 +67,16 @@ def test_chat_streaming(openai_client, qwen3_5_4b):
     assert len(chunks) >= 2
     # Per-chunk model field must equal the catalog id
     for c in chunks:
-        assert c.model == qwen3_5_4b, f"chunk model field is {c.model!r}, expected {qwen3_5_4b!r}"
+        assert c.model == chat_model, f"chunk model field is {c.model!r}, expected {chat_model!r}"
     # Some chunk somewhere along the way must terminate with a finish_reason
     finishers = [c for c in chunks if c.choices and c.choices[0].finish_reason]
     assert finishers, "no chunk had finish_reason set"
 
 
-def test_response_format_json_object(openai_client, qwen3_5_4b):
+def test_response_format_json_object(openai_client, chat_model):
     """response_format json_object produces parseable JSON content."""
     r = openai_client.chat.completions.create(
-        model=qwen3_5_4b,
+        model=chat_model,
         messages=[
             {"role": "system", "content": "Respond in JSON only."},
             {"role": "user", "content": "Return {\"answer\": 42} verbatim."},
@@ -91,7 +91,7 @@ def test_response_format_json_object(openai_client, qwen3_5_4b):
     assert isinstance(parsed, dict)
 
 
-def test_temperature_zero_is_deterministic(openai_client, qwen3_5_4b):
+def test_temperature_zero_is_deterministic(openai_client, chat_model):
     """Two identical calls at temperature=0 should produce identical content.
 
     Catches regressions where seed/temperature plumbing breaks. Llama-cpp's
@@ -99,7 +99,7 @@ def test_temperature_zero_is_deterministic(openai_client, qwen3_5_4b):
     """
     def _call():
         return openai_client.chat.completions.create(
-            model=qwen3_5_4b,
+            model=chat_model,
             messages=[{"role": "user", "content": "What is 2+2? Answer with just the digit."}],
             max_tokens=20,
             temperature=0.0,

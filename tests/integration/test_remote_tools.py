@@ -40,7 +40,7 @@ WEATHER_TOOL = {
 }
 
 
-def test_protocol_tool_call_emitted_in_structured_form(openai_client, qwen3_5_4b):
+def test_protocol_tool_call_emitted_in_structured_form(openai_client, chat_model):
     """First-turn assistant must emit tool_calls field, NOT raw text in content.
 
     This is the critical OpenAI-compat assertion. Pre-v0.11.5 this would
@@ -49,7 +49,7 @@ def test_protocol_tool_call_emitted_in_structured_form(openai_client, qwen3_5_4b
     handler which parses it back to OpenAI shape.
     """
     r = openai_client.chat.completions.create(
-        model=qwen3_5_4b,
+        model=chat_model,
         messages=[{"role": "user", "content": "What's the weather in Paris?"}],
         tools=[WEATHER_TOOL],
         tool_choice="auto",
@@ -77,12 +77,12 @@ def test_protocol_tool_call_emitted_in_structured_form(openai_client, qwen3_5_4b
     )
 
 
-def test_protocol_tool_call_id_is_unique_per_call(openai_client, qwen3_5_4b):
+def test_protocol_tool_call_id_is_unique_per_call(openai_client, chat_model):
     """Each tool_calls[i].id must be a string clients can echo back in the
     tool message's tool_call_id field. Llama-cpp generates these; we don't
     care about the format but it must be present + non-empty + a string."""
     r = openai_client.chat.completions.create(
-        model=qwen3_5_4b,
+        model=chat_model,
         messages=[{"role": "user", "content": "Weather in Tokyo?"}],
         tools=[WEATHER_TOOL],
         tool_choice="auto",
@@ -94,7 +94,7 @@ def test_protocol_tool_call_id_is_unique_per_call(openai_client, qwen3_5_4b):
 
 
 def test_protocol_second_turn_after_tool_result_yields_assistant_response(
-    openai_client, qwen3_5_4b
+    openai_client, chat_model
 ):
     """After we send a tool result, the next request must produce an assistant
     response with finish_reason=stop (not tool_calls). This proves the
@@ -108,7 +108,7 @@ def test_protocol_second_turn_after_tool_result_yields_assistant_response(
 
     # Round 1: model emits tool_call
     r1 = openai_client.chat.completions.create(
-        model=qwen3_5_4b, messages=messages, tools=tools, tool_choice="auto",
+        model=chat_model, messages=messages, tools=tools, tool_choice="auto",
         max_tokens=100, temperature=0.0,
     )
     tc = r1.choices[0].message.tool_calls[0]
@@ -124,7 +124,7 @@ def test_protocol_second_turn_after_tool_result_yields_assistant_response(
 
     # Round 2: model produces a final answer
     r2 = openai_client.chat.completions.create(
-        model=qwen3_5_4b, messages=messages, tools=tools,
+        model=chat_model, messages=messages, tools=tools,
         max_tokens=200, temperature=0.0,
     )
     assert r2.choices[0].finish_reason == "stop", (
@@ -147,7 +147,7 @@ def test_protocol_second_turn_after_tool_result_yields_assistant_response(
     strict=False,
 )
 def test_observe_tool_result_content_influences_next_response(
-    openai_client, qwen3_5_4b
+    openai_client, chat_model
 ):
     """Probe whether a UNIQUE marker in the tool result appears in the
     model's response. If the marker shows up, the model successfully
@@ -165,7 +165,7 @@ def test_observe_tool_result_content_influences_next_response(
         {"role": "user", "content": "What's the weather in Paris? Be brief."},
     ]
     r1 = openai_client.chat.completions.create(
-        model=qwen3_5_4b, messages=messages, tools=tools, tool_choice="auto",
+        model=chat_model, messages=messages, tools=tools, tool_choice="auto",
         max_tokens=100, temperature=0.0,
     )
     tc = r1.choices[0].message.tool_calls[0]
@@ -184,7 +184,7 @@ def test_observe_tool_result_content_influences_next_response(
         }),
     })
     r2 = openai_client.chat.completions.create(
-        model=qwen3_5_4b, messages=messages, tools=tools,
+        model=chat_model, messages=messages, tools=tools,
         max_tokens=200, temperature=0.0,
     )
     content = (r2.choices[0].message.content or "").lower()
@@ -195,7 +195,7 @@ def test_observe_tool_result_content_influences_next_response(
     )
 
 
-def test_observe_no_empty_think_tags_in_simple_response(openai_client, qwen3_5_4b):
+def test_observe_no_empty_think_tags_in_simple_response(openai_client, chat_model):
     """Probe whether Qwen3.5's reasoning-mode emits empty <think></think>
     tags in non-reasoning responses. Live observation: yes, this happens.
 
@@ -204,7 +204,7 @@ def test_observe_no_empty_think_tags_in_simple_response(openai_client, qwen3_5_4
     fixed it. Marked as observation, not contract.
     """
     r = openai_client.chat.completions.create(
-        model=qwen3_5_4b,
+        model=chat_model,
         messages=[{"role": "user", "content": "Reply with just the word 'ok'."}],
         max_tokens=20,
         temperature=0.0,
@@ -229,7 +229,7 @@ def test_observe_no_empty_think_tags_in_simple_response(openai_client, qwen3_5_4
     strict=False,
 )
 def test_observe_tools_unused_when_question_doesnt_need_them(
-    openai_client, qwen3_5_4b
+    openai_client, chat_model
 ):
     """Probe whether the model correctly skips the tool when the question
     doesn't need it. tool_choice='auto' should mean 'auto', not 'always'.
@@ -238,7 +238,7 @@ def test_observe_tools_unused_when_question_doesnt_need_them(
     test_observe_* after the live failure showed Qwen3.5-4B doesn't make
     this discrimination. Larger models typically do."""
     r = openai_client.chat.completions.create(
-        model=qwen3_5_4b,
+        model=chat_model,
         messages=[{"role": "user", "content": "What is 2 + 2? Just the number."}],
         tools=[WEATHER_TOOL],
         tool_choice="auto",
