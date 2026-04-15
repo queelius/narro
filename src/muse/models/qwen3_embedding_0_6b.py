@@ -20,12 +20,30 @@ from muse.modalities.embedding_text import EmbeddingResult
 
 logger = logging.getLogger(__name__)
 
-try:
-    import torch
-    from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    SentenceTransformer = None  # type: ignore
+# Heavy imports deferred: discovery must tolerate torch /
+# sentence-transformers being absent OR broken on the supervisor env
+# (they land in the per-model venv via `muse pull`). Sentinels stay
+# None until `_ensure_deps()` runs inside Model.__init__; tests that
+# patch module attrs see their mocks preserved.
+torch: Any = None
+SentenceTransformer: Any = None
+
+
+def _ensure_deps() -> None:
+    """Lazy-import torch + sentence-transformers (per-symbol; test-safe)."""
+    global torch, SentenceTransformer
+    if torch is None:
+        try:
+            import torch as _t
+            torch = _t
+        except Exception as e:  # noqa: BLE001
+            logger.debug("qwen3-embedding-0.6b torch unavailable: %s", e)
+    if SentenceTransformer is None:
+        try:
+            from sentence_transformers import SentenceTransformer as _s
+            SentenceTransformer = _s
+        except Exception as e:  # noqa: BLE001
+            logger.debug("qwen3-embedding-0.6b sentence-transformers unavailable: %s", e)
 
 
 MANIFEST = {
@@ -67,6 +85,7 @@ class Model:
         device: str = "auto",
         **_: Any,
     ) -> None:
+        _ensure_deps()
         if SentenceTransformer is None:
             raise RuntimeError(
                 "sentence-transformers is not installed; "

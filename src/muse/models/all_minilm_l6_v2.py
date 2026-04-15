@@ -18,14 +18,31 @@ from muse.modalities.embedding_text import EmbeddingResult
 
 logger = logging.getLogger(__name__)
 
-# Heavy imports are deferred so `muse --help` and the CLI work without
-# sentence-transformers installed. `muse pull all-minilm-l6-v2` installs it.
-try:
-    import torch
-    from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    SentenceTransformer = None  # type: ignore
+# Heavy imports are NOT done at module import time. Discovery must be
+# robust to torch / sentence-transformers being absent OR broken on the
+# host python (they land in the per-model venv via `muse pull`, not the
+# supervisor env). Sentinels stay None until `_ensure_deps()` runs
+# inside Model.__init__. Tests that patch these module attrs see their
+# mocks preserved: `_ensure_deps` short-circuits on non-None.
+torch: Any = None
+SentenceTransformer: Any = None
+
+
+def _ensure_deps() -> None:
+    """Lazy-import torch + sentence-transformers (per-symbol; test-safe)."""
+    global torch, SentenceTransformer
+    if torch is None:
+        try:
+            import torch as _t
+            torch = _t
+        except Exception as e:  # noqa: BLE001
+            logger.debug("all-minilm-l6-v2 torch unavailable: %s", e)
+    if SentenceTransformer is None:
+        try:
+            from sentence_transformers import SentenceTransformer as _s
+            SentenceTransformer = _s
+        except Exception as e:  # noqa: BLE001
+            logger.debug("all-minilm-l6-v2 sentence-transformers unavailable: %s", e)
 
 
 MANIFEST = {
@@ -62,6 +79,7 @@ class Model:
         device: str = "auto",
         **_: Any,
     ) -> None:
+        _ensure_deps()
         if SentenceTransformer is None:
             raise RuntimeError(
                 "sentence-transformers is not installed; "

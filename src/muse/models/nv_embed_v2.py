@@ -32,12 +32,30 @@ from muse.modalities.embedding_text import EmbeddingResult
 
 logger = logging.getLogger(__name__)
 
-try:
-    import torch
-    from transformers import AutoModel
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    AutoModel = None  # type: ignore
+# Heavy imports deferred: discovery must tolerate torch / transformers
+# being absent OR broken on the supervisor env (they land in the
+# per-model venv via `muse pull`). Sentinels stay None until
+# `_ensure_deps()` runs inside Model.__init__; tests that patch module
+# attrs see their mocks preserved.
+torch: Any = None
+AutoModel: Any = None
+
+
+def _ensure_deps() -> None:
+    """Lazy-import torch + transformers.AutoModel (per-symbol; test-safe)."""
+    global torch, AutoModel
+    if torch is None:
+        try:
+            import torch as _t
+            torch = _t
+        except Exception as e:  # noqa: BLE001
+            logger.debug("nv-embed-v2 torch unavailable: %s", e)
+    if AutoModel is None:
+        try:
+            from transformers import AutoModel as _m
+            AutoModel = _m
+        except Exception as e:  # noqa: BLE001
+            logger.debug("nv-embed-v2 transformers unavailable: %s", e)
 
 
 DEFAULT_INSTRUCTION = ""  # passage side (embed documents for later retrieval)
@@ -88,6 +106,7 @@ class Model:
         max_length: int = DEFAULT_MAX_LENGTH,
         **_: Any,
     ) -> None:
+        _ensure_deps()
         if AutoModel is None:
             raise RuntimeError(
                 "transformers is not installed; run `muse pull nv-embed-v2`"

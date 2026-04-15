@@ -288,6 +288,60 @@ class TestDiscoveryEdgeCases:
         assert result == {}
         assert "build_router" in caplog.text or "stringy_router" in caplog.text
 
+    def test_bundled_model_scripts_import_without_any_ml_deps(self):
+        """Regression: bundled scripts must discover cleanly even if torch/
+        diffusers/transformers/sentence-transformers are broken on the
+        supervisor env.
+
+        Discovery runs outside any per-model venv. A script that imports
+        a heavy dep at module top leaks the dep failure into discovery
+        and hides every sibling model from `muse models list`. The fix
+        is deferred imports via an `_ensure_deps()` helper called from
+        `Model.__init__`. This test installs a meta-path finder that
+        raises on those deps and verifies all bundled models still show
+        up.
+        """
+        import sys
+        from muse.core.catalog import _bundled_models_dir
+
+        banned = {
+            "torch", "diffusers", "transformers",
+            "sentence_transformers",
+        }
+
+        class _BlockingFinder:
+            def find_spec(self, fullname, path=None, target=None):
+                root = fullname.split(".")[0]
+                if root in banned:
+                    raise RuntimeError(f"simulated broken dep: {fullname}")
+                return None
+
+        # Evict already-imported copies so the finder gets hit next time.
+        saved = {
+            k: sys.modules.pop(k)
+            for k in list(sys.modules)
+            if k.split(".")[0] in banned
+        }
+        finder = _BlockingFinder()
+        sys.meta_path.insert(0, finder)
+        try:
+            for key in list(sys.modules):
+                if key.startswith("muse.models."):
+                    sys.modules.pop(key)
+            found = discover_models([_bundled_models_dir()])
+        finally:
+            sys.meta_path.remove(finder)
+            sys.modules.update(saved)
+
+        expected = {
+            "soprano-80m", "kokoro-82m", "bark-small",
+            "sd-turbo",
+            "all-minilm-l6-v2", "qwen3-embedding-0.6b", "nv-embed-v2",
+        }
+        assert expected.issubset(found.keys()), (
+            f"missing after dep block: {expected - found.keys()}"
+        )
+
     def test_discovery_is_isolated_per_scan(self, tmp_path):
         """Repeat scans are idempotent and don't pollute top-level sys.modules.
 

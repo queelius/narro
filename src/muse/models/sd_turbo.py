@@ -14,14 +14,41 @@ from muse.modalities.image_generation import ImageResult
 
 logger = logging.getLogger(__name__)
 
-# Heavy imports deferred so `muse --help` and the CLI work without
-# diffusers installed. `muse pull sd-turbo` installs them.
-try:
-    import torch
-    from diffusers import AutoPipelineForText2Image
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    AutoPipelineForText2Image = None  # type: ignore
+# Heavy imports are NOT done at module import time. Discovery must be
+# robust to diffusers + transformers being absent OR version-mismatched
+# on the host python (they're installed into the per-model venv by
+# `muse pull sd-turbo`, not the supervisor env). Sentinels stay None
+# until `_ensure_deps()` runs inside Model.__init__. Tests that patch
+# `muse.models.sd_turbo.torch` or `.AutoPipelineForText2Image` set the
+# module attrs directly; `_ensure_deps` sees the non-None mocks and
+# skips the real import so the mocks aren't clobbered.
+torch: Any = None
+AutoPipelineForText2Image: Any = None
+
+
+def _ensure_deps() -> None:
+    """Lazy-import torch + diffusers. Safe if deps are absent or broken.
+
+    Imports each symbol independently so that tests which patch only one
+    of the two module attrs (e.g. `AutoPipelineForText2Image` but not
+    `torch`) still get the real unpatched symbol for the other.
+    """
+    global torch, AutoPipelineForText2Image
+    if torch is None:
+        try:
+            import torch as _t
+            torch = _t
+        except Exception as e:  # noqa: BLE001
+            logger.debug("sd-turbo torch unavailable: %s", e)
+    if AutoPipelineForText2Image is None:
+        try:
+            # RuntimeError possible here when diffusers' _LazyModule
+            # wraps a broken internal import chain (e.g. diffusers
+            # pinned to a transformers version that removed MT5Tokenizer).
+            from diffusers import AutoPipelineForText2Image as _p
+            AutoPipelineForText2Image = _p
+        except Exception as e:  # noqa: BLE001
+            logger.debug("sd-turbo diffusers unavailable: %s", e)
 
 
 MANIFEST = {
@@ -64,6 +91,7 @@ class Model:
         dtype: str = "float16",
         **_: Any,
     ) -> None:
+        _ensure_deps()
         if AutoPipelineForText2Image is None:
             raise RuntimeError("diffusers is not installed; run `muse pull sd-turbo`")
         self._device = _select_device(device)
