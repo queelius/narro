@@ -157,13 +157,13 @@ def _cmd_serve(args):
 
 def _cmd_pull(args):
     from muse.core.catalog import pull
-    # When the identifier is a resolver URI, ensure the matching
-    # resolver is registered before pull() dispatches. Today only the
-    # HF resolver exists; future schemes get their own lazy import.
-    if "://" in args.identifier:
-        scheme = args.identifier.split("://", 1)[0]
-        if scheme == "hf":
-            import muse.core.resolvers_hf  # noqa: F401  (registers HFResolver on import)
+    # Always register the HF resolver before dispatching. The arg may be
+    # a URI directly, OR a curated alias that expands to a URI inside
+    # pull(); the old conditional "only import when :// is in the arg"
+    # missed the second case and crashed with "no resolver for scheme 'hf'".
+    # Importing is near-free (heavy huggingface_hub imports happen on
+    # actual resolve(), not on module import).
+    import muse.core.resolvers_hf  # noqa: F401  (registers HFResolver on import)
     try:
         pull(args.identifier)
     except KeyError as e:

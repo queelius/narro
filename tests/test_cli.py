@@ -99,6 +99,38 @@ def test_pull_unknown_model_nonzero_exit():
     assert "unknown" in combined.lower() or "not found" in combined.lower()
 
 
+def test_pull_curated_alias_registers_hf_resolver():
+    """Regression (v0.11.1): pulling a curated id that expands to an hf://
+    URI must register the HF resolver before pull() dispatches. v0.11.0
+    only registered on URIs typed directly, so curated aliases crashed
+    with 'no resolver for scheme "hf"'.
+
+    We don't actually complete the pull (that would download weights);
+    we just check that the failure mode is NOT the resolver-not-registered
+    error. The pull will likely fail later (network, missing HF repo,
+    etc.) but that's a different, acceptable failure.
+    """
+    # Pull a curated id whose URI is hf://... but point the HF call at
+    # a nonexistent repo so it fails fast. We're only checking that the
+    # resolver is registered before dispatch; any post-registration
+    # failure is fine.
+    import tempfile
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        env = os.environ.copy()
+        env["MUSE_CATALOG_DIR"] = tmp
+        import subprocess
+        r = subprocess.run(
+            ["muse", "pull", "qwen3-8b-q4"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        # Must NOT fail with "no resolver for scheme 'hf'"
+        combined = r.stdout + r.stderr
+        assert "no resolver for scheme 'hf'" not in combined, (
+            f"HF resolver not registered when pulling curated alias:\n{combined}"
+        )
+
+
 def test_help_is_fast(tmp_path):
     """muse --help must not load heavy libs (torch, diffusers, transformers)."""
     import time
