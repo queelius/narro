@@ -44,9 +44,9 @@ def test_modalities_are_isolated(reg):
     a = FakeAudioModel()
     i = FakeImageModel()
     reg.register("audio/speech", a)
-    reg.register("images.generations", i)
+    reg.register("image/generation", i)
     assert reg.get("audio/speech") is a
-    assert reg.get("images.generations") is i
+    assert reg.get("image/generation") is i
     with pytest.raises(KeyError):
         reg.get("audio/speech", "fake-diffusion")
 
@@ -62,7 +62,7 @@ def test_set_default_overrides_first_registered(reg):
 
 def test_list_models_returns_modelinfo_per_modality(reg):
     reg.register("audio/speech", FakeAudioModel())
-    reg.register("images.generations", FakeImageModel())
+    reg.register("image/generation", FakeImageModel())
     audio = reg.list_models("audio/speech")
     assert len(audio) == 1
     assert isinstance(audio[0], ModelInfo)
@@ -72,17 +72,17 @@ def test_list_models_returns_modelinfo_per_modality(reg):
 
 def test_list_all_spans_modalities(reg):
     reg.register("audio/speech", FakeAudioModel())
-    reg.register("images.generations", FakeImageModel())
+    reg.register("image/generation", FakeImageModel())
     all_models = reg.list_all()
     modalities = {m.modality for m in all_models}
-    assert modalities == {"audio/speech", "images.generations"}
+    assert modalities == {"audio/speech", "image/generation"}
 
 
 def test_modalities_lists_registered_keys(reg):
     reg.register("audio/speech", FakeAudioModel())
     assert reg.modalities() == ["audio/speech"]
-    reg.register("images.generations", FakeImageModel())
-    assert set(reg.modalities()) == {"audio/speech", "images.generations"}
+    reg.register("image/generation", FakeImageModel())
+    assert set(reg.modalities()) == {"audio/speech", "image/generation"}
 
 
 def test_missing_modality_raises(reg):

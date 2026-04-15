@@ -178,7 +178,7 @@ class TestAggregation:
                     {"id": "soprano-80m", "modality": "audio/speech", "object": "model"},
                 ]),
                 "http://127.0.0.1:9002/v1/models": make_resp([
-                    {"id": "sd-turbo", "modality": "images.generations", "object": "model"},
+                    {"id": "sd-turbo", "modality": "image/generation", "object": "model"},
                 ]),
             }
 
@@ -247,7 +247,7 @@ class TestAggregation:
                     "status": "ok", "modalities": ["audio/speech"], "models": ["soprano-80m"],
                 }),
                 "http://127.0.0.1:9002/health": make_resp({
-                    "status": "ok", "modalities": ["images.generations"], "models": ["sd-turbo"],
+                    "status": "ok", "modalities": ["image/generation"], "models": ["sd-turbo"],
                 }),
             }
 
@@ -263,7 +263,7 @@ class TestAggregation:
             r = client.get("/health")
         body = r.json()
         assert body["status"] == "ok"
-        assert set(body["modalities"]) == {"audio/speech", "images.generations"}
+        assert set(body["modalities"]) == {"audio/speech", "image/generation"}
         assert set(body["models"]) == {"soprano-80m", "sd-turbo"}
 
     def test_health_degraded_when_any_worker_down(self):

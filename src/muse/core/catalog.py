@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class CatalogEntry:
     """Static metadata for a known model."""
     model_id: str
-    modality: str              # "audio/speech" | "images.generations"
+    modality: str              # "audio/speech" | "image/generation"
     backend_path: str          # "module.path:ClassName"
     hf_repo: str
     description: str = ""
@@ -71,8 +71,8 @@ KNOWN_MODELS: dict[str, CatalogEntry] = {
     ),
     "sd-turbo": CatalogEntry(
         model_id="sd-turbo",
-        modality="images.generations",
-        backend_path="muse.images.generations.backends.sd_turbo:SDTurboModel",
+        modality="image/generation",
+        backend_path="muse.modalities.image_generation.backends.sd_turbo:SDTurboModel",
         hf_repo="stabilityai/sd-turbo",
         description="Stable Diffusion Turbo: 1-step distilled, 512x512",
         pip_extras=("diffusers>=0.27.0", "accelerate", "Pillow", "safetensors"),

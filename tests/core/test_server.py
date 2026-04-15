@@ -27,12 +27,12 @@ def test_health_reports_registered_modalities():
     class Fake:
         model_id = "fake"
     reg.register("audio/speech", Fake())
-    reg.register("images.generations", Fake())
+    reg.register("image/generation", Fake())
 
     app = create_app(registry=reg, routers={})
     client = TestClient(app)
     r = client.get("/health")
-    assert set(r.json()["modalities"]) == {"audio/speech", "images.generations"}
+    assert set(r.json()["modalities"]) == {"audio/speech", "image/generation"}
 
 
 def test_routers_are_mounted():
@@ -149,11 +149,11 @@ def test_speech_route_with_empty_registry_returns_openai_404():
 
 def test_images_route_with_empty_registry_returns_openai_404():
     """Same contract for images.generations."""
-    from muse.images.generations.routes import build_router as build_images_router
+    from muse.modalities.image_generation.routes import build_router as build_images_router
 
     reg = ModalityRegistry()
     router = build_images_router(reg)
-    app = create_app(registry=reg, routers={"images.generations": router})
+    app = create_app(registry=reg, routers={"image/generation": router})
     client = TestClient(app)
 
     r = client.post("/v1/images/generations", json={"prompt": "a cat"})

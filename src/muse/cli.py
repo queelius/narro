@@ -10,7 +10,7 @@ The CLI surface is deliberately minimal and modality-agnostic:
 
 Generation endpoints are reached via HTTP (the canonical interface):
     - Python: muse.modalities.audio_speech.SpeechClient,
-              muse.images.generations.GenerationsClient
+              muse.modalities.image_generation.GenerationsClient
     - Shell:  curl -X POST http://host:8000/v1/audio/speech ...
     - LLMs:   muse mcp (future — MCP server over HTTP)
 

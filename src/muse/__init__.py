@@ -2,7 +2,7 @@
 
 Modalities:
   - audio/speech  — /v1/audio/speech (text-to-speech)
-  - images.generations — /v1/images/generations (text-to-image)
+  - image/generation  — /v1/images/generations (text-to-image)
 
 Heavy backends (transformers, diffusers) are imported lazily inside
 individual backend modules to keep CLI startup instant.

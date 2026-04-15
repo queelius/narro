@@ -59,11 +59,11 @@ def test_models_list_shows_modality_column():
     assert r.returncode == 0
     combined = r.stdout + r.stderr
     assert "audio/speech" in combined
-    assert "images.generations" in combined
+    assert "image/generation" in combined
 
 
 def test_models_list_modality_filter():
-    r = _run("models", "list", "--modality", "images.generations")
+    r = _run("models", "list", "--modality", "image/generation")
     assert r.returncode == 0
     assert "sd-turbo" in r.stdout
     # audio/speech models must NOT appear under this filter

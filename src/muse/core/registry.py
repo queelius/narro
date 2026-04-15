@@ -22,7 +22,7 @@ class ModalityRegistry:
     """Holds loaded models grouped by modality.
 
     Each modality namespace has its own default. Modalities are independent:
-    looking up `audio/speech` won't find models registered under `images.generations`.
+    looking up `audio/speech` won't find models registered under `image/generation`.
     """
 
     def __init__(self) -> None:

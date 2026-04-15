@@ -54,11 +54,11 @@ def run_worker(*, host: str, port: int, models: list[str], device: str) -> int:
     # the OpenAI envelope rather than FastAPI's default {"detail": "Not Found"}.
     from muse.modalities.audio_speech.routes import build_router as build_audio
     from muse.modalities.embedding_text.routes import build_router as build_embeddings
-    from muse.images.generations.routes import build_router as build_images
+    from muse.modalities.image_generation.routes import build_router as build_images
 
     routers["audio/speech"] = build_audio(registry)
     routers["embedding/text"] = build_embeddings(registry)
-    routers["images.generations"] = build_images(registry)
+    routers["image/generation"] = build_images(registry)
 
     app = create_app(registry=registry, routers=routers)
     uvicorn.run(app, host=host, port=port, log_config=None)
