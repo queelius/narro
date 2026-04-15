@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from muse.embeddings.protocol import EmbeddingResult
+from muse.modalities.embedding_text.protocol import EmbeddingResult
 
 
 def _mock_model(encode_return=None, dim=1024):
@@ -24,9 +24,9 @@ def _mock_model(encode_return=None, dim=1024):
 
 
 def test_qwen3_model_id_and_dimensions():
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         m = Qwen3Embedding06BBackend(
             hf_repo="Qwen/Qwen3-Embedding-0.6B", local_dir="/fake",
         )
@@ -36,19 +36,19 @@ def test_qwen3_model_id_and_dimensions():
 
 def test_qwen3_passes_trust_remote_code_true():
     """Qwen3-Embedding publishes custom architecture in its HF repo."""
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         Qwen3Embedding06BBackend(hf_repo="fake", local_dir="/fake")
         kwargs = mock_cls.call_args.kwargs
         assert kwargs.get("trust_remote_code") is True
 
 
 def test_qwen3_embed_single_string():
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         fake = _mock_model(encode_return=[[0.1] * 1024])
         mock_cls.return_value = fake
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         m = Qwen3Embedding06BBackend(hf_repo="fake", local_dir="/fake")
         result = m.embed("hello")
         assert isinstance(result, EmbeddingResult)
@@ -59,10 +59,10 @@ def test_qwen3_embed_single_string():
 
 
 def test_qwen3_embed_list_of_strings():
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         fake = _mock_model(encode_return=np.zeros((3, 1024), dtype=np.float32))
         mock_cls.return_value = fake
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         m = Qwen3Embedding06BBackend(hf_repo="fake", local_dir="/fake")
         result = m.embed(["a", "b", "c"])
         assert len(result.embeddings) == 3
@@ -70,11 +70,11 @@ def test_qwen3_embed_list_of_strings():
 
 def test_qwen3_dimensions_truncation_renormalizes():
     """Matryoshka truncation should produce unit-norm vectors at the smaller dim."""
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         raw = np.array([[3.0, 4.0] + [0.0] * 1022], dtype=np.float32)
         fake = _mock_model(encode_return=raw)
         mock_cls.return_value = fake
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         m = Qwen3Embedding06BBackend(hf_repo="fake", local_dir="/fake")
         result = m.embed("hi", dimensions=2)
         assert result.dimensions == 2
@@ -86,9 +86,9 @@ def test_qwen3_dimensions_truncation_renormalizes():
 
 
 def test_qwen3_prefers_local_dir_over_hf_repo():
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         Qwen3Embedding06BBackend(
             hf_repo="Qwen/Qwen3-Embedding-0.6B", local_dir="/real/path",
         )
@@ -96,9 +96,9 @@ def test_qwen3_prefers_local_dir_over_hf_repo():
 
 
 def test_qwen3_falls_back_to_hf_repo_when_local_dir_none():
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         Qwen3Embedding06BBackend(
             hf_repo="Qwen/Qwen3-Embedding-0.6B", local_dir=None,
         )
@@ -106,10 +106,10 @@ def test_qwen3_falls_back_to_hf_repo_when_local_dir_none():
 
 
 def test_qwen3_counts_tokens_from_attention_mask():
-    with patch("muse.embeddings.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.qwen3_embedding.SentenceTransformer") as mock_cls:
         fake = _mock_model(encode_return=np.zeros((2, 1024), dtype=np.float32))
         mock_cls.return_value = fake
-        from muse.embeddings.backends.qwen3_embedding import Qwen3Embedding06BBackend
+        from muse.modalities.embedding_text.backends.qwen3_embedding import Qwen3Embedding06BBackend
         m = Qwen3Embedding06BBackend(hf_repo="fake", local_dir="/fake")
         result = m.embed(["a", "b"])
         # _mock_model returns attention_mask shape (2, 7) of all 1s

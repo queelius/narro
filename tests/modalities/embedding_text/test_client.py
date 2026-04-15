@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from muse.embeddings.client import EmbeddingsClient
+from muse.modalities.embedding_text.client import EmbeddingsClient
 
 
 def _make_response(embeddings, encoding_format="float", model="fake-embed", tokens=3):
@@ -44,7 +44,7 @@ def test_muse_server_env_fallback(monkeypatch):
 
 def test_embed_single_string_returns_list_of_vectors():
     fake_body = _make_response([[0.1, 0.2, 0.3]])
-    with patch("muse.embeddings.client.requests.post") as mock_post:
+    with patch("muse.modalities.embedding_text.client.requests.post") as mock_post:
         mock_post.return_value = MagicMock(status_code=200, json=lambda: fake_body)
         c = EmbeddingsClient()
         vectors = c.embed("hello")
@@ -57,7 +57,7 @@ def test_embed_single_string_returns_list_of_vectors():
 
 def test_embed_list_input_returns_list_of_vectors():
     fake_body = _make_response([[0.1], [0.2], [0.3]])
-    with patch("muse.embeddings.client.requests.post") as mock_post:
+    with patch("muse.modalities.embedding_text.client.requests.post") as mock_post:
         mock_post.return_value = MagicMock(status_code=200, json=lambda: fake_body)
         c = EmbeddingsClient()
         vectors = c.embed(["a", "b", "c"])
@@ -69,7 +69,7 @@ def test_embed_list_input_returns_list_of_vectors():
 def test_embed_base64_decodes_to_floats():
     original = [1.0, 2.0, 3.0, 4.0]
     fake_body = _make_response([original], encoding_format="base64")
-    with patch("muse.embeddings.client.requests.post") as mock_post:
+    with patch("muse.modalities.embedding_text.client.requests.post") as mock_post:
         mock_post.return_value = MagicMock(status_code=200, json=lambda: fake_body)
         c = EmbeddingsClient()
         # Client requests base64 from the server, decodes to floats for caller
@@ -81,7 +81,7 @@ def test_embed_base64_decodes_to_floats():
 
 def test_embed_sends_optional_fields_when_provided():
     fake_body = _make_response([[0.1]])
-    with patch("muse.embeddings.client.requests.post") as mock_post:
+    with patch("muse.modalities.embedding_text.client.requests.post") as mock_post:
         mock_post.return_value = MagicMock(status_code=200, json=lambda: fake_body)
         c = EmbeddingsClient()
         c.embed("hi", model="all-minilm-l6-v2", dimensions=128)
@@ -92,7 +92,7 @@ def test_embed_sends_optional_fields_when_provided():
 
 def test_embed_omits_none_optional_fields():
     fake_body = _make_response([[0.1]])
-    with patch("muse.embeddings.client.requests.post") as mock_post:
+    with patch("muse.modalities.embedding_text.client.requests.post") as mock_post:
         mock_post.return_value = MagicMock(status_code=200, json=lambda: fake_body)
         c = EmbeddingsClient()
         c.embed("hi")
@@ -102,7 +102,7 @@ def test_embed_omits_none_optional_fields():
 
 
 def test_embed_raises_on_http_error():
-    with patch("muse.embeddings.client.requests.post") as mock_post:
+    with patch("muse.modalities.embedding_text.client.requests.post") as mock_post:
         mock_post.return_value = MagicMock(status_code=500, text="boom")
         c = EmbeddingsClient()
         with pytest.raises(RuntimeError, match="500"):

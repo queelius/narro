@@ -1,7 +1,7 @@
 """Tests for EmbeddingsModel protocol."""
 import pytest
 
-from muse.embeddings.protocol import EmbeddingsModel, EmbeddingResult
+from muse.modalities.embedding_text.protocol import EmbeddingsModel, EmbeddingResult
 
 
 def test_embedding_result_stores_all_fields():

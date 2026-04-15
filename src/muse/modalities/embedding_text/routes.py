@@ -30,11 +30,11 @@ from pydantic import BaseModel, Field, field_validator
 
 from muse.core.errors import ModelNotFoundError
 from muse.core.registry import ModalityRegistry
-from muse.embeddings.codec import embedding_to_base64
+from muse.modalities.embedding_text.codec import embedding_to_base64
 
 logger = logging.getLogger(__name__)
 
-MODALITY = "embeddings"
+MODALITY = "embedding/text"
 _inference_lock = Lock()
 
 
@@ -62,7 +62,7 @@ class EmbeddingsRequest(BaseModel):
 
 
 def build_router(registry: ModalityRegistry) -> APIRouter:
-    router = APIRouter(prefix="/v1", tags=["embeddings"])
+    router = APIRouter(prefix="/v1", tags=["embedding/text"])
 
     @router.post("/embeddings")
     async def embeddings(req: EmbeddingsRequest):

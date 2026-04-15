@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from muse.embeddings.codec import embedding_to_base64, base64_to_embedding
+from muse.modalities.embedding_text.codec import embedding_to_base64, base64_to_embedding
 
 
 def test_round_trip_preserves_values_approximately():

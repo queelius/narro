@@ -14,7 +14,7 @@ from typing import Any, Union
 
 import requests
 
-from muse.embeddings.codec import base64_to_embedding
+from muse.modalities.embedding_text.codec import base64_to_embedding
 
 
 class EmbeddingsClient:

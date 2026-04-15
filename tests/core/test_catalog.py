@@ -24,7 +24,7 @@ def tmp_catalog(tmp_path, monkeypatch):
 
 
 def test_known_models_entries_have_valid_modality():
-    valid = {"audio/speech", "images.generations", "embeddings"}
+    valid = {"audio/speech", "images.generations", "embedding/text"}
     for model_id, entry in KNOWN_MODELS.items():
         assert entry.modality in valid, \
             f"model {model_id} has invalid modality {entry.modality!r}"

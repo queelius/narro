@@ -80,8 +80,8 @@ KNOWN_MODELS: dict[str, CatalogEntry] = {
     ),
     "all-minilm-l6-v2": CatalogEntry(
         model_id="all-minilm-l6-v2",
-        modality="embeddings",
-        backend_path="muse.embeddings.backends.minilm:MiniLMBackend",
+        modality="embedding/text",
+        backend_path="muse.modalities.embedding_text.backends.minilm:MiniLMBackend",
         hf_repo="sentence-transformers/all-MiniLM-L6-v2",
         description="MiniLM sentence embeddings: 384 dims, 22MB, CPU-friendly",
         pip_extras=("torch>=2.1.0", "sentence-transformers>=2.2.0"),
@@ -89,8 +89,8 @@ KNOWN_MODELS: dict[str, CatalogEntry] = {
     ),
     "qwen3-embedding-0.6b": CatalogEntry(
         model_id="qwen3-embedding-0.6b",
-        modality="embeddings",
-        backend_path="muse.embeddings.backends.qwen3_embedding:Qwen3Embedding06BBackend",
+        modality="embedding/text",
+        backend_path="muse.modalities.embedding_text.backends.qwen3_embedding:Qwen3Embedding06BBackend",
         hf_repo="Qwen/Qwen3-Embedding-0.6B",
         description="Qwen3-Embedding 0.6B: 1024 dims (matryoshka), 32K context, Apache 2.0",
         pip_extras=(
@@ -102,8 +102,8 @@ KNOWN_MODELS: dict[str, CatalogEntry] = {
     ),
     "nv-embed-v2": CatalogEntry(
         model_id="nv-embed-v2",
-        modality="embeddings",
-        backend_path="muse.embeddings.backends.nv_embed_v2:NVEmbedV2Backend",
+        modality="embedding/text",
+        backend_path="muse.modalities.embedding_text.backends.nv_embed_v2:NVEmbedV2Backend",
         hf_repo="nvidia/NV-Embed-v2",
         description=(
             "NVIDIA NV-Embed-v2: 4096 dims, 32K context, SotA MTEB "

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from muse.embeddings.protocol import EmbeddingResult
+from muse.modalities.embedding_text.protocol import EmbeddingResult
 
 
 def _mock_model(encode_return=None, dim=384):
@@ -28,9 +28,9 @@ def _mock_model(encode_return=None, dim=384):
 
 
 def test_minilm_model_id_and_dimensions():
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         m = MiniLMBackend(hf_repo="sentence-transformers/all-MiniLM-L6-v2",
                           local_dir="/fake")
         assert m.model_id == "all-minilm-l6-v2"
@@ -38,10 +38,10 @@ def test_minilm_model_id_and_dimensions():
 
 
 def test_minilm_embed_single_string():
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         fake = _mock_model(encode_return=[[0.1] * 384])
         mock_cls.return_value = fake
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         m = MiniLMBackend(hf_repo="sentence-transformers/all-MiniLM-L6-v2",
                           local_dir="/fake")
         result = m.embed("hello")
@@ -56,10 +56,10 @@ def test_minilm_embed_single_string():
 
 
 def test_minilm_embed_list_of_strings():
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         fake = _mock_model(encode_return=np.zeros((3, 384), dtype=np.float32))
         mock_cls.return_value = fake
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         m = MiniLMBackend(hf_repo="sentence-transformers/all-MiniLM-L6-v2",
                           local_dir="/fake")
         result = m.embed(["a", "b", "c"])
@@ -69,10 +69,10 @@ def test_minilm_embed_list_of_strings():
 
 
 def test_minilm_counts_tokens_from_attention_mask():
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         fake = _mock_model(encode_return=np.zeros((2, 384), dtype=np.float32))
         mock_cls.return_value = fake
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         m = MiniLMBackend(hf_repo="...", local_dir="/fake")
         result = m.embed(["a", "b"])
         # _mock_model returns attention_mask of shape (2, 5) of all 1s
@@ -81,12 +81,12 @@ def test_minilm_counts_tokens_from_attention_mask():
 
 def test_minilm_dimensions_truncation_l2_normalizes():
     """Truncating + renormalizing produces unit vectors at the smaller dim."""
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         # Encode returns a known vector so we can check the math
         raw = np.array([[3.0, 4.0, 0.0, 0.0] + [0.0] * 380], dtype=np.float32)
         fake = _mock_model(encode_return=raw)
         mock_cls.return_value = fake
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         m = MiniLMBackend(hf_repo="...", local_dir="/fake")
         result = m.embed("hi", dimensions=2)
         assert result.dimensions == 2
@@ -99,20 +99,20 @@ def test_minilm_dimensions_truncation_l2_normalizes():
 
 def test_minilm_full_dimensions_skips_truncation():
     """If dimensions >= model dim, no truncation applied."""
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         raw = np.ones((1, 384), dtype=np.float32)
         fake = _mock_model(encode_return=raw)
         mock_cls.return_value = fake
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         m = MiniLMBackend(hf_repo="...", local_dir="/fake")
         result = m.embed("hi", dimensions=384)
         assert result.dimensions == 384
 
 
 def test_minilm_prefers_local_dir_over_hf_repo():
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         MiniLMBackend(hf_repo="sentence-transformers/all-MiniLM-L6-v2",
                       local_dir="/real/local/path")
         # First positional arg should be local_dir
@@ -121,9 +121,9 @@ def test_minilm_prefers_local_dir_over_hf_repo():
 
 
 def test_minilm_falls_back_to_hf_repo_when_local_dir_none():
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         MiniLMBackend(hf_repo="sentence-transformers/all-MiniLM-L6-v2",
                       local_dir=None)
         args = mock_cls.call_args.args
@@ -132,9 +132,9 @@ def test_minilm_falls_back_to_hf_repo_when_local_dir_none():
 
 def test_minilm_accepts_unknown_kwargs():
     """Future catalog kwargs (**_) should be absorbed."""
-    with patch("muse.embeddings.backends.minilm.SentenceTransformer") as mock_cls:
+    with patch("muse.modalities.embedding_text.backends.minilm.SentenceTransformer") as mock_cls:
         mock_cls.return_value = _mock_model()
-        from muse.embeddings.backends.minilm import MiniLMBackend
+        from muse.modalities.embedding_text.backends.minilm import MiniLMBackend
         # Should not TypeError
         MiniLMBackend(
             hf_repo="x", local_dir="/fake",
@@ -144,5 +144,5 @@ def test_minilm_accepts_unknown_kwargs():
 
 def test_minilm_module_imports_without_sentence_transformers_installed():
     """Module-level try/except leaves SentenceTransformer=None when missing."""
-    import muse.embeddings.backends.minilm as mod
+    import muse.modalities.embedding_text.backends.minilm as mod
     assert hasattr(mod, "SentenceTransformer")

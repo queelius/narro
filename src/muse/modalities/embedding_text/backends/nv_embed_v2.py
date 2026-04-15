@@ -29,7 +29,7 @@ from typing import Any
 
 import numpy as np
 
-from muse.embeddings.protocol import EmbeddingResult
+from muse.modalities.embedding_text.protocol import EmbeddingResult
 
 logger = logging.getLogger(__name__)
 

@@ -7,8 +7,8 @@ from fastapi.testclient import TestClient
 
 from muse.core.registry import ModalityRegistry
 from muse.core.server import create_app
-from muse.embeddings.protocol import EmbeddingResult
-from muse.embeddings.routes import build_router
+from muse.modalities.embedding_text.protocol import EmbeddingResult
+from muse.modalities.embedding_text.routes import build_router
 
 
 class FakeEmbeddingsModel:
@@ -35,8 +35,8 @@ class FakeEmbeddingsModel:
 @pytest.fixture
 def client():
     reg = ModalityRegistry()
-    reg.register("embeddings", FakeEmbeddingsModel())
-    app = create_app(registry=reg, routers={"embeddings": build_router(reg)})
+    reg.register("embedding/text", FakeEmbeddingsModel())
+    app = create_app(registry=reg, routers={"embedding/text": build_router(reg)})
     return TestClient(app)
 
 
