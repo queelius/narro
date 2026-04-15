@@ -78,6 +78,79 @@ def test_known_models_cache_is_reusable():
     assert first is second
 
 
+def _write_user_model(user_dir, filename, model_id, modality="audio/speech", hf_repo="fake/repo"):
+    """Helper: write a minimal valid model script into user_dir."""
+    import textwrap
+    user_dir.mkdir(parents=True, exist_ok=True)
+    (user_dir / filename).write_text(textwrap.dedent(f"""
+        MANIFEST = {{
+            "model_id": {model_id!r},
+            "modality": {modality!r},
+            "hf_repo": {hf_repo!r},
+        }}
+        class Model:
+            model_id = {model_id!r}
+    """).lstrip())
+
+
+def test_known_models_picks_up_user_models_dir(tmp_path, monkeypatch):
+    """Scripts in ~/.muse/models/ show up in known_models()."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    user_dir = tmp_path / ".muse" / "models"
+    _write_user_model(user_dir, "my_custom.py", "my-custom-tts")
+
+    _reset_known_models_cache()
+    catalog = known_models()
+    assert "my-custom-tts" in catalog
+    assert catalog["my-custom-tts"].modality == "audio/speech"
+
+
+def test_known_models_picks_up_env_override_dir(tmp_path, monkeypatch):
+    """$MUSE_MODELS_DIR is scanned after the user dir."""
+    env_dir = tmp_path / "env-muse-models"
+    _write_user_model(env_dir, "experimental.py", "experimental-tts")
+    monkeypatch.setenv("MUSE_MODELS_DIR", str(env_dir))
+
+    _reset_known_models_cache()
+    catalog = known_models()
+    assert "experimental-tts" in catalog
+
+
+def test_bundled_models_shadow_user_models_on_collision(tmp_path, monkeypatch, caplog):
+    """First-found-wins: bundled entries beat user entries with the same id.
+
+    Users cannot silently replace a bundled model. A warning is logged
+    when a user script collides with a bundled one.
+    """
+    import logging
+    monkeypatch.setenv("HOME", str(tmp_path))
+    user_dir = tmp_path / ".muse" / "models"
+    # User "kokoro-82m" points at a bogus repo; bundled one points at
+    # hexgrad/Kokoro-82M. We expect the bundled manifest to win.
+    _write_user_model(
+        user_dir, "kokoro_82m.py", "kokoro-82m",
+        hf_repo="user/override-repo",
+    )
+
+    caplog.set_level(logging.WARNING)
+    _reset_known_models_cache()
+    catalog = known_models()
+    assert catalog["kokoro-82m"].hf_repo == "hexgrad/Kokoro-82M"
+    # Collision should be noted
+    assert "kokoro-82m" in caplog.text
+
+
+def test_nonexistent_user_dir_is_silently_skipped(tmp_path, monkeypatch):
+    """No ~/.muse/models/ dir = discovery carries on without warnings."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Deliberately do NOT create the user dir
+    _reset_known_models_cache()
+    catalog = known_models()
+    # Bundled set still intact
+    assert "kokoro-82m" in catalog
+    assert "sd-turbo" in catalog
+
+
 def test_list_known_filters_by_modality():
     audio = list_known("audio/speech")
     assert all(e.modality == "audio/speech" for e in audio)

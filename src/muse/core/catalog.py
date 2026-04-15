@@ -55,13 +55,35 @@ def _bundled_models_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "models"
 
 
-def _model_dirs() -> list[Path]:
-    """Scan order for model discovery (bundled first).
+def _user_models_dir() -> Path:
+    """Path to the per-user `~/.muse/models/` drop-in directory.
 
-    Task F1 will extend this with `~/.muse/models/` and `$MUSE_MODELS_DIR`.
-    For now, only the bundled dir is scanned.
+    Users can drop `.py` model scripts here to add backends without
+    modifying the muse source tree. Resolves via `Path.home()` so
+    monkeypatching `$HOME` in tests Just Works.
     """
-    return [_bundled_models_dir()]
+    return Path.home() / ".muse" / "models"
+
+
+def _env_models_dir() -> Path | None:
+    """Optional extra models dir from the `$MUSE_MODELS_DIR` env var."""
+    env = os.environ.get("MUSE_MODELS_DIR")
+    return Path(env) if env else None
+
+
+def _model_dirs() -> list[Path]:
+    """Scan order for model discovery: bundled, then user dir, then env.
+
+    First-found-wins on model_id collision, so bundled models shadow
+    user and env entries with the same id. This is intentional: users
+    cannot silently replace a bundled model by dropping a script with
+    the same id. To override, rename or remove the bundled script.
+    """
+    dirs = [_bundled_models_dir(), _user_models_dir()]
+    env = _env_models_dir()
+    if env is not None:
+        dirs.append(env)
+    return dirs
 
 
 def _manifest_to_catalog_entry(discovered: DiscoveredModel) -> CatalogEntry:
