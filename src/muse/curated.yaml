@@ -1,0 +1,68 @@
+# Hand-picked recommended models surfaced in `muse models list`.
+#
+# Adding entries:
+#   - `id` is the catalog key. Kebab-case. This is what the user types
+#     in `muse pull <id>` and what shows up in `muse models list`.
+#   - Either `uri` (resolver-pulled) OR `bundled: true` (alias to a
+#     bundled script with the same id).
+#   - For URI entries: also set `modality`, `size_gb`, `description`.
+#     For bundled entries: leave the rest empty; metadata comes from
+#     the script's MANIFEST.
+#   - Curation taste: keep the list small. New users should be able to
+#     scan it in seconds and pick something. ~10-20 entries total.
+#
+# Pulling: `muse pull <id>` resolves a curated id to its URI (resolver
+# entries) or directly invokes the bundled-script flow.
+
+# ---------- chat/completion (GGUF via llama-cpp-python) ----------
+
+- id: qwen3-1.7b-q4
+  uri: hf://Qwen/Qwen3-1.7B-Instruct-GGUF@q4_k_m
+  modality: chat/completion
+  size_gb: 1.0
+  description: "Qwen3 1.7B (Q4_K_M): tiny chat model, runs on CPU"
+
+- id: qwen3-8b-q4
+  uri: hf://Qwen/Qwen3-8B-Instruct-GGUF@q4_k_m
+  modality: chat/completion
+  size_gb: 4.5
+  description: "Qwen3 8B (Q4_K_M): general chat + tools, 8GB+ GPU"
+
+- id: qwen3-32b-q4
+  uri: hf://Qwen/Qwen3-32B-Instruct-GGUF@q4_k_m
+  modality: chat/completion
+  size_gb: 18.5
+  description: "Qwen3 32B (Q4_K_M): heavy reasoning, 24GB+ GPU"
+
+- id: llama-3.2-3b-q4
+  uri: hf://bartowski/Llama-3.2-3B-Instruct-GGUF@q4_k_m
+  modality: chat/completion
+  size_gb: 2.0
+  description: "Llama 3.2 3B Instruct (Q4_K_M): small, fast, broadly compatible"
+
+# ---------- embedding/text ----------
+
+- id: all-minilm-l6-v2-st
+  uri: hf://sentence-transformers/all-MiniLM-L6-v2
+  modality: embedding/text
+  size_gb: 0.1
+  description: "MiniLM 384 dims, 22MB: CPU-friendly default embedder"
+
+- id: qwen3-embedding-0.6b
+  bundled: true
+
+- id: nv-embed-v2
+  bundled: true
+
+# ---------- audio/speech (TTS) ----------
+
+- id: kokoro-82m
+  bundled: true
+
+- id: soprano-80m
+  bundled: true
+
+# ---------- image/generation ----------
+
+- id: sd-turbo
+  bundled: true

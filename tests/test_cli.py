@@ -75,7 +75,7 @@ def test_models_list_empty_filter_reports_empty():
     r = _run("models", "list", "--modality", "video.generations")
     assert r.returncode == 0
     combined = (r.stdout + r.stderr).lower()
-    assert "no known models" in combined
+    assert "no models" in combined
 
 
 def test_models_info_on_known_model():
@@ -151,3 +151,47 @@ def test_models_list_shows_known_model_regardless_of_pull_status():
     assert r.returncode == 0
     combined = r.stdout + r.stderr
     assert "soprano-80m" in combined
+
+
+# --- v0.11.0: curated recommendations + filters in `muse models list` ------
+
+
+def test_models_list_shows_recommended_status_for_curated_unpulled():
+    """A curated model that hasn't been pulled shows up as [recommended]."""
+    r = _run("models", "list")
+    assert r.returncode == 0
+    # The bundled curated.yaml includes resolver entries (e.g. qwen3-8b-q4)
+    # that are not pulled in this fresh test env -> they show as recommended.
+    combined = r.stdout + r.stderr
+    assert "recommended" in combined.lower()
+
+
+def test_models_list_filter_modality_chat_completion():
+    r = _run("models", "list", "--modality", "chat/completion")
+    assert r.returncode == 0
+    combined = r.stdout + r.stderr
+    # Curated chat models should appear; non-chat ones should NOT
+    assert "chat/completion" in combined
+    # kokoro is audio/speech; should be filtered out
+    assert "kokoro" not in combined.lower() or "no models" in combined.lower()
+
+
+def test_models_list_filter_available_excludes_disabled_and_enabled():
+    """--available shows only models you could install."""
+    r = _run("models", "list", "--available")
+    assert r.returncode == 0
+    combined = r.stdout + r.stderr
+    # No enabled or disabled status should appear
+    assert "[enabled" not in combined
+    assert "[disabled" not in combined
+
+
+def test_models_list_filter_installed_only():
+    """--installed shows only catalog entries (none in fresh test env -> empty)."""
+    r = _run("models", "list", "--installed")
+    assert r.returncode == 0
+    # In CI / fresh runs there's nothing pulled, so this is empty or close to it.
+    # We assert that no [recommended] or [available] rows appear.
+    combined = r.stdout + r.stderr
+    assert "[recommended" not in combined
+    assert "[available" not in combined

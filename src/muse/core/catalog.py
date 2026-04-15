@@ -29,6 +29,7 @@ from typing import Any
 
 from huggingface_hub import snapshot_download
 
+from muse.core.curated import find_curated
 from muse.core.discovery import DiscoveredModel, discover_models
 from muse.core.install import check_system_packages, install_pip_extras
 from muse.core.venv import create_venv, install_into_venv, venv_python
@@ -250,21 +251,36 @@ def _muse_repo_root() -> Path:
 
 
 def pull(identifier: str) -> None:
-    """Pull a model. Dispatch on identifier shape.
+    """Pull a model. Dispatch by identifier shape, with curated alias resolution.
 
-    Two forms:
-      - bare model_id (e.g. "kokoro-82m"): looked up in `known_models()`
-        and pulled via the bundled-script path.
-      - resolver URI (e.g. "hf://Qwen/Qwen3-8B-GGUF@q4_k_m"): routed to
-        the matching resolver, which synthesizes a manifest. The
-        synthesized manifest is persisted in catalog.json so future
-        startups see the model alongside bundled ones.
+    Resolution order:
+      1. Curated alias (e.g. "qwen3-8b-q4" from src/muse/curated.yaml):
+         expands to the underlying URI or bundled id. The curated id is
+         preserved as the catalog key, so the user sees the friendly id
+         in `muse models list` rather than a synthesized resolver one.
+      2. Resolver URI (contains "://", e.g. "hf://Qwen/Qwen3-8B-GGUF@q4_k_m"):
+         routed to the matching resolver, which synthesizes a manifest.
+      3. Bare model_id (e.g. "kokoro-82m"): looked up in `known_models()`
+         and pulled via the bundled-script path.
 
-    Both paths create a per-model venv at `<MUSE_CATALOG_DIR>/venvs/<id>/`,
-    install muse[server] (editable) + the manifest's pip_extras, fetch
-    weights, and record the venv's Python path so `muse serve` can spawn
-    workers with the right interpreter.
+    All paths create a per-model venv at `<MUSE_CATALOG_DIR>/venvs/<id>/`,
+    install muse[server] (editable) + pip_extras, fetch weights, and
+    record the venv's Python path so `muse serve` can spawn workers
+    with the right interpreter.
     """
+    curated = find_curated(identifier)
+    if curated is not None:
+        if curated.uri:
+            # Resolver-pulled curated entry. Override the synthesized id
+            # so the catalog stores the friendly curated id (e.g.
+            # qwen3-8b-q4) instead of qwen3-8b-instruct-gguf-q4-k-m.
+            _pull_via_resolver(curated.uri, model_id_override=curated.id)
+            return
+        # Bundled curated entry: id equals an existing bundled script's
+        # model_id. Fall through to the bundled path with that id.
+        _pull_bundled(curated.id)
+        return
+
     if "://" in identifier:
         _pull_via_resolver(identifier)
     else:
@@ -313,7 +329,7 @@ def _pull_bundled(model_id: str) -> None:
     _reset_known_models_cache()
 
 
-def _pull_via_resolver(uri: str) -> None:
+def _pull_via_resolver(uri: str, *, model_id_override: str | None = None) -> None:
     """Pull a model via a resolver URI (e.g. hf://Qwen/Qwen3-8B-GGUF@q4_k_m).
 
     Looks up the resolver for the URI's scheme, calls `resolve(uri)` to
@@ -322,6 +338,12 @@ def _pull_via_resolver(uri: str) -> None:
     weights via `resolved.download()`, persists the synthesized manifest
     plus a `source: <uri>` field into catalog.json, and invalidates the
     known_models cache so the next call sees the new entry.
+
+    `model_id_override` is set when the URI was reached via a curated
+    alias (e.g. user typed `qwen3-8b-q4` which expands to
+    `hf://Qwen/Qwen3-8B-Instruct-GGUF@q4_k_m`). The override replaces
+    the resolver's synthesized model_id so the catalog stores the
+    friendly curated id.
     """
     from muse.core.resolvers import resolve
 
@@ -332,6 +354,8 @@ def _pull_via_resolver(uri: str) -> None:
     # find it without consulting the resolver again.
     manifest.setdefault("backend_path", resolved.backend_path)
 
+    if model_id_override:
+        manifest["model_id"] = model_id_override
     model_id = manifest["model_id"]
 
     venvs_root = _catalog_dir() / "venvs"

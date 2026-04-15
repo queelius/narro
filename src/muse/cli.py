@@ -111,9 +111,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp_models = sub.add_parser("models", help="manage the model catalog")
     models_sub = sp_models.add_subparsers(dest="models_cmd", required=True)
 
-    sp_list = models_sub.add_parser("list", help="list known models across all modalities")
+    sp_list = models_sub.add_parser(
+        "list",
+        help="list known models (bundled scripts + curated recommendations + pulled)",
+    )
     sp_list.add_argument("--modality", default=None,
                          help="filter by modality (e.g., audio/speech)")
+    sp_list.add_argument(
+        "--installed",
+        action="store_true",
+        help="only models with a catalog.json entry (enabled or disabled)",
+    )
+    sp_list.add_argument(
+        "--available",
+        action="store_true",
+        help="only models you could install (recommended or available bundled)",
+    )
     sp_list.set_defaults(func=_cmd_models_list)
 
     sp_info = models_sub.add_parser("info", help="show catalog entry for a model")
@@ -184,20 +197,88 @@ def _cmd_worker(args):
 
 
 def _cmd_models_list(args):
-    from muse.core.catalog import is_pulled, list_known
-    entries = list_known(args.modality)
-    if not entries:
-        msg = (f"no known models for modality {args.modality!r}"
-               if args.modality else "no known models")
-        print(msg)
-        return 0
-    for e in entries:
-        if is_pulled(e.model_id):
-            from muse.core.catalog import is_enabled
-            status = "enabled" if is_enabled(e.model_id) else "disabled"
+    """Print models from three sources: bundled scripts + curated + pulled.
+
+    Status precedence:
+      - pulled (in catalog.json) -> 'enabled' or 'disabled' (catalog wins)
+      - curated and not pulled  -> 'recommended' (curated trumps bundled-available)
+      - bundled and not pulled  -> 'available'
+
+    Filters (mutually compatible):
+      --modality M     : only entries whose modality == M
+      --installed      : only entries with a catalog.json record
+      --available      : only entries you could install (recommended/available)
+    """
+    from muse.core.catalog import is_enabled, is_pulled, list_known
+    from muse.core.curated import load_curated
+
+    bundled_entries = {e.model_id: e for e in list_known(None)}
+    curated_entries = {c.id: c for c in load_curated()}
+
+    # Build the unified row set keyed by id. Each row is a dict carrying
+    # whatever metadata we have, plus the computed status.
+    rows: list[dict] = []
+    seen: set[str] = set()
+
+    # 1. Bundled scripts and resolver-pulled entries (everything in known_models).
+    for model_id, e in bundled_entries.items():
+        seen.add(model_id)
+        pulled = is_pulled(model_id)
+        if pulled:
+            status = "enabled" if is_enabled(model_id) else "disabled"
+        elif model_id in curated_entries:
+            status = "recommended"
         else:
             status = "available"
-        print(f"  {e.model_id:20s} [{status:9s}] {e.modality:22s} {e.description}")
+        rows.append({
+            "id": model_id,
+            "modality": e.modality,
+            "description": e.description,
+            "status": status,
+        })
+
+    # 2. Curated entries that aren't already covered by a bundled/pulled
+    #    entry above (i.e. resolver-pulled curated aliases).
+    for cid, c in curated_entries.items():
+        if cid in seen:
+            continue
+        if is_pulled(cid):
+            status = "enabled" if is_enabled(cid) else "disabled"
+        else:
+            status = "recommended"
+        rows.append({
+            "id": cid,
+            "modality": c.modality or "?",
+            "description": c.description or "",
+            "status": status,
+        })
+
+    # Filters
+    if args.modality:
+        rows = [r for r in rows if r["modality"] == args.modality]
+    if args.installed:
+        rows = [r for r in rows if r["status"] in ("enabled", "disabled")]
+    if args.available:
+        rows = [r for r in rows if r["status"] in ("recommended", "available")]
+
+    if not rows:
+        suffixes = []
+        if args.modality:
+            suffixes.append(f"modality {args.modality!r}")
+        if args.installed:
+            suffixes.append("--installed")
+        if args.available:
+            suffixes.append("--available")
+        suffix = (" matching " + ", ".join(suffixes)) if suffixes else ""
+        print(f"no models{suffix}")
+        return 0
+
+    rows.sort(key=lambda r: (r["status"], r["id"]))
+    for r in rows:
+        print(
+            f"  {r['id']:20s} [{r['status']:11s}] "
+            f"{r['modality']:22s} {r['description']}"
+        )
     return 0
 
 

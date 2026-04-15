@@ -724,3 +724,107 @@ def test_load_backend_bundled_path_unchanged(tmp_catalog):
     assert kwargs["hf_repo"] == "ekwek/Soprano-1.1-80M"
     assert kwargs["local_dir"] == "/fake/local"
     assert kwargs["device"] == "cpu"
+
+
+# --- v0.11.0: curated alias dispatch in pull() -----------------------------
+
+
+def test_pull_curated_resolver_id_uses_curated_id_in_catalog(tmp_catalog):
+    """`muse pull qwen3-8b-q4` (curated alias) persists under `qwen3-8b-q4`,
+    not under the resolver's synthesized id like `qwen3-8b-instruct-gguf-q4-k-m`."""
+    from muse.core.catalog import pull
+    from muse.core.curated import CuratedEntry, _reset_curated_cache_for_tests
+    from muse.core.resolvers import (
+        Resolver, ResolvedModel, register_resolver, _reset_registry_for_tests,
+    )
+
+    class _FakeResolver(Resolver):
+        scheme = "fake"
+        def resolve(self, uri):
+            return ResolvedModel(
+                manifest={
+                    "model_id": "long-ugly-synthesized-id",
+                    "modality": "chat/completion",
+                    "hf_repo": "fake/repo",
+                    "backend_path": "x.y:Z",
+                },
+                backend_path="x.y:Z",
+                download=lambda cache: cache / "w",
+            )
+        def search(self, q, **k):
+            return []
+
+    _reset_registry_for_tests()
+    _reset_curated_cache_for_tests()
+    register_resolver(_FakeResolver())
+
+    # Patch find_curated to return a curated alias for "friendly-id"
+    fake_curated = CuratedEntry(
+        id="friendly-id",
+        bundled=False,
+        uri="fake://anything",
+        modality="chat/completion",
+        size_gb=1.0,
+        description="aliased",
+        tags=(),
+    )
+    try:
+        with patch("muse.core.catalog.find_curated", return_value=fake_curated), \
+             patch("muse.core.catalog.create_venv"), \
+             patch("muse.core.catalog.install_into_venv"), \
+             patch("muse.core.catalog.check_system_packages", return_value=[]):
+            pull("friendly-id")
+    finally:
+        _reset_registry_for_tests()
+        _reset_curated_cache_for_tests()
+
+    catalog = _read_catalog()
+    # Curated id wins over the resolver's synthesized id
+    assert "friendly-id" in catalog
+    assert "long-ugly-synthesized-id" not in catalog
+    assert catalog["friendly-id"]["manifest"]["model_id"] == "friendly-id"
+    assert catalog["friendly-id"]["source"] == "fake://anything"
+
+
+def test_pull_curated_bundled_alias_uses_bundled_path(tmp_catalog):
+    """A curated entry with `bundled: true` should route through the
+    bundled-script path, not the resolver path."""
+    from muse.core.catalog import pull, is_pulled
+    from muse.core.curated import CuratedEntry
+
+    fake_curated = CuratedEntry(
+        id="kokoro-82m",
+        bundled=True,
+        uri=None,
+        modality="audio/speech",
+        size_gb=None,
+        description=None,
+        tags=(),
+    )
+    with patch("muse.core.catalog.find_curated", return_value=fake_curated), \
+         patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("kokoro-82m")
+    assert is_pulled("kokoro-82m")
+    # Bundled path: no `manifest` field persisted (legacy shape)
+    assert "manifest" not in _read_catalog()["kokoro-82m"]
+
+
+def test_pull_bare_id_unaffected_by_curated_cache(tmp_catalog):
+    """Regression: pulling a bare bundled id that's NOT in the curated list
+    works exactly as before (no spurious dispatch)."""
+    from muse.core.catalog import pull, is_pulled
+    from muse.core.curated import _reset_curated_cache_for_tests
+
+    _reset_curated_cache_for_tests()
+    # find_curated returns None for the real "soprano-80m" if the YAML's
+    # bundled entry is `kokoro-82m` etc. — make it explicit:
+    with patch("muse.core.catalog.find_curated", return_value=None), \
+         patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("soprano-80m")
+    assert is_pulled("soprano-80m")
