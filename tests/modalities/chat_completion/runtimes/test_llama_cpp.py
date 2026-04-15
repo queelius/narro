@@ -160,3 +160,59 @@ def test_llama_cpp_raises_on_missing_gguf_file(tmp_path):
                 model_id="x", hf_repo="x",
                 local_dir=str(tmp_path), gguf_file="does-not-exist.gguf",
             )
+
+
+def test_llama_cpp_result_model_id_overrides_llamacpp_path(tmp_path):
+    """Regression (v0.11.4): llama-cpp sets response['model'] to the GGUF
+    filesystem path. We must override with the muse catalog id so OpenAI
+    clients see `qwen3.5-4b-q4`, not `/home/.../model.gguf`."""
+    local_dir, gguf = _with_existing_gguf(tmp_path)
+    with patch("muse.modalities.chat_completion.runtimes.llama_cpp.Llama") as mock_cls:
+        fake_llama = MagicMock()
+        # Simulate the real llama-cpp behavior: response['model'] is the
+        # filesystem path, not the catalog id.
+        fake_llama.create_chat_completion.return_value = {
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 0,
+            "model": f"/home/spinoza/.muse/weights/.../{gguf}",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        mock_cls.return_value = fake_llama
+        from muse.modalities.chat_completion.runtimes.llama_cpp import LlamaCppModel
+        m = LlamaCppModel(
+            model_id="qwen3.5-4b-q4",
+            hf_repo="x", local_dir=str(local_dir), gguf_file=gguf,
+        )
+        result = m.chat(messages=[{"role": "user", "content": "hi"}])
+    # Catalog id wins, not the filesystem path
+    assert result.model_id == "qwen3.5-4b-q4"
+    assert "/home/" not in result.model_id
+    assert ".gguf" not in result.model_id
+
+
+def test_llama_cpp_stream_chunk_model_id_overrides_llamacpp_path(tmp_path):
+    """Same regression for streaming chunks."""
+    local_dir, gguf = _with_existing_gguf(tmp_path)
+    with patch("muse.modalities.chat_completion.runtimes.llama_cpp.Llama") as mock_cls:
+        fake_llama = MagicMock()
+        fake_llama.create_chat_completion.return_value = iter([
+            {"id": "c", "object": "chat.completion.chunk", "created": 0,
+             "model": f"/home/spinoza/.muse/weights/.../{gguf}",
+             "choices": [{"index": 0, "delta": {"content": "a"}, "finish_reason": None}]},
+            {"id": "c", "object": "chat.completion.chunk", "created": 0,
+             "model": f"/home/spinoza/.muse/weights/.../{gguf}",
+             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ])
+        mock_cls.return_value = fake_llama
+        from muse.modalities.chat_completion.runtimes.llama_cpp import LlamaCppModel
+        m = LlamaCppModel(
+            model_id="qwen3.5-4b-q4",
+            hf_repo="x", local_dir=str(local_dir), gguf_file=gguf,
+        )
+        chunks = list(m.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    # Every chunk's model_id is the catalog id, NOT the path
+    assert all(c.model_id == "qwen3.5-4b-q4" for c in chunks)
+    assert not any("/home/" in c.model_id for c in chunks)

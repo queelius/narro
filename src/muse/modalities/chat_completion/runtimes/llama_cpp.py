@@ -96,7 +96,7 @@ class LlamaCppModel:
             stream=False,
             **_filter_kwargs(kwargs),
         )
-        return _dict_to_chat_result(resp, fallback_model_id=self.model_id)
+        return _dict_to_chat_result(resp, model_id=self.model_id)
 
     def chat_stream(self, messages: list[dict], **kwargs) -> Iterator[ChatChunk]:
         for chunk in self._llama.create_chat_completion(
@@ -104,7 +104,7 @@ class LlamaCppModel:
             stream=True,
             **_filter_kwargs(kwargs),
         ):
-            yield _dict_to_chat_chunk(chunk, fallback_model_id=self.model_id)
+            yield _dict_to_chat_chunk(chunk, model_id=self.model_id)
 
 
 _FORWARDED_KWARGS = frozenset({
@@ -120,10 +120,16 @@ def _filter_kwargs(kwargs: dict) -> dict:
     return {k: v for k, v in kwargs.items() if k in _FORWARDED_KWARGS}
 
 
-def _dict_to_chat_result(resp: dict, *, fallback_model_id: str) -> ChatResult:
+def _dict_to_chat_result(resp: dict, *, model_id: str) -> ChatResult:
+    """Translate llama-cpp's OpenAI-shape response to our ChatResult.
+
+    `model_id` is authoritative: llama-cpp sets the response's `model`
+    field to the GGUF filesystem path (e.g. /home/.../model.gguf),
+    which is useless to clients. We always override with our catalog id.
+    """
     return ChatResult(
         id=resp.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}",
-        model_id=resp.get("model") or fallback_model_id,
+        model_id=model_id,
         created=resp.get("created") or int(time.time()),
         choices=[
             ChatChoice(
@@ -137,12 +143,16 @@ def _dict_to_chat_result(resp: dict, *, fallback_model_id: str) -> ChatResult:
     )
 
 
-def _dict_to_chat_chunk(chunk: dict, *, fallback_model_id: str) -> ChatChunk:
+def _dict_to_chat_chunk(chunk: dict, *, model_id: str) -> ChatChunk:
+    """Translate a llama-cpp stream chunk to our ChatChunk.
+
+    Same model_id-override rationale as _dict_to_chat_result.
+    """
     choices = chunk.get("choices") or []
     c = choices[0] if choices else {"index": 0, "delta": {}, "finish_reason": None}
     return ChatChunk(
         id=chunk.get("id") or "chatcmpl-stream",
-        model_id=chunk.get("model") or fallback_model_id,
+        model_id=model_id,
         created=chunk.get("created") or int(time.time()),
         choice_index=c.get("index", 0),
         delta=c.get("delta") or {},
