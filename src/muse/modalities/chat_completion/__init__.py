@@ -9,6 +9,7 @@ events.
 Models declaring `modality = "chat/completion"` in their MANIFEST and
 satisfying the ChatModel protocol plug into this modality.
 """
+from muse.modalities.chat_completion.client import ChatClient
 from muse.modalities.chat_completion.protocol import (
     ChatChoice,
     ChatChunk,
@@ -20,11 +21,10 @@ from muse.modalities.chat_completion.routes import build_router
 
 MODALITY = "chat/completion"
 
-# NOTE: ChatClient (Task B4) will be re-exported here when it lands.
-
 __all__ = [
     "MODALITY",
     "build_router",
+    "ChatClient",
     "ChatChoice",
     "ChatChunk",
     "ChatMessage",
