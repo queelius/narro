@@ -60,9 +60,11 @@ class LlamaCppModel:
         local_dir: str | None = None,
         gguf_file: str,
         context_length: int = 8192,
-        chat_template: str | None = None,
+        chat_format: str | None = None,
+        chat_template: str | None = None,  # deprecated alias for chat_format
         n_gpu_layers: int = -1,
         device: str = "auto",
+        supports_tools: bool | None = None,  # consumed; not forwarded
         **_: Any,
     ) -> None:
         _ensure_deps()
@@ -72,6 +74,12 @@ class LlamaCppModel:
                 "install `llama-cpp-python` into this venv"
             )
         self.model_id = model_id
+        # `chat_format` is the canonical kwarg (matches llama-cpp-python's API);
+        # `chat_template` is kept as a deprecated alias for back-compat with
+        # earlier muse manifests that used the wrong name.
+        effective_chat_format = chat_format if chat_format is not None else chat_template
+        # Stash for the chat-time tools warning (see routes.py).
+        self.supports_tools = supports_tools
         if not local_dir:
             raise RuntimeError("local_dir is required; the GGUF file must be on disk")
         base = Path(local_dir)
@@ -79,14 +87,14 @@ class LlamaCppModel:
         if not gguf_path.exists():
             raise FileNotFoundError(f"GGUF file not found: {gguf_path}")
         logger.info(
-            "loading GGUF %s (ctx=%d, gpu_layers=%d, chat_template=%s)",
-            gguf_path, context_length, n_gpu_layers, chat_template,
+            "loading GGUF %s (ctx=%d, gpu_layers=%d, chat_format=%s)",
+            gguf_path, context_length, n_gpu_layers, effective_chat_format,
         )
         self._llama = Llama(
             model_path=str(gguf_path),
             n_ctx=context_length,
             n_gpu_layers=n_gpu_layers,
-            chat_format=chat_template,
+            chat_format=effective_chat_format,
             verbose=False,
         )
 

@@ -129,16 +129,70 @@ def test_llama_cpp_raises_clear_error_when_deps_missing(tmp_path):
             )
 
 
-def test_llama_cpp_accepts_chat_template_override(tmp_path):
+def test_llama_cpp_accepts_chat_format_kwarg(tmp_path):
+    """chat_format is the canonical kwarg (matches llama-cpp-python's API)."""
     local_dir, gguf = _with_existing_gguf(tmp_path)
     with patch("muse.modalities.chat_completion.runtimes.llama_cpp.Llama") as mock_cls:
         mock_cls.return_value = MagicMock()
         from muse.modalities.chat_completion.runtimes.llama_cpp import LlamaCppModel
         LlamaCppModel(
             model_id="x", hf_repo="x", local_dir=str(local_dir),
-            gguf_file=gguf, chat_template="chatml",
+            gguf_file=gguf, chat_format="chatml-function-calling",
         )
-        assert mock_cls.call_args.kwargs.get("chat_format") == "chatml"
+        assert mock_cls.call_args.kwargs.get("chat_format") == "chatml-function-calling"
+
+
+def test_llama_cpp_accepts_chat_template_alias_for_chat_format(tmp_path):
+    """chat_template is a deprecated alias kept for back-compat with earlier
+    muse manifests that used the wrong name. chat_format wins when both set."""
+    local_dir, gguf = _with_existing_gguf(tmp_path)
+    with patch("muse.modalities.chat_completion.runtimes.llama_cpp.Llama") as mock_cls:
+        mock_cls.return_value = MagicMock()
+        from muse.modalities.chat_completion.runtimes.llama_cpp import LlamaCppModel
+        # Only chat_template set: still wired through
+        LlamaCppModel(
+            model_id="x", hf_repo="x", local_dir=str(local_dir),
+            gguf_file=gguf, chat_template="qwen",
+        )
+        assert mock_cls.call_args.kwargs.get("chat_format") == "qwen"
+        # Both set: chat_format wins
+        mock_cls.reset_mock()
+        LlamaCppModel(
+            model_id="y", hf_repo="x", local_dir=str(local_dir),
+            gguf_file=gguf,
+            chat_format="chatml-function-calling",
+            chat_template="legacy-name",
+        )
+        assert mock_cls.call_args.kwargs.get("chat_format") == "chatml-function-calling"
+
+
+def test_llama_cpp_stashes_supports_tools_for_route_warning(tmp_path):
+    """The route reads model.supports_tools to decide whether to warn.
+    LlamaCppModel must accept and store the manifest's supports_tools value."""
+    local_dir, gguf = _with_existing_gguf(tmp_path)
+    with patch("muse.modalities.chat_completion.runtimes.llama_cpp.Llama") as mock_cls:
+        mock_cls.return_value = MagicMock()
+        from muse.modalities.chat_completion.runtimes.llama_cpp import LlamaCppModel
+        for value in (True, False, None):
+            m = LlamaCppModel(
+                model_id="x", hf_repo="x", local_dir=str(local_dir),
+                gguf_file=gguf, supports_tools=value,
+            )
+            assert m.supports_tools is value
+
+
+def test_llama_cpp_does_not_forward_supports_tools_to_llama(tmp_path):
+    """supports_tools is muse-side metadata, NOT a llama-cpp constructor arg.
+    Passing it to Llama() would raise TypeError."""
+    local_dir, gguf = _with_existing_gguf(tmp_path)
+    with patch("muse.modalities.chat_completion.runtimes.llama_cpp.Llama") as mock_cls:
+        mock_cls.return_value = MagicMock()
+        from muse.modalities.chat_completion.runtimes.llama_cpp import LlamaCppModel
+        LlamaCppModel(
+            model_id="x", hf_repo="x", local_dir=str(local_dir),
+            gguf_file=gguf, supports_tools=True,
+        )
+    assert "supports_tools" not in mock_cls.call_args.kwargs
 
 
 def test_llama_cpp_n_gpu_layers_default_is_all(tmp_path):

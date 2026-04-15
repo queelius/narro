@@ -125,11 +125,22 @@ class HFResolver(Resolver):
         supports_tools = _try_sniff_tools_from_repo(self._api, repo_id)
         ctx_length = _try_sniff_context_length_from_repo(self._api, repo_id)
 
+        # Look up curated chat-format hints (chat_formats.yaml). The
+        # lookup table is the source of truth for "this model family
+        # works with this llama.cpp chat handler" and lets users get
+        # working tool calls without hand-editing manifests. The hints
+        # also override the supports_tools sniff result when they
+        # disagree (the YAML is curated; the sniff is heuristic).
+        from muse.core.chat_formats import lookup_chat_format
+        hints = lookup_chat_format(repo_id) or {}
+
         model_id = _gguf_model_id(repo_id, variant)
         capabilities: dict[str, Any] = {
             "gguf_file": matched,
-            "supports_tools": supports_tools,
+            "supports_tools": hints.get("supports_tools", supports_tools),
         }
+        if "chat_format" in hints:
+            capabilities["chat_format"] = hints["chat_format"]
         if ctx_length:
             capabilities["context_length"] = ctx_length
 

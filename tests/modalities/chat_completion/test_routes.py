@@ -163,3 +163,86 @@ def test_tools_passthrough_to_backend():
     assert seen["tools"] == tools
     assert seen["tool_choice"] == "auto"
     assert seen["temperature"] == 0.2
+
+
+# --- v0.11.5: tools-with-unknown-support warning ---------------------------
+
+
+def _model_with_supports_tools(value):
+    """A tiny FakeChatModel whose supports_tools attribute is settable."""
+    class _M:
+        model_id = "tools-test"
+        supports_tools = value
+        def chat(self, messages, **kwargs):
+            return ChatResult(
+                id="x", model_id=self.model_id, created=0,
+                choices=[ChatChoice(index=0, message={"role":"assistant","content":""}, finish_reason="stop")],
+                usage={"prompt_tokens":0,"completion_tokens":0,"total_tokens":0},
+            )
+        def chat_stream(self, messages, **kwargs):
+            return iter([])
+    return _M()
+
+
+def _client_for(model):
+    reg = ModalityRegistry()
+    reg.register("chat/completion", model)
+    app = create_app(registry=reg, routers={"chat/completion": build_router(reg)})
+    return TestClient(app)
+
+
+def test_route_warns_when_tools_requested_and_supports_tools_is_None(caplog):
+    """capabilities.supports_tools == None means 'unknown'; warn at chat time."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="muse.modalities.chat_completion.routes")
+    client = _client_for(_model_with_supports_tools(None))
+    r = client.post("/v1/chat/completions", json={
+        "model": "tools-test",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}],
+    })
+    assert r.status_code == 200
+    assert "unknown" in caplog.text.lower()
+    assert "tools-test" in caplog.text
+
+
+def test_route_warns_when_tools_requested_and_supports_tools_is_False(caplog):
+    """capabilities.supports_tools == False means 'known not to support'; warn."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="muse.modalities.chat_completion.routes")
+    client = _client_for(_model_with_supports_tools(False))
+    r = client.post("/v1/chat/completions", json={
+        "model": "tools-test",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}],
+    })
+    assert r.status_code == 200
+    assert "not known to support" in caplog.text.lower()
+
+
+def test_route_silent_when_tools_requested_and_supports_tools_is_True(caplog):
+    """capabilities.supports_tools == True: silent (we believe tools work)."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="muse.modalities.chat_completion.routes")
+    client = _client_for(_model_with_supports_tools(True))
+    r = client.post("/v1/chat/completions", json={
+        "model": "tools-test",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}],
+    })
+    assert r.status_code == 200
+    # No tool-related warnings
+    assert "tool" not in caplog.text.lower() or "warning" not in caplog.text.lower()
+
+
+def test_route_silent_when_no_tools_requested(caplog):
+    """No tools in request: never warn, even if supports_tools is None."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="muse.modalities.chat_completion.routes")
+    client = _client_for(_model_with_supports_tools(None))
+    r = client.post("/v1/chat/completions", json={
+        "model": "tools-test",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200
+    assert caplog.text == ""

@@ -275,3 +275,58 @@ def test_hf_resolver_registers_on_import():
     from muse.core.resolvers import get_resolver
     r = get_resolver("hf://anything/anywhere")
     assert r.scheme == "hf"
+
+
+def test_resolve_gguf_applies_chat_format_hints_from_yaml():
+    """When chat_formats.yaml has a pattern matching the repo, the resolver
+    populates capabilities.chat_format and capabilities.supports_tools."""
+    from muse.core.resolvers_hf import HFResolver
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi, \
+         patch("muse.core.resolvers_hf._try_sniff_tools_from_repo", return_value=None), \
+         patch("muse.core.resolvers_hf._try_sniff_context_length_from_repo", return_value=None), \
+         patch("muse.core.chat_formats.lookup_chat_format", return_value={
+             "chat_format": "chatml-function-calling",
+             "supports_tools": True,
+         }):
+        MockApi.return_value.repo_info.return_value = _fake_repo_info(
+            siblings=["model-q4_k_m.gguf"],
+            tags=["text-generation"],
+        )
+        rm = HFResolver().resolve("hf://unsloth/Qwen3.5-4B-GGUF@q4_k_m")
+    caps = rm.manifest["capabilities"]
+    assert caps["chat_format"] == "chatml-function-calling"
+    assert caps["supports_tools"] is True
+
+
+def test_resolve_gguf_yaml_supports_tools_overrides_sniff_result():
+    """If sniff returned None but YAML says True, YAML wins (it's curated)."""
+    from muse.core.resolvers_hf import HFResolver
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi, \
+         patch("muse.core.resolvers_hf._try_sniff_tools_from_repo", return_value=None), \
+         patch("muse.core.resolvers_hf._try_sniff_context_length_from_repo", return_value=None), \
+         patch("muse.core.chat_formats.lookup_chat_format", return_value={
+             "supports_tools": True,
+         }):
+        MockApi.return_value.repo_info.return_value = _fake_repo_info(
+            siblings=["model-q4_k_m.gguf"],
+            tags=[],
+        )
+        rm = HFResolver().resolve("hf://acme/some-model-GGUF@q4_k_m")
+    assert rm.manifest["capabilities"]["supports_tools"] is True
+
+
+def test_resolve_gguf_no_yaml_match_leaves_supports_tools_as_sniff_value():
+    """Unknown repo: capabilities.chat_format absent, supports_tools = sniff."""
+    from muse.core.resolvers_hf import HFResolver
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi, \
+         patch("muse.core.resolvers_hf._try_sniff_tools_from_repo", return_value=None), \
+         patch("muse.core.resolvers_hf._try_sniff_context_length_from_repo", return_value=None), \
+         patch("muse.core.chat_formats.lookup_chat_format", return_value=None):
+        MockApi.return_value.repo_info.return_value = _fake_repo_info(
+            siblings=["model-q4_k_m.gguf"],
+            tags=[],
+        )
+        rm = HFResolver().resolve("hf://nobody/random-GGUF@q4_k_m")
+    caps = rm.manifest["capabilities"]
+    assert "chat_format" not in caps
+    assert caps["supports_tools"] is None  # sniff returned None and no YAML hint

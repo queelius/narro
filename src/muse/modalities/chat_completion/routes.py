@@ -97,6 +97,30 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
         model = _get_model(req.model)
         kwargs = req.backend_kwargs()
 
+        # If the request asks for tool calling, warn when the loaded
+        # model isn't known to support it. Tool-call quality is a
+        # property of the model + chat_format combination; muse doesn't
+        # block the request, but a warning lets the user know structured
+        # tool_calls may not appear and the model may emit raw text in
+        # `content` instead.
+        if req.tools is not None:
+            supports = getattr(model, "supports_tools", None)
+            if supports is False:
+                logger.warning(
+                    "model %s is not known to support tool calling; "
+                    "structured tool_calls may not appear in the response",
+                    getattr(model, "model_id", "?"),
+                )
+            elif supports is None:
+                logger.warning(
+                    "tool support for model %s is unknown; "
+                    "structured tool_calls may not appear in the response. "
+                    "If you know this model works, set "
+                    "capabilities.chat_format in its manifest "
+                    "(see docs/CHAT_COMPLETION.md)",
+                    getattr(model, "model_id", "?"),
+                )
+
         if not req.stream:
             result = await asyncio.to_thread(model.chat, req.messages, **kwargs)
             return result_to_openai_dict(result)
