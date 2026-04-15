@@ -71,24 +71,27 @@ def test_registry_stored_on_app_state():
     assert app.state.registry is reg
 
 
-def test_v1_models_registry_fields_win_over_extra():
-    """Authoritative fields (id, modality, object) must never be clobbered by extra."""
+def test_v1_models_registry_fields_win_over_manifest():
+    """Authoritative fields (id, modality, object) must never be clobbered by manifest."""
     reg = ModalityRegistry()
 
     class HostileModel:
         model_id = "real-id"
-        # Attributes that, if harvested into extra, would collide with authoritative fields.
-        # None of these names are in registry._extra's current allowlist, but the server
-        # must be defensive regardless.
-        pass
 
-    reg.register("audio/speech", HostileModel())
-    # Manually inject collision keys into the ModelInfo.extra to simulate a future
-    # backend that exposes them.
-    info = reg.list_all()[0]
-    info.extra["id"] = "IMPOSTOR"
-    info.extra["modality"] = "wrong"
-    info.extra["object"] = "evil"
+    # A manifest whose top-level + capabilities both try to override the
+    # authoritative fields. The server must ignore all three overrides.
+    hostile_manifest = {
+        "model_id": "real-id",
+        "modality": "audio/speech",
+        "id": "IMPOSTOR",           # collides with authoritative "id"
+        "object": "evil",           # collides with authoritative "object"
+        "capabilities": {
+            "id": "ALSO-IMPOSTOR",
+            "modality": "wrong",
+            "object": "evil-cap",
+        },
+    }
+    reg.register("audio/speech", HostileModel(), manifest=hostile_manifest)
 
     app = create_app(registry=reg, routers={})
     client = TestClient(app)
@@ -98,6 +101,39 @@ def test_v1_models_registry_fields_win_over_extra():
     assert data[0]["id"] == "real-id"
     assert data[0]["modality"] == "audio/speech"
     assert data[0]["object"] == "model"
+
+
+def test_v1_models_exposes_capabilities_and_metadata_from_manifest():
+    """Capabilities, description, license, hf_repo from the manifest flow to /v1/models."""
+    reg = ModalityRegistry()
+
+    class Fake:
+        model_id = "kokoro-82m"
+
+    manifest = {
+        "model_id": "kokoro-82m",
+        "modality": "audio/speech",
+        "hf_repo": "hexgrad/Kokoro-82M",
+        "description": "Lightweight TTS, 54 voices, 24kHz",
+        "license": "Apache 2.0",
+        "capabilities": {
+            "sample_rate": 24000,
+            "voices": ["af_heart", "am_adam"],
+        },
+    }
+    reg.register("audio/speech", Fake(), manifest=manifest)
+
+    app = create_app(registry=reg, routers={})
+    client = TestClient(app)
+    r = client.get("/v1/models")
+    entry = r.json()["data"][0]
+    # Top-level metadata
+    assert entry["hf_repo"] == "hexgrad/Kokoro-82M"
+    assert entry["description"] == "Lightweight TTS, 54 voices, 24kHz"
+    assert entry["license"] == "Apache 2.0"
+    # Capabilities projected to top level
+    assert entry["sample_rate"] == 24000
+    assert entry["voices"] == ["af_heart", "am_adam"]
 
 
 def test_model_not_found_error_serializes_openai_shape():

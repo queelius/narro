@@ -284,3 +284,21 @@ def load_backend(model_id: str, **kwargs) -> Any:
     catalog = _read_catalog()
     local_dir = catalog[model_id]["local_dir"]
     return cls(hf_repo=entry.hf_repo, local_dir=local_dir, **kwargs)
+
+
+def get_manifest(model_id: str) -> dict:
+    """Return the MANIFEST dict from a known model's script.
+
+    Looks up the model's module via its CatalogEntry.backend_path, then
+    reads the module-level MANIFEST. Returns a copy so callers can mutate
+    without affecting the source.
+
+    Raises KeyError if the model is not in `known_models()`.
+    """
+    catalog_known = known_models()
+    if model_id not in catalog_known:
+        raise KeyError(f"unknown model {model_id!r}; known: {sorted(catalog_known)}")
+    entry = catalog_known[model_id]
+    module_path, _ = entry.backend_path.split(":", 1)
+    module = importlib.import_module(module_path)
+    return dict(getattr(module, "MANIFEST", {}))

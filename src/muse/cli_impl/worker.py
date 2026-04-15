@@ -12,7 +12,7 @@ import logging
 
 import uvicorn
 
-from muse.core.catalog import is_pulled, known_models, load_backend
+from muse.core.catalog import get_manifest, is_pulled, known_models, load_backend
 from muse.core.registry import ModalityRegistry
 from muse.core.server import create_app
 
@@ -49,7 +49,8 @@ def run_worker(*, host: str, port: int, models: list[str], device: str) -> int:
         except Exception as e:
             log.error("failed to load %s: %s", model_id, e)
             continue
-        registry.register(entry.modality, backend)
+        manifest = get_manifest(model_id)
+        registry.register(entry.modality, backend, manifest=manifest)
 
     # Always mount all modality routers so empty-registry requests get
     # the OpenAI envelope rather than FastAPI's default {"detail": "Not Found"}.

@@ -104,10 +104,33 @@ def test_get_error_messages_include_available_options(reg):
     """Errors should tell the operator what's actually available."""
     reg.register("audio/speech", FakeAudioModel(model_id="tts-1"))
 
-    # Missing modality → lists known modalities
+    # Missing modality -> lists known modalities
     with pytest.raises(KeyError, match="known modalities"):
         reg.get("video.clips")
 
-    # Wrong model_id in a valid modality → lists available in that modality
+    # Wrong model_id in a valid modality -> lists available in that modality
     with pytest.raises(KeyError, match="available.*tts-1"):
         reg.get("audio/speech", "tts-99")
+
+
+def test_register_stores_manifest_on_modelinfo(reg):
+    """Manifest passed to register() flows to ModelInfo unchanged."""
+    m = FakeAudioModel()
+    manifest = {
+        "model_id": "fake-tts",
+        "modality": "audio/speech",
+        "capabilities": {"sample_rate": 16000, "voices": ["a", "b"]},
+        "license": "CC0",
+    }
+    reg.register("audio/speech", m, manifest=manifest)
+    info = reg.list_models("audio/speech")[0]
+    assert info.manifest == manifest
+
+
+def test_register_without_manifest_gets_minimal_stub(reg):
+    """Registration without a manifest still populates the required keys."""
+    reg.register("audio/speech", FakeAudioModel(model_id="anon"))
+    info = reg.list_models("audio/speech")[0]
+    # Minimal stub so downstream consumers never hit a KeyError on these
+    assert info.manifest["model_id"] == "anon"
+    assert info.manifest["modality"] == "audio/speech"

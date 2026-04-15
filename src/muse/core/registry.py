@@ -2,7 +2,12 @@
 
 Registry shape: {modality: {model_id: Model}}.
 First model registered per modality becomes its default.
-Each modality is independent — no shared protocol between audio and image models.
+Each modality is independent; no shared protocol between audio and image models.
+
+Registration carries a MANIFEST dict (the one declared in the model's
+script) that the server surfaces via /v1/models. Capabilities,
+description, license, and hf_repo flow straight from the manifest to the
+API response; nothing is gathered by hardcoded attribute allowlist.
 """
 from __future__ import annotations
 
@@ -12,10 +17,16 @@ from typing import Any
 
 @dataclass
 class ModelInfo:
-    """Registry metadata for a loaded model."""
+    """Registry metadata for a loaded model.
+
+    `manifest` holds the full MANIFEST dict from the model's script
+    (or an empty dict for tests / hand-registered models that skip it).
+    Replaces the old `extra` field populated by a hardcoded attribute
+    allowlist.
+    """
     modality: str
     model_id: str
-    extra: dict = field(default_factory=dict)
+    manifest: dict = field(default_factory=dict)
 
 
 class ModalityRegistry:
@@ -27,12 +38,30 @@ class ModalityRegistry:
 
     def __init__(self) -> None:
         self._models: dict[str, dict[str, Any]] = {}
+        self._manifests: dict[str, dict[str, dict]] = {}
         self._defaults: dict[str, str] = {}
 
-    def register(self, modality: str, model: Any) -> None:
-        """Register a model under a modality. First registered becomes default."""
+    def register(
+        self,
+        modality: str,
+        model: Any,
+        manifest: dict | None = None,
+    ) -> None:
+        """Register a model under a modality.
+
+        First registered becomes default. `manifest` is stored verbatim
+        and surfaced via list_models / list_all. When omitted a minimal
+        stub `{"model_id", "modality"}` is used so ModelInfo consumers
+        always see the two required keys.
+        """
         models = self._models.setdefault(modality, {})
         models[model.model_id] = model
+        self._manifests.setdefault(modality, {})[model.model_id] = (
+            manifest if manifest is not None else {
+                "model_id": model.model_id,
+                "modality": modality,
+            }
+        )
         self._defaults.setdefault(modality, model.model_id)
 
     def get(self, modality: str, model_id: str | None = None) -> Any:
@@ -63,8 +92,12 @@ class ModalityRegistry:
 
     def list_models(self, modality: str) -> list[ModelInfo]:
         return [
-            ModelInfo(modality=modality, model_id=mid, extra=_extra(m))
-            for mid, m in self._models.get(modality, {}).items()
+            ModelInfo(
+                modality=modality,
+                model_id=mid,
+                manifest=self._manifests.get(modality, {}).get(mid, {}),
+            )
+            for mid in self._models.get(modality, {})
         ]
 
     def list_all(self) -> list[ModelInfo]:
@@ -75,16 +108,6 @@ class ModalityRegistry:
 
     def modalities(self) -> list[str]:
         return list(self._models.keys())
-
-
-
-def _extra(model: Any) -> dict:
-    """Pull commonly-exposed metadata from a model without assuming a base class."""
-    extra: dict = {}
-    for attr in ("sample_rate", "default_size", "voices", "description"):
-        if hasattr(model, attr):
-            extra[attr] = getattr(model, attr)
-    return extra
 
 
 # Module-level singleton. Modalities register into this at server startup.

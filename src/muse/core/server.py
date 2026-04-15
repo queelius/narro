@@ -65,7 +65,18 @@ def create_app(
     def list_models():
         data = []
         for info in registry.list_all():
-            entry = {**info.extra, "id": info.model_id, "modality": info.modality, "object": "model"}
+            entry: dict = {}
+            # Splat capabilities (sample_rate, voices, default_size, ...) first
+            entry.update(info.manifest.get("capabilities", {}))
+            # Then top-level manifest metadata when present
+            for k in ("description", "license", "hf_repo"):
+                if k in info.manifest:
+                    entry[k] = info.manifest[k]
+            # Authoritative fields written last so nothing in the manifest
+            # or capabilities can clobber id/modality/object.
+            entry["id"] = info.model_id
+            entry["modality"] = info.modality
+            entry["object"] = "model"
             data.append(entry)
         return {"object": "list", "data": data}
 
