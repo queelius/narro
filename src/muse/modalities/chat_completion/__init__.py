@@ -16,16 +16,15 @@ from muse.modalities.chat_completion.protocol import (
     ChatModel,
     ChatResult,
 )
+from muse.modalities.chat_completion.routes import build_router
 
 MODALITY = "chat/completion"
 
-# NOTE: build_router (Task B3) and ChatClient (Task B4) will be
-# re-exported here when those land. Keeping __init__.py minimal until
-# then so discover_modalities() can import this package without
-# chasing missing submodules.
+# NOTE: ChatClient (Task B4) will be re-exported here when it lands.
 
 __all__ = [
     "MODALITY",
+    "build_router",
     "ChatChoice",
     "ChatChunk",
     "ChatMessage",
