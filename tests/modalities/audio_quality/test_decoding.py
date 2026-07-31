@@ -14,6 +14,7 @@ def _decoder(
     reported_seconds=None,
     channels=1,
     raise_at_eof=False,
+    first_range_pts_offset=0.0,
 ):
     instances = []
 
@@ -39,13 +40,18 @@ def _decoder(
                     "No audio frames were decoded. This is probably because "
                     "start_seconds is too high"
                 )
+            sample_start = start_seconds
+            if len(self.calls) == 1:
+                sample_start += first_range_pts_offset
             duration = max(
                 0.0,
-                min(stop_seconds, actual_seconds) - start_seconds,
+                min(stop_seconds, actual_seconds) - sample_start,
             )
             sample_count = round(duration * self.sample_rate)
             return SimpleNamespace(
                 data=torch.ones(channels, sample_count),
+                pts_seconds=sample_start,
+                duration_seconds=duration,
             )
 
     monkeypatch.setattr(decoding, "AudioDecoder", _Decoder)
@@ -73,6 +79,84 @@ def test_decodes_fixed_ranges_and_downmixes(monkeypatch):
     assert all(window.waveform.shape[0] == 1 for window in windows)
     assert instances[0].num_channels == 1
     assert instances[0].calls == [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)]
+
+
+def test_short_compressed_interior_range_does_not_end_decode(monkeypatch):
+    instances = _decoder(
+        monkeypatch,
+        actual_seconds=28,
+        first_range_pts_offset=0.023,
+    )
+    reader = decoding.WindowedAudio(
+        "chapter.mp3",
+        sample_rate=16000,
+        window_seconds=10,
+        max_duration_seconds=60,
+    )
+
+    windows = list(reader)
+
+    assert [(w.start_seconds, w.end_seconds) for w in windows] == [
+        (0.023, 10.0),
+        (10.0, 20.0),
+        (20.0, 28.0),
+    ]
+    assert instances[0].calls == [
+        (0.0, 10.0),
+        (10.0, 20.0),
+        (20.0, 30.0),
+    ]
+
+
+def test_overreported_duration_does_not_extend_partial_eof(monkeypatch):
+    instances = _decoder(
+        monkeypatch,
+        actual_seconds=28,
+        reported_seconds=38,
+        raise_at_eof=True,
+    )
+    reader = decoding.WindowedAudio(
+        "overreported.mp3",
+        sample_rate=16000,
+        window_seconds=10,
+        max_duration_seconds=60,
+    )
+
+    windows = list(reader)
+
+    assert [(w.start_seconds, w.end_seconds) for w in windows] == [
+        (0.0, 10.0),
+        (10.0, 20.0),
+        (20.0, 28.0),
+    ]
+    assert instances[0].calls == [
+        (0.0, 10.0),
+        (10.0, 20.0),
+        (20.0, 30.0),
+    ]
+
+
+def test_overreported_duration_treats_no_frames_as_eof(monkeypatch):
+    instances = _decoder(
+        monkeypatch,
+        actual_seconds=20,
+        reported_seconds=38,
+        raise_at_eof=True,
+    )
+    reader = decoding.WindowedAudio(
+        "overreported.mp3",
+        sample_rate=16000,
+        window_seconds=10,
+        max_duration_seconds=60,
+    )
+
+    windows = list(reader)
+
+    assert [(w.start_seconds, w.end_seconds) for w in windows] == [
+        (0.0, 10.0),
+        (10.0, 20.0),
+    ]
+    assert instances[0].calls[-1] == (20.0, 30.0)
 
 
 def test_rejects_duration_from_metadata_before_decoding(monkeypatch):

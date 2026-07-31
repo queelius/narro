@@ -16,6 +16,7 @@ from muse.modalities.audio_quality.protocol import (
 logger = logging.getLogger(__name__)
 torch: Any = None
 AesMultiOutput: Any = None
+MINIMUM_REVIEW_WINDOW_SECONDS = 1.0
 
 
 _AXES = (
@@ -187,8 +188,20 @@ class AudioboxAestheticsRuntime:
             )
             for name, value in values.items()
         }
+        eligible_review_segments = [
+            segment for segment in segments
+            if (
+                segment["end_seconds"] - segment["start_seconds"]
+                >= MINIMUM_REVIEW_WINDOW_SECONDS
+            )
+        ]
+        review_segments = eligible_review_segments or segments
         worst = min(
             segments,
+            key=lambda segment: segment["scores"]["production_quality"],
+        )
+        worst_review = min(
+            review_segments,
             key=lambda segment: segment["scores"]["production_quality"],
         )
         return AudioQualityResult(
@@ -203,5 +216,12 @@ class AudioboxAestheticsRuntime:
                 "aggregation": "duration_weighted_mean",
                 "segments": segments,
                 "worst_segment": worst,
+                "worst_review_segment": worst_review,
+                "minimum_review_window_seconds": (
+                    MINIMUM_REVIEW_WINDOW_SECONDS
+                ),
+                "short_review_windows_excluded": (
+                    len(segments) - len(review_segments)
+                ),
             },
         )

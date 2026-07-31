@@ -108,14 +108,7 @@ class WindowedAudio:
             )
         except RuntimeError as exc:
             no_frames = "no audio frames were decoded" in str(exc).lower()
-            known_end = self.source_duration_seconds
-            at_known_end = (
-                known_end is not None
-                and start_seconds >= known_end - (1.0 / self.sample_rate)
-            )
-            if allow_eof and no_frames and (
-                known_end is None or at_known_end
-            ):
+            if allow_eof and no_frames:
                 return None
             raise
 
@@ -148,16 +141,23 @@ class WindowedAudio:
 
             saw_samples = True
             decoded_seconds = sample_count / self.sample_rate
-            end = min(start + decoded_seconds, stop)
+            sample_pts = getattr(samples, "pts_seconds", None)
+            sample_start = (
+                start if sample_pts is None else float(sample_pts)
+            )
+            sample_end = min(sample_start + decoded_seconds, stop)
             yield AudioWindow(
                 waveform=waveform,
                 sample_rate=self.sample_rate,
-                start_seconds=start,
-                end_seconds=end,
+                start_seconds=sample_start,
+                end_seconds=sample_end,
             )
 
-            requested_seconds = stop - start
-            if decoded_seconds + one_sample < requested_seconds:
+            # Encoder delay can make the first compressed range shorter than
+            # requested even though its samples still reach ``stop``. Use the
+            # decoded presentation range, rather than fallible container
+            # duration metadata, to distinguish that case from a true EOF.
+            if sample_end + one_sample < stop:
                 break
             start = stop
             reached_limit = (

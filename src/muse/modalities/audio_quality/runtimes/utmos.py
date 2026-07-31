@@ -15,6 +15,7 @@ from muse.modalities.audio_quality.protocol import (
 
 logger = logging.getLogger(__name__)
 torch: Any = None
+MINIMUM_REVIEW_WINDOW_SECONDS = 1.0
 
 
 def _ensure_deps() -> None:
@@ -105,8 +106,20 @@ class UTMOSRuntime:
             })
 
         value = weighted_total / total_duration
+        eligible_review_segments = [
+            segment for segment in segments
+            if (
+                segment["end_seconds"] - segment["start_seconds"]
+                >= MINIMUM_REVIEW_WINDOW_SECONDS
+            )
+        ]
+        review_segments = eligible_review_segments or segments
         worst = min(
             segments,
+            key=lambda segment: segment["scores"]["naturalness"],
+        )
+        worst_review = min(
+            review_segments,
             key=lambda segment: segment["scores"]["naturalness"],
         )
         return AudioQualityResult(
@@ -128,5 +141,12 @@ class UTMOSRuntime:
                 "aggregation": "duration_weighted_mean",
                 "segments": segments,
                 "worst_segment": worst,
+                "worst_review_segment": worst_review,
+                "minimum_review_window_seconds": (
+                    MINIMUM_REVIEW_WINDOW_SECONDS
+                ),
+                "short_review_windows_excluded": (
+                    len(segments) - len(review_segments)
+                ),
             },
         )

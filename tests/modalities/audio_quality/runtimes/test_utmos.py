@@ -57,6 +57,28 @@ def test_assess_aggregates_windows_and_reports_worst_segment(
     assert reader.call_args.kwargs["max_duration_seconds"] == 30
 
 
+def test_subsecond_tail_is_not_used_as_worst_review_window(
+    tmp_path, monkeypatch,
+):
+    windows = [
+        AudioWindow(torch.ones(1, 160000), 16000, 0, 10),
+        AudioWindow(torch.ones(1, 4800), 16000, 10, 10.3),
+    ]
+    runtime, _, _, _ = _runtime(
+        tmp_path,
+        monkeypatch,
+        scores=(4.0, 2.0),
+        windows=windows,
+    )
+
+    result = runtime.assess("clip.wav")
+
+    assert result.metadata["worst_segment"]["start_seconds"] == 10
+    assert result.metadata["worst_review_segment"]["start_seconds"] == 0
+    assert result.metadata["short_review_windows_excluded"] == 1
+    assert result.scores["naturalness"].value < 4.0
+
+
 def test_missing_checkpoint_fails_clearly(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_module, "torch", torch)
     with pytest.raises(FileNotFoundError, match="pull the model first"):
