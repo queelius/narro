@@ -248,6 +248,26 @@ async def test_decode_image_file_reads_png_from_upload():
 
 
 @pytest.mark.asyncio
+async def test_decode_image_file_rejects_side_before_pixel_decode(
+    monkeypatch,
+):
+    from muse.modalities.image_generation.image_input import decode_image_file
+    from PIL import Image
+
+    raw = _png_bytes(width=48, height=24)
+    upload = _FakeUploadFile(raw)
+    load = Image.Image.load
+
+    def fail_if_loaded(self):
+        raise AssertionError("oversized image pixels should not be decoded")
+
+    monkeypatch.setattr(Image.Image, "load", fail_if_loaded)
+    with pytest.raises(ValueError, match="max input side 32"):
+        await decode_image_file(upload, max_side=32)
+    monkeypatch.setattr(Image.Image, "load", load)
+
+
+@pytest.mark.asyncio
 async def test_decode_image_file_rejects_empty():
     from muse.modalities.image_generation.image_input import decode_image_file
     upload = _FakeUploadFile(b"")

@@ -1,11 +1,12 @@
 """Inference image tools.
 
-Seven tools wrapping the image modalities:
+Eight tools wrapping the image modalities:
   - muse_generate_image      /v1/images/generations
   - muse_edit_image          /v1/images/edits           (image + mask)
   - muse_vary_image          /v1/images/variations      (image)
   - muse_upscale_image       /v1/images/upscale         (image)
   - muse_segment_image       /v1/images/segment         (image)
+  - muse_vectorize_image     /v1/images/vectorize       (image)
   - muse_generate_animation  /v1/images/animations
   - muse_embed_image         /v1/images/embeddings
 
@@ -132,6 +133,19 @@ def _handle_segment_image(client: MuseClient, args: dict) -> list[dict]:
     out = client.segment_image(image=image, **body)
     # Segmentation envelopes carry masks per the codec convention; we
     # forward the full envelope as a TextContent block.
+    return [_json_block(out)]
+
+
+def _handle_vectorize_image(client: MuseClient, args: dict) -> list[dict]:
+    image = resolve_binary_input(
+        b64=args.get("image_b64"),
+        url=args.get("image_url"),
+        path=args.get("image_path"),
+        field_name="image",
+    )
+    body = _filter_keys(args, prefixes=("image_",))
+    body["response_format"] = "json"
+    out = client.vectorize_image(image=image, **body)
     return [_json_block(out)]
 
 
@@ -308,6 +322,50 @@ INFERENCE_TOOLS.extend([
             },
         ),
         handler=_handle_segment_image,
+    ),
+    ToolEntry(
+        tool=Tool(
+            name="muse_vectorize_image",
+            description=(
+                "Convert a raster icon, logo, or diagram into editable "
+                "static SVG. Returns the SVG source, dimensions, seed, "
+                "and token usage. Useful before animation or diagram "
+                "assembly; photographic inputs are a poor fit."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string"},
+                    "max_new_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 7680,
+                        "default": 4096,
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2,
+                        "default": 1,
+                    },
+                    "top_p": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": 1,
+                        "default": 0.9,
+                    },
+                    "num_beams": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "default": 2,
+                    },
+                    "seed": {"type": "integer"},
+                    **binary_input_schema("image"),
+                },
+            },
+        ),
+        handler=_handle_vectorize_image,
     ),
     ToolEntry(
         tool=Tool(

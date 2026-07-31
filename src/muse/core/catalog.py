@@ -858,14 +858,14 @@ def _pull_bundled(model_id: str) -> None:
     # checkpoints when the diffusers/transformers runtime only needs the
     # subfolder weights.
     allow_patterns = entry.extra.get("allow_patterns")
+    revision = entry.extra.get("revision")
+    download_kwargs: dict[str, Any] = {"repo_id": entry.hf_repo}
+    if allow_patterns:
+        download_kwargs["allow_patterns"] = list(allow_patterns)
+    if revision:
+        download_kwargs["revision"] = revision
     with _hf_quiet_if_needed():
-        if allow_patterns:
-            local_dir = snapshot_download(
-                repo_id=entry.hf_repo,
-                allow_patterns=list(allow_patterns),
-            )
-        else:
-            local_dir = snapshot_download(repo_id=entry.hf_repo)
+        local_dir = snapshot_download(**download_kwargs)
 
     # M1: hold _CATALOG_WRITE_LOCK for the full read->mutate->write sequence.
     # The heavy work (venv creation, pip install, HF download) happens above,
@@ -880,6 +880,8 @@ def _pull_bundled(model_id: str) -> None:
             "python_path": str(venv_python(venv_path)),
             "enabled": True,
         }
+        if revision:
+            catalog[model_id]["revision"] = revision
         _write_catalog(catalog)
     _reset_known_models_cache()
 

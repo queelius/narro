@@ -9,11 +9,11 @@ build-backend = "setuptools.build_meta"
 # CLI binary, GitHub repo, and project identity stay `muse`; only the
 # PyPI label is `museq`. See docs/superpowers/specs/ for context.
 name = "museq"
-version = "0.58.1"
+version = "0.59.0"
 authors = [
   { name="Alex Towell", email="lex@metafunctor.com" },
 ]
-description = "Self-hostable OpenAI-compatible multi-modality AI server: 22 modalities (chat, image, audio, video, 3D, embeddings, OCR, segmentation), plugin runtimes (PyTorch, diffusers, llama-cpp-python)."
+description = "Self-hostable OpenAI-compatible multi-modality AI server: 23 modalities (chat, image, audio, video, 3D, embeddings, OCR, vectorization), plugin runtimes (PyTorch, diffusers, llama-cpp-python)."
 readme = "README.md"
 requires-python = ">=3.10"
 keywords = [

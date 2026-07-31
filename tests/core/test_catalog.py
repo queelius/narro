@@ -2109,6 +2109,28 @@ def test_pull_bundled_no_allow_patterns_calls_default(tmp_catalog):
     mock_download.assert_called_once()
     kwargs = mock_download.call_args.kwargs
     assert "allow_patterns" not in kwargs
+    assert "revision" not in kwargs
+
+
+def test_pull_bundled_honors_pinned_revision(tmp_catalog):
+    """Exact custom architectures must download the reviewed snapshot."""
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch(
+             "muse.core.catalog.snapshot_download",
+             return_value="/fake/starvector",
+         ) as mock_download, \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("starvector-1b-im2svg")
+
+    kwargs = mock_download.call_args.kwargs
+    revision = (
+        "380ab95d25a8e9ab1dc825debe238b4953ae13b9"
+    )
+    assert kwargs["revision"] == revision
+    assert "*.safetensors" in kwargs["allow_patterns"]
+    assert "*.py" not in kwargs["allow_patterns"]
+    assert _read_catalog()["starvector-1b-im2svg"]["revision"] == revision
 
 
 def test_known_models_surfaces_memory_annotation():

@@ -44,9 +44,9 @@ class TestServerStdioBasics:
         assert types.ListToolsRequest in rh
         assert types.CallToolRequest in rh
 
-    def test_30_tools_in_cache(self, server):
+    def test_31_tools_in_cache(self, server):
         # Trigger the list_tools handler so the SDK populates its cache.
-        # We then assert the cache has exactly 30 entries.
+        # We then assert the cache has exactly 31 entries.
         import asyncio
         from mcp import types
 
@@ -57,7 +57,7 @@ class TestServerStdioBasics:
 
         asyncio.run(run_handler())
         cache = server._server._tool_cache
-        assert len(cache) == 30
+        assert len(cache) == 31
 
     def test_call_tool_dispatches(self, server, monkeypatch):
         # Drive the call_tool handler with a fake list_models response.

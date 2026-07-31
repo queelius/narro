@@ -62,6 +62,7 @@ MODALITY_EXTRAS: dict[str, list[str]] = {
     "image/upscale": ["images"],
     "image/embedding": [],
     "image/segmentation": [],
+    "image/vectorization": [],
     "embedding/text": ["embeddings"],
     "text/classification": [],
     "text/rerank": [],

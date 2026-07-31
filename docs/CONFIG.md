@@ -137,6 +137,7 @@ A snapshot of the defaults:
 | `limits.image_embeddings_max_batch` | `MUSE_IMAGE_EMBEDDINGS_MAX_BATCH` | 64 |
 | `limits.segmentation_max_input_side` | `MUSE_SEGMENTATION_MAX_INPUT_SIDE` | 2048 |
 | `limits.upscale_max_input_side` | `MUSE_UPSCALE_MAX_INPUT_SIDE` | 1024 |
+| `limits.vectorization_max_input_side` | `MUSE_VECTORIZATION_MAX_INPUT_SIDE` | 2048 |
 | `limits.model_3d_input_max_bytes` | `MUSE_3D_INPUT_MAX_BYTES` | 20971520 (20 MB) |
 | `limits.moderations_max_batch` | `MUSE_MODERATIONS_MAX_BATCH` | 1024 |
 | `limits.moderations_max_chars_per_item` | `MUSE_MODERATIONS_MAX_CHARS_PER_ITEM` | 100000 |
@@ -148,8 +149,9 @@ A snapshot of the defaults:
 | `limits.translate_max_chars` | `MUSE_TRANSLATE_MAX_CHARS` | 20000 |
 | `limits.video_max_frames_b64` | `MUSE_VIDEO_MAX_FRAMES_B64` | 240 |
 
-The five `limits.*` byte/side caps that have a positivity guard
-(`image_input`, `audio_cls`, `model_3d_input`, `segmentation`, `upscale`) treat
+The six `limits.*` byte/side caps that have a positivity guard
+(`image_input`, `audio_cls`, `model_3d_input`, `segmentation`, `upscale`,
+`vectorization`) treat
 a non-positive value (`<= 0`, or empty for the opt-int byte caps) as "use the
 default", so setting one to 0 falls back rather than rejecting every request.
 

@@ -14,6 +14,7 @@ Model-agnostic multi-modality generation server. OpenAI-compatible HTTP is the c
 - text-to-music on `/v1/audio/music` and text-to-sound-effects on `/v1/audio/sfx`
 - text-to-image on `/v1/images/generations`, image inpainting on `/v1/images/edits`, image variations on `/v1/images/variations`
 - image-to-image super-resolution on `/v1/images/upscale`
+- raster-to-editable-SVG vectorization on `/v1/images/vectorize`
 - image depth, keypoints, and object detection on `/v1/images/depth`, `/v1/images/keypoints`, and `/v1/images/detect`
 - image OCR on `/v1/images/ocr`
 - promptable segmentation on `/v1/images/segment`
@@ -29,7 +30,7 @@ Model-agnostic multi-modality generation server. OpenAI-compatible HTTP is the c
 - text translation (LibreTranslate-compat) on `/v1/translate` (+ bare `/translate` alias, `GET /languages`)
 - image-to-3D and text-to-3D on `/v1/3d/from-image` and `/v1/3d/generations`
 
-Modality tags are MIME-style (`3d/generation`, `audio/alignment`, `audio/classification`, `audio/embedding`, `audio/generation`, `audio/quality`, `audio/speech`, `audio/transcription`, `chat/completion`, `embedding/text`, `image/animation`, `image/cv`, `image/embedding`, `image/generation`, `image/ocr`, `image/segmentation`, `image/upscale`, `text/classification`, `text/rerank`, `text/summarization`, `text/translation`, `video/generation`).
+Modality tags are MIME-style (`3d/generation`, `audio/alignment`, `audio/classification`, `audio/embedding`, `audio/generation`, `audio/quality`, `audio/speech`, `audio/transcription`, `chat/completion`, `embedding/text`, `image/animation`, `image/cv`, `image/embedding`, `image/generation`, `image/ocr`, `image/segmentation`, `image/upscale`, `image/vectorization`, `text/classification`, `text/rerank`, `text/summarization`, `text/translation`, `video/generation`).
 
 Three ways to add a model, in order of how often you'll reach for them:
 
@@ -113,8 +114,10 @@ curl -X POST http://localhost:8000/v1/audio/embeddings \
 
 # Speech/audio quality assessment (named, scaled axes)
 # Long clips are scored in bounded 10-second windows; metadata includes
-# every segment and the worst segment. The decoded-duration cap defaults
-# to 600 seconds (MUSE_AUDIO_QUALITY_MAX_DURATION_SECONDS).
+# every segment, the literal worst segment, and a `worst_review_segment`
+# that ignores subsecond tail windows when a longer candidate exists.
+# The decoded-duration cap defaults to 600 seconds
+# (MUSE_AUDIO_QUALITY_MAX_DURATION_SECONDS).
 muse pull utmos
 curl -X POST http://localhost:8000/v1/audio/quality \
   -F "file=@narration.wav" \
@@ -204,6 +207,15 @@ curl -s -X POST http://localhost:8000/v1/images/upscale \
   | jq -r '.data[0].b64_json' \
   | base64 -d > upscaled.png
 
+# Raster-to-SVG vectorization. Raw SVG output is convenient for Manim;
+# use response_format=json to also receive dimensions, seed, and usage.
+muse pull starvector-1b-im2svg
+curl -s -X POST http://localhost:8000/v1/images/vectorize \
+  -F "image=@diagram.png" \
+  -F "model=starvector-1b-im2svg" \
+  -F "response_format=svg" \
+  --output diagram.svg
+
 # Image segmentation (multipart: SAM-2 promptable masks)
 # Mode 1: automatic (sweep grid of point prompts internally)
 curl -s -X POST http://localhost:8000/v1/images/segment \
@@ -277,6 +289,7 @@ variants = ImageVariationsClient().vary(image=src, model="sd-turbo", n=2)
 
 # Image upscale (since v0.25.0): 4x super-resolution
 from muse.modalities.image_upscale import ImageUpscaleClient
+from muse.modalities.image_vectorization import VectorizationClient
 from pathlib import Path
 upscaled = ImageUpscaleClient().upscale(
     image=Path("source.png").read_bytes(),
@@ -285,6 +298,13 @@ upscaled = ImageUpscaleClient().upscale(
     prompt="razor sharp detail",
 )
 Path("upscaled.png").write_bytes(upscaled[0])
+
+# Raster-to-SVG vectorization (v0.59.0)
+svg = VectorizationClient().vectorize(
+    Path("diagram.png"), model="starvector-1b-im2svg",
+    response_format="svg", seed=0,
+)
+Path("diagram.svg").write_text(svg)
 
 # Image segmentation (since v0.26.0): SAM-2 promptable masks
 from muse.modalities.image_segmentation import ImageSegmentationClient
@@ -419,7 +439,7 @@ combined with live measurements as `min(declared, live)`.
 | `muse models warmup <model-id>` | pre-load a model into a worker without serving traffic; first real request is hot |
 | `muse models refresh <id> \| --all \| --enabled` | re-install museq[server,extras] into per-model venv(s) (after `pip install -U museq`) |
 | `muse config generate \| show \| path \| get \| set \| unset` | manage `~/.muse/config.yaml` (see Configuration below) |
-| `muse mcp [--http]` | run an MCP server bridging muse to LLM clients (30 tools) |
+| `muse mcp [--http]` | run an MCP server bridging muse to LLM clients (31 tools) |
 
 No per-modality subcommands (`muse speak`, `muse audio ...`). Those would be hardcoded modality-to-verb mappings that grow with every new modality. Keeping the CLI modality-agnostic means embeddings, transcriptions, and video land without CLI churn.
 
@@ -455,6 +475,7 @@ settings inventory and precedence rules.
 | `POST /v1/images/generations` | generate images (OpenAI-compatible; supports img2img via `image` + `strength`) |
 | `POST /v1/images/edits` | inpaint masked regions (OpenAI-compatible; multipart with image+mask+prompt) |
 | `POST /v1/images/variations` | generate alternates of one image (OpenAI-compatible; multipart, no prompt) |
+| `POST /v1/images/vectorize` | convert a raster icon/diagram to validated static SVG (multipart; JSON or image/svg+xml) |
 | `POST /v1/embeddings` | text embeddings (OpenAI-compatible) |
 | `POST /v1/images/embeddings` | image embeddings (OpenAI-shape envelope mirroring /v1/embeddings) |
 | `POST /v1/audio/embeddings` | audio embeddings (multipart upload + OpenAI-shape envelope mirroring /v1/embeddings) |
@@ -555,7 +576,7 @@ muse serve
 
 ## MCP server (since v0.29.0)
 
-`muse mcp` runs a Model Context Protocol server that exposes muse to LLM clients (Claude Desktop, Cursor, etc.) as 30 structured tools: 11 admin tools (gated by `MUSE_ADMIN_TOKEN`) plus 19 inference tools. Stdio mode is the default (for desktop apps); HTTP+SSE mode (`--http --port 8088`) is available for remote / web embedders.
+`muse mcp` runs a Model Context Protocol server that exposes muse to LLM clients (Claude Desktop, Cursor, etc.) as 31 structured tools: 11 admin tools (gated by `MUSE_ADMIN_TOKEN`) plus 20 inference tools. Stdio mode is the default (for desktop apps); HTTP+SSE mode (`--http --port 8088`) is available for remote / web embedders.
 
 ```bash
 muse mcp                                  # stdio mode
@@ -586,7 +607,7 @@ Tools split into two groups:
 
 **Admin (11):** `muse_list_models`, `muse_get_model_info`, `muse_search_models`, `muse_pull_model`, `muse_remove_model`, `muse_enable_model`, `muse_disable_model`, `muse_probe_model`, `muse_get_memory_status`, `muse_get_workers`, `muse_get_jobs`. Long-running ops (pull, probe, enable) return a `job_id` and the LLM polls `muse_get_jobs` to track progress.
 
-**Inference (19):** `muse_chat`, `muse_summarize`, `muse_rerank`, `muse_classify`, `muse_embed_text`, `muse_translate`, `muse_generate_image`, `muse_edit_image`, `muse_vary_image`, `muse_upscale_image`, `muse_segment_image`, `muse_generate_animation`, `muse_embed_image`, `muse_speak`, `muse_transcribe`, `muse_generate_music`, `muse_generate_sfx`, `muse_embed_audio`, `muse_generate_video`.
+**Inference (20):** `muse_chat`, `muse_summarize`, `muse_rerank`, `muse_classify`, `muse_embed_text`, `muse_translate`, `muse_generate_image`, `muse_edit_image`, `muse_vary_image`, `muse_upscale_image`, `muse_segment_image`, `muse_vectorize_image`, `muse_generate_animation`, `muse_embed_image`, `muse_speak`, `muse_transcribe`, `muse_generate_music`, `muse_generate_sfx`, `muse_embed_audio`, `muse_generate_video`.
 
 Binary inputs accept `<name>_b64` (base64), `<name>_url` (data: or http URL), or `<name>_path` (local file). Image and audio outputs return as MCP `ImageContent` / `AudioContent` blocks plus a JSON summary.
 

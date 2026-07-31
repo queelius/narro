@@ -153,6 +153,14 @@ class MuseClient:
         data = {k: str(v) for k, v in body.items() if v is not None}
         return self._post_multipart("/v1/images/segment", files=files, data=data)
 
+    def vectorize_image(self, *, image: bytes, **body: Any) -> dict:
+        files = {"image": ("image.png", image, "image/png")}
+        body.setdefault("response_format", "json")
+        data = {k: str(v) for k, v in body.items() if v is not None}
+        return self._post_multipart(
+            "/v1/images/vectorize", files=files, data=data,
+        )
+
     def generate_animation(self, **body: Any) -> dict:
         return self._post_json("/v1/images/animations", body)
 

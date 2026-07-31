@@ -146,6 +146,20 @@ class TestImageRoutes:
         call = mock_httpx_client.post.call_args
         assert call.args[0].endswith("/v1/images/segment")
 
+    def test_vectorize_image_multipart(self, client, mock_httpx_client):
+        mock_httpx_client.post.return_value = _ok_json({
+            "mime_type": "image/svg+xml", "svg": "<svg/>",
+        })
+        out = client.vectorize_image(
+            image=b"img", model="starvector", seed=7,
+        )
+        assert out["mime_type"] == "image/svg+xml"
+        call = mock_httpx_client.post.call_args
+        assert call.args[0].endswith("/v1/images/vectorize")
+        assert call.kwargs["data"]["model"] == "starvector"
+        assert call.kwargs["data"]["seed"] == "7"
+        assert call.kwargs["data"]["response_format"] == "json"
+
     def test_generate_animation(self, client, mock_httpx_client):
         mock_httpx_client.post.return_value = _ok_json({"data": [{"b64": "..."}]})
         client.generate_animation(prompt="bouncing ball")

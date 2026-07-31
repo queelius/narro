@@ -76,7 +76,12 @@ async def decode_image_input(value: str, *, max_bytes: int | None = None) -> Any
     )
 
 
-async def decode_image_file(file: Any, *, max_bytes: int | None = None) -> Any:
+async def decode_image_file(
+    file: Any,
+    *,
+    max_bytes: int | None = None,
+    max_side: int | None = None,
+) -> Any:
     """Decode a multipart UploadFile into a PIL.Image.
 
     Used by /v1/images/edits and /v1/images/variations, where the
@@ -95,6 +100,9 @@ async def decode_image_file(file: Any, *, max_bytes: int | None = None) -> Any:
     fully buffer into worker memory before being rejected.
 
     `max_bytes` defaults to MUSE_IMAGE_INPUT_MAX_BYTES (or 10MB).
+    When `max_side` is set, declared dimensions are checked before pixel
+    decoding so an oversized image is rejected without allocating its
+    full raster.
     """
     cap = max_bytes if max_bytes is not None else _default_max_bytes()
     raw = await file.read(cap + 1)
@@ -104,7 +112,7 @@ async def decode_image_file(file: Any, *, max_bytes: int | None = None) -> Any:
         raise ValueError(
             f"image bytes exceeds max ({len(raw)} > {cap})"
         )
-    return _bytes_to_pil(raw)
+    return _bytes_to_pil(raw, max_side=max_side)
 
 
 def _decode_data_url(value: str, *, max_bytes: int):
@@ -158,10 +166,18 @@ def _validate_public_host(url: str) -> None:
     _validate_public_host_impl(url)
 
 
-def _bytes_to_pil(raw: bytes):
+def _bytes_to_pil(raw: bytes, *, max_side: int | None = None):
     from PIL import Image, UnidentifiedImageError
     try:
         img = Image.open(io.BytesIO(raw))
+        width, height = img.size
+        if max_side is not None and (
+            width > max_side or height > max_side
+        ):
+            raise ValueError(
+                f"image too large: {width}x{height} exceeds max input side "
+                f"{max_side}"
+            )
         img.load()  # force decode now so errors surface here, not later
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
         # DecompressionBombError is a plain Exception (not OSError): a tiny

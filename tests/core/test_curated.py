@@ -263,6 +263,13 @@ def test_load_curated_includes_qwen3_forced_aligner():
     assert len(entry.capabilities["supported_languages"]) == 11
 
 
+def test_load_curated_includes_starvector():
+    entries = {entry.id: entry for entry in load_curated()}
+    entry = entries["starvector-1b-im2svg"]
+    assert entry.bundled is True
+    assert entry.uri is None
+
+
 def test_load_curated_includes_v046_model_refresh():
     """v0.46.0 model-refresh additions across existing modalities. Each is a
     pure resolver-pull entry (no new runtime), verified to resolve to the

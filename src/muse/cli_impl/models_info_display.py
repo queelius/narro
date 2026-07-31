@@ -115,6 +115,15 @@ KNOWN_CAPABILITIES: dict[str, dict[str, tuple[str, Callable[[Any], str]]]] = {
         "memory_gb": ("annotated memory", lambda v: f"{v} GB"),
         "idle_timeout_seconds": ("idle timeout", lambda v: f"{v}s"),
     },
+    "image/vectorization": {
+        "supports_image_to_svg": ("image-to-SVG", _yes_no),
+        "output_mime_type": ("output MIME", _str),
+        "static_svg_only": ("static SVG only", _yes_no),
+        "max_new_tokens": ("max tokens", _str),
+        "device": ("device pref", _str),
+        "memory_gb": ("annotated memory", lambda v: f"{v} GB"),
+        "idle_timeout_seconds": ("idle timeout", lambda v: f"{v}s"),
+    },
     "image/animation": {
         "default_size": ("default size", _str),
         "default_frames": ("default frames", _str),

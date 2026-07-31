@@ -36,6 +36,7 @@ def test_expected_settings_present():
         "paths.catalog_dir",
         "fetch.allow_private",
         "limits.upscale_max_input_side",
+        "limits.vectorization_max_input_side",
         "limits.audio_quality_max_bytes",
         "limits.audio_quality_max_duration_seconds",
         "limits.audio_alignment_max_bytes",

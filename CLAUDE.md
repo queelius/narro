@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project overview
 
 Muse is a multi-modality generation server and client. It currently supports
-twenty-two modalities:
+twenty-three modalities:
 
 - **audio/alignment**: trusted reference transcript to word timestamps via `/v1/audio/alignments` (Qwen3 ForcedAligner 0.6B curated; multipart audio + text; 11 languages; per-word start/end and uncalibrated timestamp confidence)
 - **audio/classification**: audio event / emotion / language classification via `/v1/audio/classifications` (ast-audioset bundled, 527-class multi-label; emotion + speech-commands + language-ID via the resolver; multipart upload + per-input list of `{label, score}` pairs mirroring `/v1/text/classifications`)
@@ -23,6 +23,7 @@ twenty-two modalities:
 - **image/ocr**: image-to-text via `/v1/images/ocr` (trocr-base-printed bundled; Nougat / TexTeller / TrOCR-handwritten via the resolver; multipart upload, optional `prompt` for task hints, optional `max_new_tokens`; OpenAI-shape envelope mirroring `/v1/audio/transcriptions`)
 - **image/segmentation**: promptable segmentation via `/v1/images/segment` (sam2-hiera-tiny bundled; SAM-2 family via the resolver; multipart upload, mode dispatch auto/points/boxes/text gated by capability flags; masks emitted as base64 PNG or COCO RLE)
 - **image/upscale**: image-to-image super-resolution via `/v1/images/upscale` (stable-diffusion-x4-upscaler bundled; multipart upload, OpenAI-shape envelope; 4x diffusion-based upscaling; capability-gated on `supported_scales`; env-tunable input cap via `MUSE_UPSCALE_MAX_INPUT_SIDE`)
+- **image/vectorization**: raster-to-static-SVG via `/v1/images/vectorize` (StarVector-1B im2svg bundled; multipart upload; JSON or raw `image/svg+xml`; pinned, local architecture with no Hub code execution; active SVG content rejected)
 - **text/classification**: text moderation via `/v1/moderations` and full label distribution via `/v1/text/classifications` (any HF text-classifier or zero-shot NLI; bundled twitter-roberta sentiment + deberta-v3 zero-shot; capability-gated dispatch on `supports_classification` / `supports_zero_shot`)
 - **text/rerank**: cross-encoder rerank via `/v1/rerank` (bge-reranker-v2-m3 bundled; any cross-encoder reranker on HF; Cohere-compat wire shape)
 - **text/summarization**: BART/PEGASUS seq2seq summarization via `/v1/summarize` (bart-large-cnn bundled; any summarization-tagged HF repo via the resolver; Cohere-compat wire shape)
@@ -49,9 +50,11 @@ direction (`higher_is_better`, `lower_is_better`, or `descriptive`),
 because a UTMOS 1-5 naturalness MOS is not numerically interchangeable
 with Audiobox's 1-10 axes. Both runtimes use TorchCodec to decode 16kHz
 mono ranges sequentially (10-second windows), return a duration-weighted
-aggregate plus `metadata.segments` / `metadata.worst_segment`, and reject
-audio over `MUSE_AUDIO_QUALITY_MAX_DURATION_SECONDS` (600s default) with
-413. The priority-100 HF plugin claims only two
+aggregate plus `metadata.segments`, the literal `metadata.worst_segment`,
+and `metadata.worst_review_segment` (which ignores subsecond tail windows
+when a longer review candidate exists), and reject audio over
+`MUSE_AUDIO_QUALITY_MAX_DURATION_SECONDS` (600s default) with 413. The
+priority-100 HF plugin claims only two
 verified custom checkpoint shapes: `Blinorot/UTMOS-PyTorch` routes to
 the local TorchScript runtime and `facebook/audiobox-aesthetics`
 loads the package's official model class from Hub safetensors directly
@@ -255,6 +258,8 @@ Models advertise support via `capabilities.supports_img2img`. Requests for non-s
 The `image/generation` modality also exposes `/v1/images/edits` (inpainting) and `/v1/images/variations` (alternates of one image, no prompt) since v0.21.0. Both are multipart/form-data routes that mount on the same modality. Inpainting takes `image` + `mask` + `prompt` and routes to `backend.inpaint(...)`, which lazy-loads `AutoPipelineForInpainting.from_pipe(self._pipe)` to share VRAM with the loaded t2i pipeline. Variations takes `image` only and routes to `backend.vary(...)`, which delegates to the existing img2img path with empty prompt and high strength (default 0.85). Capability flags `supports_inpainting` and `supports_variations` gate the routes; OpenAI SDK clients use `client.images.edit(image=..., mask=..., prompt=..., model=...)` and `client.images.create_variation(image=..., model=...)` natively.
 
 `image/upscale` (v0.25.0) is muse's super-resolution modality: a separate MIME tag from `image/generation` because the runtime backbone is different (`StableDiffusionUpscalePipeline`, not `AutoPipelineForText2Image`). Wire shape at `POST /v1/images/upscale` is multipart/form-data (mirroring `/v1/images/edits`), with `image` as the source file plus `model`, `scale`, optional `prompt`, `negative_prompt`, `steps`, `guidance`, `seed`, `n`, and `response_format` as Form fields. Output envelope mirrors `/v1/images/generations`: `{created, data: [{b64_json|url, revised_prompt}]}`. The bundled `stable-diffusion-x4-upscaler` (Apache 2.0, ~3GB, fixed 4x) is the default; the HF resolver plugin (priority 105) sniffs other diffusers-shape upscalers (`model_index.json` + `image-to-image` tag + upscaler-name allowlist). The `supported_scales` capability gates the request `scale` parameter (returns 400 for unsupported values; SD x4 supports `[4]` only). An env-tunable input-side cap (`MUSE_UPSCALE_MAX_INPUT_SIDE`, default 1024) prevents runaway VRAM use on oversized inputs; the cap is read per-request, so changes take effect on the next request, not at supervisor restart. GAN-based upscalers (AuraSR, Real-ESRGAN) need separate non-diffusers runtimes and are deferred to v1.next.
+
+`image/vectorization` (v0.59.0) is muse's raster-to-SVG modality. `POST /v1/images/vectorize` accepts multipart `image` plus optional `model`, `max_new_tokens` (1-7680), `temperature` (0-2), `top_p`, `num_beams` (1-8), `seed`, and `response_format` (`json` or `svg`). JSON returns `{id, object, model, mime_type, svg, source_size, width, height, view_box, seed, usage, metadata}`; raw mode returns `image/svg+xml`, ready to save or pass to an SVG consumer such as Manim. The bundled and curated `starvector-1b-im2svg` model uses the Apache-2.0 official mixed-precision checkpoint (~5.14GB on disk, loaded fp16 with ~7GB working memory, suitable for a 12GB GPU). Supply-chain policy is exact-only: `muse pull` pins HF revision `380ab95d25a8e9ab1dc825debe238b4953ae13b9`, downloads only config/tokenizer/safetensors data, and instantiates Muse's audited inference-only architecture; there is intentionally no broad HF resolver and no `trust_remote_code`. The output boundary accepts a static SVG subset and rejects scripts, event handlers, foreign objects, embedded rasters, remote/data URLs, DTDs/entities, oversized documents, or excessive element nesting. Input long side defaults to 2048 pixels and is configurable with `MUSE_VECTORIZATION_MAX_INPUT_SIDE`. This model is aimed at icons, logos, flat illustrations, and technical diagrams rather than photographs.
 
 `image/segmentation` (v0.26.0) is muse's promptable-segmentation modality. Wire shape at `POST /v1/images/segment` is multipart/form-data: `image` as the source file plus `model`, `mode` (auto/points/boxes/text), `prompt` (text mode), `points` (JSON-encoded `[[x, y], ...]`), `boxes` (JSON-encoded `[[x1, y1, x2, y2], ...]`), `mask_format` (`png_b64` or `rle`), and `max_masks` as Form fields. Output: `{id, model, mode, image_size, masks: [{index, score, mask, bbox, area}]}`. Mode dispatch is capability-gated end-to-end: `supports_automatic`, `supports_point_prompts`, `supports_box_prompts`, `supports_text_prompts`. A request with `mode=text` against a model declaring `supports_text_prompts: False` returns 400 before the runtime is invoked. The bundled `sam2-hiera-tiny` (Apache 2.0, ~40MB, point/box/auto, no text) is the default; curated `sam2-hiera-base-plus` and `sam2-hiera-large` extend the family. The HF resolver plugin (priority 110) sniffs `mask-generation` and `image-segmentation` tags. CLIPSeg is a deferred future: the plugin pattern recognizes it and flips `supports_text_prompts: True`, but the SAM2Runtime backbone needs a CLIPSeg-specific replacement to actually consume the text prompt. The mask format dispatch (`png_b64` for portable / viewable, `rle` for compact / pycocotools-compatible) introduces a precedent: the codec ships pure-Python RLE encode/decode that round-trips internally, with `pycocotools` as an optional faster path that produces output other COCO tooling can decode directly. Axis-order discipline at the wire layer: `image_size` is `[W, H]` (PIL convention); RLE `size` is `[H, W]` (COCO convention); `bbox` is `[x, y, w, h]` (COCO bbox convention).
 
@@ -1260,7 +1265,7 @@ api_key="not-used")`.
 
 `muse mcp` runs an MCP (Model Context Protocol) server that exposes
 muse's capabilities to LLM clients (Claude Desktop, Cursor, etc.) as
-30 structured tools: 11 admin tools (wrap `/v1/admin/*`) and 19
+31 structured tools: 11 admin tools (wrap `/v1/admin/*`) and 20
 inference tools (one per generation route).
 
 The package layout:
@@ -1288,9 +1293,9 @@ Two transport modes:
   for remote / web embedders.
 
 Filter mode pins the tool surface:
-- `--filter all` (default): 30 tools.
+- `--filter all` (default): 31 tools.
 - `--filter admin`: 11 tools, only useful with `MUSE_ADMIN_TOKEN`.
-- `--filter inference`: 19 tools, no admin-token needed.
+- `--filter inference`: 20 tools, no admin-token needed.
 
 Auth: `--admin-token` (or `$MUSE_ADMIN_TOKEN`) is forwarded as the
 bearer token for admin tool calls. Inference tools don't need a token.
@@ -1411,7 +1416,7 @@ muse serve --device cuda
 muse mcp                                       # MCP server for LLM clients (stdio mode)
 muse mcp --http --port 8088                    # MCP server in HTTP+SSE mode
 muse mcp --filter admin                        # only the 11 admin tools
-muse mcp --filter inference                    # only the 19 inference tools
+muse mcp --filter inference                    # only the 20 inference tools
 
 # Python clients (HTTP)
 python - <<'PY'

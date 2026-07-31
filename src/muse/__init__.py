@@ -18,6 +18,7 @@ the bundled modalities are:
   - image/generation: /v1/images/generations, /v1/images/edits (inpaint), /v1/images/variations (diffusers)
   - image/segmentation: /v1/images/segment (SAM-2; multipart upload, mode-aware: auto/points/boxes/text; PNG or COCO RLE masks)
   - image/upscale: /v1/images/upscale (StableDiffusionUpscalePipeline; SD x4; multipart upload)
+  - image/vectorization: /v1/images/vectorize (StarVector-1B; raster-to-static-SVG; multipart upload)
   - text/classification: /v1/moderations (HF text-classification)
   - text/rerank: /v1/rerank (sentence-transformers CrossEncoder; Cohere-compat)
   - text/summarization: /v1/summarize (transformers AutoModelForSeq2SeqLM; Cohere-compat)

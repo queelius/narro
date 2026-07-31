@@ -1,6 +1,6 @@
 """muse mcp: MCP server bridging muse capabilities to LLM clients.
 
-`muse mcp` exposes 30 tools (11 admin + 19 inference) over the Model
+`muse mcp` exposes 31 tools (11 admin + 20 inference) over the Model
 Context Protocol. Stdio mode is the default (for desktop apps); HTTP+SSE
 mode is available for remote / web embedders.
 

@@ -314,6 +314,13 @@ class TestModelOptionalPaths:
         result = model_optional_paths()
         assert result.get("/v1/audio/alignments") == "audio/alignment"
 
+    def test_real_bundled_vectorization_modality_is_discovered(self):
+        result = model_optional_paths()
+        assert (
+            result.get("/v1/images/vectorize")
+            == "image/vectorization"
+        )
+
     def test_default_scan_is_memoized_for_process_lifetime(self, monkeypatch):
         """T3 review finding: model_optional_paths() is called with no args
         on the gateway's hot path for every model-less request (LibreTranslate

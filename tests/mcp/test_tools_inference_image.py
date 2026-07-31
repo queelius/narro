@@ -1,8 +1,8 @@
-"""Tests for the 7 inference image tools.
+"""Tests for the eight inference image tools.
 
-Cover: correct routing, b64/url/path input resolution for the four
-binary-input tools (edit, vary, upscale, segment), output ImageContent
-packing for the three image-output tools (generate, edit, vary, upscale).
+Cover: correct routing and b64/url/path input resolution for the five
+binary-input tools (edit, vary, upscale, segment, vectorize), plus output
+ImageContent packing for generate, edit, vary, and upscale.
 """
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ class TestRegistry:
             "muse_vary_image",
             "muse_upscale_image",
             "muse_segment_image",
+            "muse_vectorize_image",
             "muse_generate_animation",
             "muse_embed_image",
         ):
@@ -192,6 +193,29 @@ class TestSegmentImage:
         call = server.client.segment_image.call_args
         assert call.kwargs["image"] == SAMPLE_PNG
         assert call.kwargs["mode"] == "auto"
+
+
+class TestVectorizeImage:
+    def test_returns_svg_envelope_and_forwards_controls(self, server):
+        server.client.vectorize_image = MagicMock(return_value={
+            "model": "starvector-1b-im2svg",
+            "mime_type": "image/svg+xml",
+            "svg": '<svg xmlns="http://www.w3.org/2000/svg"><circle r="5"/></svg>',
+        })
+        blocks = server.call_handler("muse_vectorize_image", {
+            "image_b64": SAMPLE_PNG_B64,
+            "seed": 7,
+            "max_new_tokens": 512,
+        })
+        assert len(blocks) == 1
+        body = _parse_text(blocks[0])
+        assert body["mime_type"] == "image/svg+xml"
+        assert "<circle" in body["svg"]
+        call = server.client.vectorize_image.call_args
+        assert call.kwargs["image"] == SAMPLE_PNG
+        assert call.kwargs["seed"] == 7
+        assert call.kwargs["max_new_tokens"] == 512
+        assert call.kwargs["response_format"] == "json"
 
 
 class TestGenerateAnimation:

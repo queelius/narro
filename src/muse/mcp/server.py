@@ -42,7 +42,7 @@ def build_tools(filter_kind: str = "all") -> list[Any]:
     """Build the list of registered MCP Tool objects.
 
     ``filter_kind``: ``'admin'`` | ``'inference'`` | ``'all'``. Default
-    ``'all'`` returns 11 + 19 = 30 tools.
+    ``'all'`` returns 11 + 20 = 31 tools.
     """
     _require_mcp()
     from muse.mcp.tools import ADMIN_TOOLS, INFERENCE_TOOLS

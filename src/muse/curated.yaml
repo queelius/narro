@@ -746,6 +746,11 @@
 - id: stable-diffusion-x4-upscaler
   bundled: true
 
+# ---------- image/vectorization (raster-to-SVG) ----------
+
+- id: starvector-1b-im2svg
+  bundled: true
+
 # ---------- image/segmentation (SAM-2 promptable segmenters) ----------
 
 - id: sam2-hiera-tiny
