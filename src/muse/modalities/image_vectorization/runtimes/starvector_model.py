@@ -263,6 +263,18 @@ class StarVectorForCausalLM(PreTrainedModel):
             )
         self.model = _StarVectorInner(config)
 
+    def get_input_embeddings(self) -> nn.Module:
+        """Expose the nested StarCoder embeddings for weight tying."""
+        return (
+            self.model.svg_transformer.transformer.get_input_embeddings()
+        )
+
+    def get_output_embeddings(self) -> nn.Module:
+        """Expose the omitted, tied language-model checkpoint head."""
+        return (
+            self.model.svg_transformer.transformer.get_output_embeddings()
+        )
+
     def forward(self, *args: Any, **kwargs: Any):
         raise NotImplementedError(
             "call the image/vectorization runtime, not the checkpoint shell"
