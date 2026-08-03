@@ -5,15 +5,18 @@ sets a different runtime_path and a different capability flag on the
 synthesized manifest:
 
   depth-estimation      -> HFDepthRuntime, supports_depth=True
-  keypoint-detection    -> HFKeypointRuntime, supports_keypoints=True
+  keypoint-detection    -> config-dispatched HFKeypointRuntime,
+                           supports_keypoints=True
   object-detection      -> HFObjectDetectionRuntime, supports_detection=True
 
 Repo-name fallbacks catch checkpoints without the canonical tag:
 
   depth: trocr is excluded; substrings 'depth', 'dpt', 'zoedepth',
          'midas' all suggest depth.
-  keypoint: 'pose', 'keypoint', 'vitpose', 'rtmpose', 'rtmo' all
-            suggest keypoint detection.
+  keypoint: supported ViTPose and SuperPoint config/name evidence suggests
+            keypoint detection. A canonical tag without config metadata is
+            accepted with the safe dependency superset; explicitly unsupported
+            config families are rejected.
   detection: 'detr', 'yolos', 'rtdetr', 'rt-detr', 'owlvit',
              'conditional-detr' suggest object detection.
 
@@ -29,12 +32,18 @@ Loaded via single-file import; no relative imports.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
+from muse.core.resolvers import (
+    ResolvedModel,
+    ResolverError,
+    SearchResult,
+    hf_commit_revision,
+)
 
 
 _DEPTH_RUNTIME = (
@@ -55,12 +64,20 @@ _PIP_EXTRAS_BASE = (
     "Pillow",
     "numpy",
 )
+_PIP_EXTRAS_KEYPOINT_SAFE = (
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "transformers>=4.48.0",
+    "scipy",
+    "Pillow",
+    "numpy",
+)
 # Detection adds timm for backbones (DETR, RT-DETR-ResNet).
 _PIP_EXTRAS_DETECTION = (*_PIP_EXTRAS_BASE, "timm")
 
 
 _DEPTH_NAME_HINTS = ("depth", "dpt", "zoedepth", "midas")
-_KEYPOINT_NAME_HINTS = ("vitpose", "rtmpose", "rtmo", "pose-", "keypoint")
+_KEYPOINT_NAME_HINTS = ("vitpose", "superpoint")
 _DETECTION_NAME_HINTS = (
     "detr", "yolos", "rtdetr", "rt-detr", "owlvit", "owl-vit",
 )
@@ -86,11 +103,63 @@ def _is_depth(info) -> bool:
 
 
 def _is_keypoint(info) -> bool:
-    tags = getattr(info, "tags", None) or []
-    if "keypoint-detection" in tags:
+    family = _keypoint_family(info)
+    if family == "unsupported":
+        return False
+    if family is not None:
         return True
+    tags = getattr(info, "tags", None) or []
+    return "keypoint-detection" in tags
+
+
+def _architecture_names(config: Mapping) -> tuple[str, ...]:
+    """Return only well-formed architecture names from Hub metadata."""
+    value = config.get("architectures")
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(name for name in value if isinstance(name, str))
+
+
+def _is_vitpose(info) -> bool:
+    """Recognize ViTPose without treating every pose model as ViTPose."""
+    config = getattr(info, "config", None)
+    if isinstance(config, Mapping):
+        model_type = config.get("model_type")
+        architectures = _architecture_names(config)
+        if isinstance(model_type, str) or architectures:
+            return (
+                isinstance(model_type, str)
+                and model_type.lower() == "vitpose"
+            ) or any(
+                name.lower() == "vitposeforposeestimation"
+                for name in architectures
+            )
     repo_id = (getattr(info, "id", "") or "").lower()
-    return any(h in repo_id for h in _KEYPOINT_NAME_HINTS)
+    return "vitpose" in repo_id
+
+
+def _keypoint_family(info) -> str | None:
+    """Return a supported family, unsupported evidence, or opaque metadata."""
+    if _is_vitpose(info):
+        return "vitpose"
+    config = getattr(info, "config", None)
+    if isinstance(config, Mapping):
+        model_type = config.get("model_type")
+        architectures = _architecture_names(config)
+        if (
+            isinstance(model_type, str)
+            and model_type.lower() == "superpoint"
+        ) or any(
+            name.lower() == "superpointforkeypointdetection"
+            for name in architectures
+        ):
+            return "superpoint"
+        if isinstance(model_type, str) or architectures:
+            return "unsupported"
+    repo_id = (getattr(info, "id", "") or "").lower()
+    if "superpoint" in repo_id:
+        return "superpoint"
+    return None
 
 
 def _is_object_detection(info) -> bool:
@@ -134,7 +203,12 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         kind = "Depth"
     elif _is_keypoint(info):
         runtime_path = _KEYPOINT_RUNTIME
-        pip_extras = list(_PIP_EXTRAS_BASE)
+        family = _keypoint_family(info)
+        pip_extras = list(
+            _PIP_EXTRAS_BASE
+            if family == "superpoint"
+            else _PIP_EXTRAS_KEYPOINT_SAFE
+        )
         capabilities = {
             "device": "auto",
             "supports_depth": False,
@@ -142,8 +216,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             "supports_detection": False,
         }
         kind = "Keypoint detection"
-    else:
-        # _is_object_detection branch (sniff guarantees one of the three).
+    elif _is_object_detection(info):
         runtime_path = _DETECTION_RUNTIME
         pip_extras = list(_PIP_EXTRAS_DETECTION)
         capabilities = {
@@ -153,6 +226,10 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             "supports_detection": True,
         }
         kind = "Object detection"
+    else:
+        raise ResolverError(
+            f"unsupported image/cv model family for {repo_id!r}"
+        )
 
     manifest = {
         "model_id": _model_id(repo_id),
@@ -211,6 +288,10 @@ def _search(api: HfApi, query: str, *, sort: str, limit: int) -> Iterable[Search
         )
         for repo in repos:
             if repo.id in seen:
+                continue
+            if task == "keypoint-detection" and not any(
+                hint in repo.id.lower() for hint in _KEYPOINT_NAME_HINTS
+            ):
                 continue
             seen.add(repo.id)
             yield SearchResult(

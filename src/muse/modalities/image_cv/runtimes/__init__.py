@@ -7,9 +7,10 @@ Three sibling runtimes, one per primitive:
     DPT, ZoeDepth, etc. all share the encoder-decoder shape.
 
   HFKeypointRuntime
-    AutoModelForKeypointDetection + AutoImageProcessor (transformers
-    4.46+). ViTPose-family. Receives a single full-image bbox per call
-    in v1; multi-person pose pipelines need a person detector first.
+    Config-dispatched keypoint loading + AutoImageProcessor. ViTPose uses
+    VitPoseForPoseEstimation (transformers 4.48+) and receives a single
+    full-image bbox per call in v1; other supported families retain the
+    generic auto-model path.
 
   HFObjectDetectionRuntime
     AutoModelForObjectDetection + AutoImageProcessor. DETR, YOLOS,

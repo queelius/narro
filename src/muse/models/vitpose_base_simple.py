@@ -26,7 +26,7 @@ MANIFEST = {
     "license": "Apache 2.0",
     "pip_extras": [
         "torch>=2.1.0", "torchvision>=0.16.0",
-        "transformers>=4.46.0", "Pillow", "numpy",
+        "transformers>=4.48.0", "scipy", "Pillow", "numpy",
     ],
     "system_packages": [],
     "capabilities": {

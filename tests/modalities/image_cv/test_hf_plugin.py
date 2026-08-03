@@ -1,17 +1,20 @@
 """Tests for the image_cv HF plugin (3-way dispatch)."""
 from unittest.mock import MagicMock
 
+import pytest
+
 from muse.modalities.image_cv.hf import HF_PLUGIN
 from muse.core.discovery import REQUIRED_HF_PLUGIN_KEYS
-from muse.core.resolvers import ResolvedModel
+from muse.core.resolvers import ResolvedModel, ResolverError
 
 
-def _fake_info(siblings=None, tags=None, repo_id="org/repo"):
+def _fake_info(siblings=None, tags=None, repo_id="org/repo", config=None):
     info = MagicMock()
     info.siblings = [MagicMock(rfilename=f) for f in (siblings or [])]
     info.tags = tags or []
     info.card_data = MagicMock(license=None)
     info.id = repo_id
+    info.config = config or {}
     return info
 
 
@@ -48,6 +51,42 @@ def test_sniff_true_on_depth_repo_name_fallback():
 
 def test_sniff_true_on_keypoint_repo_name_fallback():
     info = _fake_info(tags=[], repo_id="custom-org/vitpose-finetune")
+    assert HF_PLUGIN["sniff"](info) is True
+
+
+def test_sniff_true_on_vitpose_config_without_name_or_tag():
+    info = _fake_info(
+        tags=[], repo_id="custom-org/custom-pose-model",
+        config={"model_type": "vitpose"},
+    )
+    assert HF_PLUGIN["sniff"](info) is True
+
+
+def test_sniff_true_on_vitpose_architecture_without_name_or_tag():
+    info = _fake_info(
+        tags=[], repo_id="custom-org/custom-pose-model",
+        config={"architectures": ["VitPoseForPoseEstimation"]},
+    )
+    assert HF_PLUGIN["sniff"](info) is True
+
+
+def test_sniff_rejects_explicitly_unsupported_keypoint_family():
+    info = _fake_info(
+        tags=["keypoint-detection"], repo_id="org/rtmpose-model",
+        config={"model_type": "rtmpose"},
+    )
+    assert HF_PLUGIN["sniff"](info) is False
+
+
+def test_sniff_rejects_unsupported_keypoint_name_without_tag():
+    info = _fake_info(tags=[], repo_id="org/rtmpose-model")
+    assert HF_PLUGIN["sniff"](info) is False
+
+
+def test_sniff_tolerates_malformed_architecture_metadata():
+    info = _fake_info(
+        tags=["keypoint-detection"], config={"architectures": 123},
+    )
     assert HF_PLUGIN["sniff"](info) is True
 
 
@@ -100,6 +139,41 @@ def test_resolve_keypoint_dispatches_to_keypoint_runtime():
         extra.startswith("torchvision")
         for extra in result.manifest["pip_extras"]
     )
+    assert "transformers>=4.48.0" in result.manifest["pip_extras"]
+    assert "scipy" in result.manifest["pip_extras"]
+
+
+def test_resolve_generic_keypoint_keeps_generic_dependencies():
+    info = _fake_info(
+        tags=["keypoint-detection"],
+        repo_id="magic-leap-community/superpoint",
+        config={"model_type": "superpoint"},
+    )
+    result = HF_PLUGIN["resolve"](
+        "magic-leap-community/superpoint", None, info,
+    )
+
+    assert "HFKeypointRuntime" in result.backend_path
+    assert "transformers>=4.46.0" in result.manifest["pip_extras"]
+    assert "scipy" not in result.manifest["pip_extras"]
+
+
+def test_forced_resolve_rejects_unsupported_keypoint_family():
+    info = _fake_info(
+        tags=["keypoint-detection"], repo_id="org/rtmpose-model",
+        config={"model_type": "rtmpose"},
+    )
+
+    with pytest.raises(ResolverError, match="unsupported image/cv"):
+        HF_PLUGIN["resolve"]("org/rtmpose-model", None, info)
+
+
+def test_resolve_opaque_keypoint_uses_safe_dependency_superset():
+    info = _fake_info(tags=["keypoint-detection"], repo_id="org/opaque-model")
+    result = HF_PLUGIN["resolve"]("org/opaque-model", None, info)
+
+    assert "transformers>=4.48.0" in result.manifest["pip_extras"]
+    assert "scipy" in result.manifest["pip_extras"]
 
 
 def test_resolve_object_detection_dispatches_to_detection_runtime():
@@ -189,15 +263,35 @@ def test_search_yields_results():
     # Three queries (one per task tag); each returns one fake repo.
     fake_api.list_models.side_effect = [
         [MagicMock(id="org/depth-x", downloads=10)],
-        [MagicMock(id="org/pose-x", downloads=20)],
+        [MagicMock(id="org/vitpose-x", downloads=20)],
         [MagicMock(id="org/detr-x", downloads=30)],
     ]
     rows = list(HF_PLUGIN["search"](
         fake_api, "x", sort="downloads", limit=30,
     ))
     assert len(rows) == 3
-    assert {r.model_id for r in rows} == {"depth-x", "pose-x", "detr-x"}
+    assert {r.model_id for r in rows} == {
+        "depth-x", "vitpose-x", "detr-x",
+    }
     assert all(r.modality == "image/cv" for r in rows)
+    assert [call.kwargs["filter"] for call in fake_api.list_models.call_args_list] == [
+        "depth-estimation", "keypoint-detection", "object-detection",
+    ]
+
+
+def test_search_omits_unsupported_keypoint_family():
+    fake_api = MagicMock()
+    fake_api.list_models.side_effect = [
+        [],
+        [MagicMock(id="org/rtmpose-x", downloads=20)],
+        [],
+    ]
+
+    rows = list(HF_PLUGIN["search"](
+        fake_api, "x", sort="downloads", limit=30,
+    ))
+
+    assert rows == []
 
 
 def test_search_dedupes_overlapping_repos():

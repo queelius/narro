@@ -3,7 +3,7 @@
 Three primitives share this MIME tag:
 
   POST /v1/images/depth      depth estimation (depth-anything, ZoeDepth, DPT)
-  POST /v1/images/keypoints  keypoint / pose detection (ViTPose, RTMPose)
+  POST /v1/images/keypoints  keypoint / pose detection (ViTPose, SuperPoint)
   POST /v1/images/detect     object detection (DETR, YOLOS, RT-DETR)
 
 Each model declares one of three capability flags

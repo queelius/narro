@@ -21,16 +21,12 @@ def test_model_inherits_runtime():
     assert issubclass(Model, HFKeypointRuntime)
 
 
-def test_pip_extras_requires_transformers_4_46():
-    """AutoModelForKeypointDetection arrived in 4.46; the bundled
-    pip_extras must pin that minimum so a fresh-venv pull doesn't
-    silently install an older transformers and crash on load."""
+def test_pip_extras_require_vitpose_transformers_and_scipy():
+    """Fresh pulls include the explicit ViTPose API and processor deps."""
     extras = MANIFEST["pip_extras"]
     transformers_pins = [e for e in extras if e.startswith("transformers")]
-    assert transformers_pins
-    # Must be >= 4.46.x.
-    pin = transformers_pins[0]
-    assert "4.46" in pin or ">4.46" in pin or ">=4.46" in pin
+    assert transformers_pins == ["transformers>=4.48.0"]
+    assert "scipy" in extras
 
 
 def test_pip_extras_include_transformers_5_image_processor_dependency():
