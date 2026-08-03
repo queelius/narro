@@ -583,7 +583,10 @@ class TestLoadModelIntoWorkerDeadSpec:
             },
         })
 
+        spawn_started = threading.Event()
+
         def _slow_spawn(spec, device, **_kwargs):
+            spawn_started.set()
             time.sleep(0.4)
 
         monkeypatch.setattr("muse.admin.operations.spawn_worker", _slow_spawn)
@@ -602,8 +605,9 @@ class TestLoadModelIntoWorkerDeadSpec:
             enable_done.set()
 
         threading.Thread(target=_enable).start()
-        # Give the enable thread a head start so it's mid-spawn.
-        time.sleep(0.1)
+        assert spawn_started.wait(timeout=1.0), (
+            "enable thread did not enter the mocked spawn window"
+        )
 
         # Grab the lock and time it. With the bug, this would block
         # for the full slow-spawn duration (0.3s+).
