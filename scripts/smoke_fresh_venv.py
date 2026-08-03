@@ -5,11 +5,11 @@ Catches the production failure mode where a bundled script's
 transitive deps that `from_pretrained` (or sentence-transformers, or
 diffusers) pulls in at load time.
 
-The host muse install (with broad dev extras: server, audio, images,
-embeddings, dev) typically has those transitives already, so the test
-suite passes. A fresh per-model venv created via `muse pull` does NOT,
-because `pull` installs ONLY `museq[server]` plus the model's declared
-`pip_extras`. Transitive holes show up there.
+The host harness installs Muse's dev and server extras so `muse pull`
+can discover bundled models and execute its CLI path. A fresh per-model
+venv created by that pull does NOT inherit host packages: it installs
+ONLY `museq[server]` plus the model's declared `pip_extras`. Transitive
+holes therefore show up in the in-venv probe.
 
 This script reproduces the `muse pull` install path against a clean
 venv and then runs the in-venv probe worker. Most models use load-only

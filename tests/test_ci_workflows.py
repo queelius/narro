@@ -14,6 +14,17 @@ def test_fresh_venv_smoke_propagates_failure_through_tee():
     assert "| tee smoke-result.json" in smoke_step
 
 
+def test_fresh_venv_smoke_host_can_discover_bundled_models():
+    workflow = (ROOT / ".github/workflows/fresh-venv-smoke.yml").read_text()
+    host_install = workflow.split("- name: install host muse", 1)[1].split(
+        "- name:", 1,
+    )[0]
+    match = re.search(r'pip install -e "\.\[([^]]+)]"', host_install)
+    assert match is not None
+    extras = {extra.strip() for extra in match.group(1).split(",")}
+    assert {"dev", "server"} <= extras
+
+
 def test_release_gate_validates_wheel_and_sdist_built_wheel():
     workflow = (ROOT / ".github/workflows/tests.yml").read_text()
     artifact_job = workflow.split("  artifacts:", 1)[1]

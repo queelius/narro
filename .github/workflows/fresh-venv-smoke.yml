@@ -81,7 +81,11 @@ jobs:
           PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # The outer harness executes `muse pull`, whose bundled-model
+          # discovery imports modality protocols backed by FastAPI. Keep
+          # model ML dependencies isolated to the fresh venv below, but give
+          # the harness Muse's server runtime contract.
+          pip install -e ".[dev,server]"
 
       - name: system deps for kokoro
         if: matrix.model == 'kokoro-82m'
