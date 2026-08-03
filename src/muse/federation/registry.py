@@ -225,17 +225,16 @@ class NodeRegistry:
         """Own cancellation of one refresh task until it actually settles."""
         try:
             task.cancel()
+            # Waiting on the set does not forward cancellation into its
+            # member task. This dedicated owner can therefore distinguish
+            # its own cancellation from the expected cancellation result
+            # of the refresh task without relying on Task.cancelling(),
+            # which is unavailable on Python 3.10.
+            await asyncio.wait((task,))
             try:
-                # Caller cancellation must not cancel the shared refresh-task
-                # teardown. It can be retried only when this dedicated owner
-                # itself is cancelled (for example during loop shutdown).
-                await asyncio.shield(task)
+                task.result()
             except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
-                    raise
-                if not task.done():
-                    raise
+                pass
         except Exception:
             logger.warning("federation registry close failed", exc_info=True)
             raise
@@ -250,9 +249,10 @@ class NodeRegistry:
     async def aclose(self) -> None:
         """Cancel the refresh loop, sharing one teardown across all callers.
 
-        Every overlapping caller awaits the same shielded lifecycle task. A
-        cancelled waiter therefore cannot strand the registry half-closed or
-        make another waiter return before the refresh task has settled.
+        Every overlapping caller waits on the same lifecycle task without
+        forwarding its own cancellation. A cancelled waiter therefore cannot
+        strand the registry half-closed or make another waiter return before
+        the refresh task has settled.
         """
         close_task = self._close_task
         if close_task is None:
@@ -273,4 +273,5 @@ class NodeRegistry:
             # completed synchronously before `_close_task` was assigned.
             if close_task.done() and self._close_task is close_task:
                 self._close_task = None
-        await asyncio.shield(close_task)
+        await asyncio.wait((close_task,))
+        close_task.result()

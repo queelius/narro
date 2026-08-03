@@ -172,8 +172,7 @@ async def run_native_offload(
 
     A native callable that raises ``asyncio.CancelledError`` is also treated
     as abandoned: asyncio marks the inner task cancelled, so the helper runs
-    cleanup and re-raises the original native exception rather than exposing
-    shield's message-less replacement.
+    cleanup and re-raises the original native exception.
 
     The ownership handshake lives inside the native wrapper rather than in a
     task done callback. Event-loop shutdown can cancel an asyncio task while
@@ -203,24 +202,32 @@ async def run_native_offload(
 
     task = asyncio.create_task(asyncio.to_thread(_run))
     try:
-        result = await asyncio.shield(task)
-    except asyncio.CancelledError:
-        current = asyncio.current_task()
-        backend_cancelled = ownership.backend_cancelled_error()
+        # asyncio.wait never forwards this request task's cancellation into
+        # a member task. Unlike asyncio.shield on Python 3.14, it also does
+        # not report an eventual abandoned exception independently through
+        # the loop exception handler.
+        await asyncio.wait((task,))
+    except BaseException:
+        # Any external unwind abandons the still-independent native task.
+        # Cancellation is the common case, but GeneratorExit and other base
+        # exceptions must not leave its eventual resources unowned either.
         ownership.abandon()
         _track_abandoned_task(task, ownership)
-        if (
-            backend_cancelled is not None
-            and (current is None or current.cancelling() == 0)
-        ):
+        raise
+
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        # The wait completed, so this cancellation belongs to the native
+        # callable rather than the request waiter. Preserve its original
+        # exception (including message) while taking abandoned ownership.
+        backend_cancelled = ownership.backend_cancelled_error()
+        ownership.abandon()
+        if backend_cancelled is not None:
             raise backend_cancelled
         raise
     except BaseException:
-        if task.done():
-            ownership.claim()
-        else:
-            ownership.abandon()
-            _track_abandoned_task(task, ownership)
+        ownership.claim()
         raise
     else:
         ownership.claim()

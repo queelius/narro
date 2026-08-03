@@ -215,11 +215,14 @@ def test_read_wraps_advisory_lock_failure(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink loops are POSIX-specific")
-def test_read_wraps_catalog_symlink_resolution_loop(tmp_path):
+def test_read_rejects_catalog_symlink_resolution_loop(tmp_path):
     loop = tmp_path / "loop"
     loop.symlink_to(loop)
 
-    with pytest.raises(registry.ResourceRegistryError, match="cannot resolve"):
+    with pytest.raises(
+        registry.ResourceRegistryError,
+        match="cannot resolve|not a safe directory",
+    ):
         registry.list_resources(catalog_dir=loop)
 
 

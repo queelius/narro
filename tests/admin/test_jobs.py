@@ -417,6 +417,16 @@ class TestJobStore:
         assert (5252, signal.SIGTERM) in signals
         assert (5252, signal.SIGKILL) in signals
 
+    @pytest.mark.skipif(
+        not (
+            callable(getattr(os, "waitid", None))
+            and all(
+                getattr(os, name, None) is not None
+                for name in ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+            )
+        ),
+        reason="requires waitid with WNOWAIT",
+    )
     def test_pinned_group_gets_final_kill_before_leader_reap(self):
         store = JobStore()
         job = store.create(op="pull", model_id="m")

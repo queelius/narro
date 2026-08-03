@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 
 import pytest
@@ -88,7 +89,9 @@ async def test_cancelled_success_keeps_input_open_and_closes_eventual_result():
     task.cancel("client disconnected")
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
-    assert caught.value.args == ("client disconnected",)
+    # Python 3.11 began propagating Task.cancel(msg) to awaiters.
+    expected_args = ("client disconnected",) if sys.version_info >= (3, 11) else ()
+    assert caught.value.args == expected_args
     assert not input_resource.closed
     assert not output_resource.closed
 
@@ -196,6 +199,47 @@ async def test_cancelled_while_executor_work_is_unstarted_cleans_inputs(
 
 
 @pytest.mark.asyncio
+async def test_external_base_exception_still_tracks_unstarted_work(monkeypatch):
+    class ExternalUnwind(BaseException):
+        pass
+
+    entered_to_thread = asyncio.Event()
+    never_start = asyncio.Event()
+    cleanup_done = asyncio.Event()
+    cleanup_values: list[object] = []
+
+    async def _queued_to_thread(_call):
+        entered_to_thread.set()
+        await never_start.wait()
+
+    async def _raise_external_unwind(_tasks):
+        await entered_to_thread.wait()
+        raise ExternalUnwind("request coroutine closed")
+
+    def _cleanup(value) -> None:
+        cleanup_values.append(value)
+        cleanup_done.set()
+
+    monkeypatch.setattr(offload.asyncio, "to_thread", _queued_to_thread)
+    monkeypatch.setattr(offload.asyncio, "wait", _raise_external_unwind)
+
+    with pytest.raises(ExternalUnwind, match="request coroutine closed"):
+        await offload.run_native_offload(
+            lambda: pytest.fail("native callable unexpectedly ran"),
+            cleanup_abandoned=_cleanup,
+        )
+
+    assert len(offload._ABANDONED_OFFLOADS) == 1
+    inner = next(iter(offload._ABANDONED_OFFLOADS))
+    inner.cancel()
+    await asyncio.wait_for(cleanup_done.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert cleanup_values == [None]
+    assert not offload._ABANDONED_OFFLOADS
+
+
+@pytest.mark.asyncio
 async def test_backend_cancelled_error_uses_abandoned_cleanup_once():
     input_resource = _Closable()
     cleanup_values: list[object] = []
@@ -212,6 +256,7 @@ async def test_backend_cancelled_error_uses_abandoned_cleanup_once():
             _cancel,
             cleanup_abandoned=_cleanup,
         )
+    assert not offload._ABANDONED_OFFLOADS
     await asyncio.sleep(0)
 
     assert cleanup_values == [None]

@@ -1884,6 +1884,9 @@ class TestProbeAndPull:
 
         assert capture.finish(timeout=0.2) is False
         assert stdout.closed.is_set()
+        # Production performs this bounded final-drain pass after a forced
+        # close. Mirror that contract before asserting scheduler settlement.
+        capture.finish(timeout=1.0)
         assert all(not thread.is_alive() for thread in capture._threads.values())
 
     def test_inherited_output_fd_never_resignals_reaped_leader(
