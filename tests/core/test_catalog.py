@@ -19,6 +19,37 @@ from muse.core.catalog import (
 from muse.core.discovery import modality_tags
 
 
+def test_pull_runs_automatic_storage_maintenance_before_model_dispatch(
+    tmp_catalog,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from muse.core import catalog as catalog_module
+
+    events = []
+
+    def maintenance():
+        events.append("maintenance")
+
+    def bundled(_identifier):
+        events.append("pull")
+
+    monkeypatch.setattr(
+        catalog_module, "_run_automatic_storage_maintenance", maintenance,
+    )
+    monkeypatch.setattr(
+        catalog_module,
+        "find_curated",
+        lambda _identifier: SimpleNamespace(id="demo", uri=None),
+    )
+    monkeypatch.setattr(catalog_module, "_pull_bundled", bundled)
+
+    pull("demo")
+
+    assert events == ["maintenance", "pull"]
+
+
 def _hold_catalog_process_lock(catalog_dir, holding, release) -> None:
     """Child helper: hold one cross-process catalog transaction open."""
     import os
@@ -237,7 +268,14 @@ def test_pull_installs_pip_downloads_and_writes_catalog(tmp_catalog):
         assert is_pulled("soprano-80m")
 
 
-def test_pull_unknown_raises():
+def test_pull_unknown_raises_without_running_storage_maintenance(
+    tmp_catalog,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "muse.core.catalog._run_automatic_storage_maintenance",
+        lambda: pytest.fail("unknown identifiers must not trigger cleanup"),
+    )
     with pytest.raises(KeyError, match="unknown model"):
         pull("does-not-exist-xyz")
 
@@ -548,6 +586,93 @@ def test_remove_with_purge_cleans_resolver_weights(tmp_catalog):
     assert not weights_dir.exists(), "purge must rmtree resolver weights"
     assert not venv_path.exists(), "purge must rmtree venv"
     assert "x" not in _read_catalog()
+
+
+def test_remove_with_purge_deletes_complete_hf_cache_repository(tmp_catalog):
+    """A snapshot path owns its repository, including sibling blob storage."""
+    from muse.core.catalog import _write_catalog
+
+    revision = "a" * 40
+    repo = tmp_catalog / "weights" / "models--org--demo"
+    blob = repo / "blobs" / "blob-a"
+    snapshot = repo / "snapshots" / revision
+    blob.parent.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob.write_bytes(b"large-weight")
+    (snapshot / "model.bin").symlink_to(Path("../../blobs/blob-a"))
+    _write_catalog({"demo": {"local_dir": str(snapshot)}})
+
+    remove("demo", purge=True)
+
+    assert not repo.exists(), "purge must reclaim blobs, not only snapshot links"
+
+
+def test_remove_with_purge_preserves_hf_repo_with_sibling_revision_reference(
+    tmp_catalog,
+):
+    """A different catalog snapshot in the same HF repo protects the repo."""
+    from muse.core.catalog import _write_catalog
+
+    repo = tmp_catalog / "weights" / "models--org--shared"
+    first = repo / "snapshots" / ("a" * 40)
+    second = repo / "snapshots" / ("b" * 40)
+    blob = repo / "blobs" / "blob"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    blob.parent.mkdir()
+    blob.write_bytes(b"shared")
+    _write_catalog({
+        "owner": {"local_dir": str(first)},
+        "sibling": {"local_dir": str(second)},
+    })
+
+    remove("owner", purge=True)
+
+    assert repo.exists()
+    assert blob.read_bytes() == b"shared"
+    assert "owner" not in _read_catalog()
+    assert "sibling" in _read_catalog()
+
+
+def test_remove_with_purge_rechecks_hf_repo_references_under_storage_lock(
+    tmp_catalog,
+    monkeypatch,
+):
+    """A different model may acquire the repository after unregistering."""
+    from contextlib import contextmanager
+
+    from muse.core import catalog as catalog_module
+    from muse.core.catalog import _write_catalog
+
+    repo = tmp_catalog / "weights" / "models--org--raced"
+    first = repo / "snapshots" / ("a" * 40)
+    second = repo / "snapshots" / ("b" * 40)
+    blob = repo / "blobs" / "blob"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    blob.parent.mkdir()
+    blob.write_bytes(b"shared")
+    _write_catalog({"owner": {"local_dir": str(first)}})
+
+    real_storage_lock = catalog_module._storage_cache_lock
+
+    @contextmanager
+    def storage_lock_with_new_reference(*, wait=True):
+        with real_storage_lock(wait=wait):
+            catalog = _read_catalog()
+            catalog["late-owner"] = {"local_dir": str(second)}
+            _write_catalog(catalog)
+            yield
+
+    monkeypatch.setattr(
+        catalog_module, "_storage_cache_lock", storage_lock_with_new_reference,
+    )
+
+    remove("owner", purge=True)
+
+    assert blob.read_bytes() == b"shared"
+    assert "owner" not in _read_catalog()
+    assert _read_catalog()["late-owner"]["local_dir"] == str(second)
 
 
 def test_remove_with_purge_preserves_weights_referenced_by_other_entry(
@@ -3098,6 +3223,7 @@ def test_pull_bundled_honors_allow_patterns_capability(tmp_catalog):
     # Verify snapshot_download was called with allow_patterns
     mock_download.assert_called_once()
     kwargs = mock_download.call_args.kwargs
+    assert kwargs["cache_dir"] == str(tmp_catalog / "weights")
     assert "allow_patterns" in kwargs
     patterns = kwargs["allow_patterns"]
     # spot-check a few patterns we know should be there

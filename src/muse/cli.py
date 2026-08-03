@@ -121,6 +121,14 @@ doctor_app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(doctor_app, name="doctor")
+storage_app = typer.Typer(
+    name="storage",
+    help="inspect and reclaim Muse-owned disk space",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(storage_app, name="storage")
 
 
 def _version_callback(value: bool) -> bool:
@@ -185,6 +193,59 @@ def doctor_resources(
     from muse.cli_impl.resource_doctor import run_resource_doctor
 
     raise typer.Exit(run_resource_doctor(repair=repair, grace=grace))
+
+
+@doctor_app.command("storage")
+def doctor_storage(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="emit a machine-readable storage report"),
+    ] = False,
+) -> None:
+    """Inspect owned and adjacent shared storage without changing it."""
+    from muse.cli_impl.storage import run_storage_doctor
+
+    raise typer.Exit(run_storage_doctor(json_output=json_output))
+
+
+@storage_app.command("prune")
+def storage_prune(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="show the cleanup plan without deleting"),
+    ] = False,
+    include_unreferenced: Annotated[
+        bool,
+        typer.Option(
+            "--include-unreferenced",
+            help=(
+                "also delete old Muse-owned venvs/weights with no catalog "
+                "reference; these may have been intentionally retained"
+            ),
+        ),
+    ] = False,
+    older_than_hours: Annotated[
+        float,
+        typer.Option(
+            "--older-than-hours",
+            min=0.0,
+            help="only prune items untouched for at least this many hours",
+        ),
+    ] = 24.0,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="emit machine-readable results"),
+    ] = False,
+) -> None:
+    """Delete old partial/staging data; unreferenced models require opt-in."""
+    from muse.cli_impl.storage import run_storage_prune
+
+    raise typer.Exit(run_storage_prune(
+        dry_run=dry_run,
+        include_unreferenced=include_unreferenced,
+        older_than_hours=older_than_hours,
+        json_output=json_output,
+    ))
 
 
 def _resolve_serve_device(cli_device: "Device | None") -> str:
@@ -620,20 +681,20 @@ def models_remove(
         typer.Option(
             "--purge",
             help=(
-                "also delete the per-model venv (HF weights cache is left alone; "
-                "use huggingface-cli delete-cache to reclaim it)"
+                "also delete the per-model venv and unshared Muse-owned "
+                "weights; legacy weights in a shared HF cache are preserved"
             ),
         ),
     ] = False,
 ) -> None:
     """Unregister a model from the catalog."""
-    from muse.core.catalog import ModelInUseError, remove
+    from muse.core.catalog import CatalogError, remove
     try:
         remove(model_id, purge=purge)
-    except ModelInUseError as e:
+    except CatalogError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2)
-    suffix = " (purged venv)" if purge else ""
+    suffix = " (purged unshared Muse-owned files)" if purge else ""
     typer.echo(f"removed {model_id} from catalog{suffix}")
 
 

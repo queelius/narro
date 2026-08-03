@@ -58,6 +58,12 @@ def test_catalog_write_rejects_nonfinite_json() -> None:
         catalog._write_catalog({"model": {"memory_gb": float("nan")}})
 
 
+@pytest.mark.parametrize("model_id", ["../escape", "/absolute", ".", ".."])
+def test_catalog_rejects_filesystem_unsafe_model_ids(model_id: str) -> None:
+    with pytest.raises(catalog.CatalogError, match="invalid model id"):
+        catalog._write_catalog({model_id: {"enabled": True}})
+
+
 def test_catalog_read_rejects_oversized_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

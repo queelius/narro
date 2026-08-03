@@ -435,13 +435,15 @@ governs each load's admission and any same-pool eviction.
 | `muse search <query> [--modality M]` | search HuggingFace for pullable GGUF / sentence-transformers models |
 | `muse models list [--modality X]` | list known/pulled models with five-state status (enabled_loaded / enabled_unloaded / disabled / recommended / available) |
 | `muse models info <model-id>` | show catalog entry |
-| `muse models remove <model-id>` | unregister from catalog |
+| `muse models remove <model-id> [--purge]` | unregister; optionally delete its unshared Muse-owned venv and weights |
 | `muse models enable <model-id>` | mark a pulled model active in the catalog (allowed to lazy-load) |
 | `muse models disable <model-id>` | mark a pulled model inactive in the catalog (refuses to lazy-load) |
 | `muse models warmup <model-id>` | pre-load a model into a worker without serving traffic; first real request is hot |
 | `muse models refresh <id> \| --all \| --enabled` | re-install museq[server,extras] into per-model venv(s) (after `pip install -U museq`) |
 | `muse config generate \| show \| path \| get \| set \| unset` | manage `~/.muse/config.yaml` (see Configuration below) |
 | `muse doctor resources [--repair]` | inspect Muse's owned-resource registry; optionally clean verified stale/orphan records after an unclean exit |
+| `muse doctor storage [--json]` | report Muse-owned storage, shared caches, broken references, and reclaimable space without changing files |
+| `muse storage prune [--dry-run] [--include-unreferenced]` | reclaim old partial/staging data; optionally include unregistered retained model files |
 | `muse mcp [--http]` | run an MCP server bridging muse to LLM clients (31 tools) |
 
 No per-modality subcommands (`muse speak`, `muse audio ...`). Those would be hardcoded modality-to-verb mappings that grow with every new modality. Keeping the CLI modality-agnostic means embeddings, transcriptions, and video land without CLI churn.
@@ -452,6 +454,15 @@ records and terminate only orphan Muse process leaders whose recorded identity
 can still be verified; unverifiable or changed identities are refused and
 reported for manual investigation. Normal `Ctrl+C` shutdown should release the
 same resources without needing repair.
+
+`muse doctor storage` separates the Muse-owned catalog directory from the
+user-wide Hugging Face and pip caches. `muse storage prune` only deletes old
+partial downloads and abandoned staging workspaces by default. Unregistered
+venvs and weights may have been deliberately retained by `muse models remove`,
+so deleting them requires `--include-unreferenced`; shared caches are always
+report-only. Pulls automatically run this narrow safe cleanup when disk
+headroom falls below the configured limits. See
+[Storage lifecycle](docs/STORAGE.md) for ownership and safety details.
 
 ## Configuration
 

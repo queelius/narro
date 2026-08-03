@@ -7,6 +7,7 @@ No per-modality subcommands — those would be hardcoded modality→verb
 mappings (the anti-pattern this CLI design rejects).
 """
 import os
+import json
 import subprocess
 import sys
 from importlib.metadata import version
@@ -69,7 +70,7 @@ def test_top_level_help_lists_only_admin_subcommands():
     """serve, pull, models — and nothing modality-specific."""
     r = _run("--help")
     combined = r.stdout + r.stderr
-    for cmd in ("serve", "pull", "models"):
+    for cmd in ("serve", "pull", "models", "storage"):
         assert cmd in combined, f"{cmd!r} missing from top-level help"
     # The per-modality and shortcut subcommands must NOT appear
     for removed in ("speak", "imagine", "audio ", "images "):
@@ -94,6 +95,67 @@ def test_doctor_resources_command_parses_without_inspecting_processes():
     opts = [opt for param in resources.params for opt in param.opts]
     assert "--repair" in opts
     assert "--grace" in opts
+
+
+def test_storage_commands_expose_safe_cleanup_controls():
+    import typer
+
+    from muse.cli import app
+
+    root = typer.main.get_command(app)
+    doctor = root.commands["doctor"]
+    storage = root.commands["storage"]
+    assert "storage" in doctor.commands
+    assert "prune" in storage.commands
+    doctor_opts = [
+        opt for param in doctor.commands["storage"].params for opt in param.opts
+    ]
+    prune_opts = [
+        opt for param in storage.commands["prune"].params for opt in param.opts
+    ]
+    assert "--json" in doctor_opts
+    assert "--repair" not in doctor_opts
+    for option in ("--dry-run", "--include-unreferenced", "--older-than-hours"):
+        assert option in prune_opts
+
+
+def test_doctor_storage_json_is_read_only_on_empty_state(tmp_path):
+    catalog = tmp_path / "catalog"
+    assert not catalog.exists()
+
+    r = _run("doctor", "storage", "--json")
+
+    # Doctor may return 1 solely because the host filesystem is below its
+    # free-space health threshold; the isolated Muse state itself is empty.
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["muse_owned"]["total_bytes"] == 0
+    assert payload["automatic_policy"]["safe_categories_only"] is True
+    assert not catalog.exists()
+
+
+def test_storage_prune_empty_dry_run_is_success():
+    r = _run("storage", "prune", "--dry-run", "--json")
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["dry_run"] is True
+    assert payload["estimated_bytes"] == 0
+    assert payload["outcomes"] == []
+
+
+def test_models_remove_reports_catalog_safety_error_without_traceback(tmp_path):
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    (catalog / "catalog.json").write_text(
+        json.dumps({"../escape": {"enabled": True}}),
+    )
+
+    r = _run("models", "remove", "../escape", "--purge")
+
+    assert r.returncode == 2
+    assert "invalid model id" in r.stderr
+    assert "Traceback" not in r.stderr
 
 
 def test_models_list_shows_entries_across_all_modalities():

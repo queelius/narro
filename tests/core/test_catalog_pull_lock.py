@@ -34,6 +34,31 @@ def _acquire_model_pull_lock(
         acquired.set()
 
 
+def _hold_storage_cache_lock(catalog_dir: str, holding, release) -> None:
+    os.environ["MUSE_CATALOG_DIR"] = catalog_dir
+    from muse.core import config
+    from muse.core.catalog import _storage_cache_lock
+
+    config.reset_config()
+    with _storage_cache_lock():
+        holding.set()
+        release.wait(10)
+
+
+def _try_storage_cache_lock(catalog_dir: str, attempted, refused) -> None:
+    os.environ["MUSE_CATALOG_DIR"] = catalog_dir
+    from muse.core import config
+    from muse.core.catalog import StorageBusyError, _storage_cache_lock
+
+    config.reset_config()
+    attempted.set()
+    try:
+        with _storage_cache_lock(wait=False):
+            pass
+    except StorageBusyError:
+        refused.set()
+
+
 def test_same_model_pull_lock_serializes_independent_processes(tmp_path):
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("requires fork-capable platform")
@@ -116,6 +141,66 @@ def test_pull_lock_paths_are_hashed_and_private(tmp_path, monkeypatch):
         assert lock_files[0].stat().st_mode & 0o777 == 0o600
         assert (tmp_path / "locks").stat().st_mode & 0o777 == 0o700
     config.reset_config()
+
+
+def test_storage_cache_lock_is_nonblocking_for_cleanup(tmp_path, monkeypatch):
+    from muse.core import config
+    from muse.core.catalog import StorageBusyError, _storage_cache_lock
+
+    monkeypatch.setenv("MUSE_CATALOG_DIR", str(tmp_path))
+    config.reset_config()
+    attempted = threading.Event()
+    refused = threading.Event()
+
+    def contender() -> None:
+        attempted.set()
+        try:
+            with _storage_cache_lock(wait=False):
+                pass
+        except StorageBusyError:
+            refused.set()
+
+    with _storage_cache_lock():
+        thread = threading.Thread(target=contender)
+        thread.start()
+        assert attempted.wait(1)
+        assert refused.wait(1)
+        thread.join(2)
+        lock_path = tmp_path / "locks" / "storage-cache.lock"
+        assert lock_path.stat().st_mode & 0o777 == 0o600
+    config.reset_config()
+
+
+def test_storage_cache_lock_serializes_independent_processes(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires fork-capable platform")
+    context = multiprocessing.get_context("fork")
+    holding = context.Event()
+    release = context.Event()
+    attempted = context.Event()
+    refused = context.Event()
+    holder = context.Process(
+        target=_hold_storage_cache_lock,
+        args=(str(tmp_path), holding, release),
+    )
+    contender = context.Process(
+        target=_try_storage_cache_lock,
+        args=(str(tmp_path), attempted, refused),
+    )
+    holder.start()
+    try:
+        assert holding.wait(5)
+        contender.start()
+        assert attempted.wait(5)
+        assert refused.wait(5)
+        contender.join(5)
+        assert contender.exitcode == 0
+    finally:
+        release.set()
+        holder.join(5)
+        if contender.pid is not None:
+            contender.join(1)
+    assert holder.exitcode == 0
 
 
 def test_remove_waits_for_same_model_pull_lock(tmp_path, monkeypatch):

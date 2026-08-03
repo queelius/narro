@@ -35,6 +35,10 @@ def test_expected_settings_present():
         "admin.token",
         "client.server_url",
         "paths.catalog_dir",
+        "storage.auto_prune_before_pull",
+        "storage.auto_prune_grace_hours",
+        "storage.auto_prune_min_free_gb",
+        "storage.auto_prune_min_free_percent",
         "fetch.allow_private",
         "limits.upscale_max_input_side",
         "limits.vectorization_max_input_side",
@@ -58,6 +62,13 @@ def test_video_cpu_offload_setting_shape():
 
 def test_idle_timeout_default_is_600():
     assert cfg.SETTINGS_BY_KEY["server.idle_timeout_seconds"].default == 600.0
+
+
+def test_storage_maintenance_defaults_are_conservative():
+    assert cfg.SETTINGS_BY_KEY["storage.auto_prune_before_pull"].default is True
+    assert cfg.SETTINGS_BY_KEY["storage.auto_prune_grace_hours"].default == 24.0
+    assert cfg.SETTINGS_BY_KEY["storage.auto_prune_min_free_gb"].default == 50.0
+    assert cfg.SETTINGS_BY_KEY["storage.auto_prune_min_free_percent"].default == 5.0
 
 
 def test_max_request_body_setting_is_strictly_positive():

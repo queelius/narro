@@ -137,6 +137,10 @@ class ModelInUseError(CatalogError):
     """Raised when a live worker/probe owns a model's mutable resources."""
 
 
+class StorageBusyError(CatalogError):
+    """Raised when another process is mutating Muse's weights cache."""
+
+
 @dataclass(frozen=True)
 class CatalogEntry:
     """Stable catalog shape derived from a model script's MANIFEST."""
@@ -540,13 +544,16 @@ _PULL_LOCKS_GUARD = threading.Lock()
 _PULL_THREAD_LOCKS: dict[str, threading.RLock] = {}
 _RESOURCE_LOCKS_GUARD = threading.Lock()
 _RESOURCE_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_STORAGE_THREAD_LOCK = threading.RLock()
 
 
 class _ModelPullLock:
     """Thread/process lock covering one model's complete pull transaction."""
 
-    def __init__(self, identity: str) -> None:
+    def __init__(self, identity: str, *, wait: bool = True) -> None:
+        self._identity = identity
         self._digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        self._wait = wait
         self._thread_lock: threading.RLock | None = None
         self._handle = None
 
@@ -556,7 +563,11 @@ class _ModelPullLock:
                 self._digest, threading.RLock(),
             )
         self._thread_lock = thread_lock
-        thread_lock.acquire()
+        if not thread_lock.acquire(blocking=self._wait):
+            self._thread_lock = None
+            raise ModelInUseError(
+                f"model {self._identity!r} has an active pull or update; retry later"
+            )
         fd: int | None = None
         handle = None
         try:
@@ -564,7 +575,16 @@ class _ModelPullLock:
             _ensure_owned_directory(locks_dir, private=True)
             lock_path = locks_dir / f"pull-{self._digest}.lock"
             handle = _open_catalog_lock(lock_path)
-            _acquire_catalog_file_lock(handle)
+            acquired = (
+                (_acquire_catalog_file_lock(handle) is None)
+                if self._wait
+                else _try_acquire_catalog_file_lock(handle)
+            )
+            if not acquired:
+                raise ModelInUseError(
+                    f"model {self._identity!r} has an active pull or update; "
+                    "retry later"
+                )
             self._handle = handle
             return self
         except BaseException:
@@ -590,8 +610,63 @@ class _ModelPullLock:
                 self._thread_lock = None
 
 
-def _model_pull_lock(identity: str) -> _ModelPullLock:
-    return _ModelPullLock(identity)
+def _model_pull_lock(identity: str, *, wait: bool = True) -> _ModelPullLock:
+    return _ModelPullLock(identity, wait=wait)
+
+
+class _StorageCacheLock:
+    """Serialize mutation of the Muse-owned weights cache across processes."""
+
+    def __init__(self, *, wait: bool = True) -> None:
+        self._wait = wait
+        self._thread_acquired = False
+        self._handle = None
+
+    def __enter__(self) -> "_StorageCacheLock":
+        if not _STORAGE_THREAD_LOCK.acquire(blocking=self._wait):
+            raise StorageBusyError(
+                "Muse's weights cache is busy with another pull or cleanup"
+            )
+        self._thread_acquired = True
+        handle = None
+        try:
+            locks_dir = _catalog_dir() / "locks"
+            _ensure_owned_directory(locks_dir, private=True)
+            handle = _open_catalog_lock(locks_dir / "storage-cache.lock")
+            acquired = (
+                (_acquire_catalog_file_lock(handle) is None)
+                if self._wait
+                else _try_acquire_catalog_file_lock(handle)
+            )
+            if not acquired:
+                raise StorageBusyError(
+                    "Muse's weights cache is busy with another pull or cleanup"
+                )
+            self._handle = handle
+            return self
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            _STORAGE_THREAD_LOCK.release()
+            self._thread_acquired = False
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        try:
+            if self._handle is not None:
+                try:
+                    _release_catalog_file_lock(self._handle)
+                finally:
+                    self._handle.close()
+                    self._handle = None
+        finally:
+            if self._thread_acquired:
+                _STORAGE_THREAD_LOCK.release()
+                self._thread_acquired = False
+
+
+def _storage_cache_lock(*, wait: bool = True) -> _StorageCacheLock:
+    return _StorageCacheLock(wait=wait)
 
 
 class _ModelResourceLease:
@@ -1173,6 +1248,10 @@ def _validate_catalog_shape(
             raise _CatalogSchemaError(
                 "model identifiers must be non-empty strings"
             )
+        try:
+            _validate_model_id_for_fs(model_id)
+        except ValueError as exc:
+            raise _CatalogSchemaError(str(exc)) from exc
         if not isinstance(entry, dict):
             raise _CatalogSchemaError(
                 f"entry for model {model_id!r} must be a JSON object"
@@ -1501,6 +1580,39 @@ def _validate_lora_capabilities(manifest: dict) -> None:
             )
 
 
+def _run_automatic_storage_maintenance() -> None:
+    """Run best-effort low-space cleanup before any pull locks are acquired."""
+    # The deferred import avoids the catalog <-> storage module cycle. The
+    # automatic policy never includes unreferenced resources or shared caches.
+    try:
+        from muse.core.storage import automatic_prune_before_pull
+
+        maintenance = automatic_prune_before_pull()
+    except Exception as exc:  # noqa: BLE001 - never hide the pull's own result
+        logger.warning("automatic storage maintenance skipped: %s", exc)
+        return
+    if maintenance is None:
+        return
+    reclaimed = maintenance.result.reclaimed_bytes
+    if reclaimed:
+        logger.info(
+            "automatic storage maintenance reclaimed %.1f GiB",
+            reclaimed / 1024**3,
+        )
+    if maintenance.result.failures:
+        logger.warning(
+            "automatic storage maintenance could not clean %d item(s); "
+            "run `muse doctor storage` for details",
+            len(maintenance.result.failures),
+        )
+    if maintenance.free_bytes_after < maintenance.threshold_bytes:
+        logger.warning(
+            "disk space remains below the configured pre-pull reserve "
+            "(%.1f GiB free); run `muse doctor storage`",
+            maintenance.free_bytes_after / 1024**3,
+        )
+
+
 def pull(identifier: str, *, base_override: str | None = None) -> None:
     """Pull a model. Dispatch by identifier shape, with curated alias resolution.
 
@@ -1529,6 +1641,7 @@ def pull(identifier: str, *, base_override: str | None = None) -> None:
     """
     curated = find_curated(identifier)
     if curated is not None:
+        _run_automatic_storage_maintenance()
         if curated.uri:
             # Resolver-pulled curated entry. Override the synthesized id
             # so the catalog stores the friendly curated id (e.g.
@@ -1579,6 +1692,7 @@ def pull(identifier: str, *, base_override: str | None = None) -> None:
             uri_curated.id if uri_curated is not None
             else existing_source_id or "__unresolved_resolver_pull__"
         )
+        _run_automatic_storage_maintenance()
         with _model_pull_lock(lock_identity):
             if uri_curated is not None:
                 overlay = dict(uri_curated.capabilities or {})
@@ -1616,6 +1730,7 @@ def pull(identifier: str, *, base_override: str | None = None) -> None:
         # warn-and-ignore. The warning below is reserved for pulls with
         # no resolver source at all (true bundled scripts).
         uri_curated = find_curated_by_uri(source_uri)
+        _run_automatic_storage_maintenance()
         with _model_pull_lock(identifier):
             if uri_curated is not None:
                 _pull_via_resolver(
@@ -1645,6 +1760,7 @@ def pull(identifier: str, *, base_override: str | None = None) -> None:
 
     catalog_known = known_models()
     if identifier in catalog_known:
+        _run_automatic_storage_maintenance()
         with _model_pull_lock(identifier):
             _pull_bundled(identifier)
         return
@@ -1886,51 +2002,54 @@ def _pull_bundled_transaction(
     # subfolder weights.
     allow_patterns = download_spec.allow_patterns
     revision = download_spec.revision
-    if download_spec.artifacts is not None:
-        from muse.core.artifacts import download_hf_artifact_bundle
+    weights_cache = _catalog_dir() / "weights"
+    _ensure_owned_directory(weights_cache, private=True)
+    with _storage_cache_lock():
+        if download_spec.artifacts is not None:
+            from muse.core.artifacts import download_hf_artifact_bundle
 
-        weights_cache = _catalog_dir() / "weights"
-        _ensure_owned_directory(weights_cache, private=True)
-        with _hf_quiet_if_needed():
-            local_dir = download_hf_artifact_bundle(
-                weights_cache,
-                bundle_name=model_id,
-                artifacts=download_spec.artifacts,
-                snapshot_download_fn=snapshot_download,
+            with _hf_quiet_if_needed():
+                local_dir = download_hf_artifact_bundle(
+                    weights_cache,
+                    bundle_name=model_id,
+                    artifacts=download_spec.artifacts,
+                    snapshot_download_fn=snapshot_download,
+                )
+        else:
+            download_kwargs: dict[str, Any] = {
+                "repo_id": entry.hf_repo,
+                "cache_dir": str(weights_cache),
+            }
+            if allow_patterns:
+                download_kwargs["allow_patterns"] = list(allow_patterns)
+            if revision:
+                download_kwargs["revision"] = revision
+            with _hf_quiet_if_needed():
+                local_dir = snapshot_download(**download_kwargs)
+        # Keep the storage lock through the catalog commit. Otherwise a
+        # concurrent cleaner can observe a fully-downloaded repository before
+        # its catalog reference exists and misclassify it as unreferenced.
+        with _CATALOG_WRITE_LOCK:
+            catalog = _read_catalog()
+            replacement = {
+                "pulled_at": datetime.now(timezone.utc).isoformat(),
+                "hf_repo": entry.hf_repo,
+                "local_dir": str(local_dir),
+                "venv_path": str(venv_path),
+                "python_path": str(venv_python(venv_path)),
+                "enabled": True,
+            }
+            if revision:
+                replacement["revision"] = revision
+            if download_spec.artifact_provenance is not None:
+                replacement["artifact_provenance"] = copy.deepcopy(
+                    list(download_spec.artifact_provenance)
+                )
+            catalog[model_id] = _preserve_operator_state(
+                replacement,
+                catalog.get(model_id),
             )
-    else:
-        download_kwargs: dict[str, Any] = {"repo_id": entry.hf_repo}
-        if allow_patterns:
-            download_kwargs["allow_patterns"] = list(allow_patterns)
-        if revision:
-            download_kwargs["revision"] = revision
-        with _hf_quiet_if_needed():
-            local_dir = snapshot_download(**download_kwargs)
-
-    # M1: hold _CATALOG_WRITE_LOCK for the full read->mutate->write sequence.
-    # The heavy work (venv creation, pip install, HF download) happens above,
-    # outside any lock. Only the catalog file RMW is time-sensitive here.
-    with _CATALOG_WRITE_LOCK:
-        catalog = _read_catalog()
-        replacement = {
-            "pulled_at": datetime.now(timezone.utc).isoformat(),
-            "hf_repo": entry.hf_repo,
-            "local_dir": str(local_dir),
-            "venv_path": str(venv_path),
-            "python_path": str(venv_python(venv_path)),
-            "enabled": True,
-        }
-        if revision:
-            replacement["revision"] = revision
-        if download_spec.artifact_provenance is not None:
-            replacement["artifact_provenance"] = copy.deepcopy(
-                list(download_spec.artifact_provenance)
-            )
-        catalog[model_id] = _preserve_operator_state(
-            replacement,
-            catalog.get(model_id),
-        )
-        _write_catalog(catalog)
+            _write_catalog(catalog)
     _reset_known_models_cache()
 
 
@@ -2176,39 +2295,38 @@ def _pull_resolved_transaction(
 
     weights_cache = _catalog_dir() / "weights"
     _ensure_owned_directory(weights_cache, private=True)
-    with _hf_quiet_if_needed():
-        local_dir = resolved.download(weights_cache)
-
-    # M1: hold _CATALOG_WRITE_LOCK for the full read->mutate->write sequence.
-    # The heavy work (resolve, venv creation, pip install, HF download) happens
-    # above, outside any lock. Only the catalog file RMW is protected here.
-    with _CATALOG_WRITE_LOCK:
-        catalog = _read_catalog()
-        entry = {
-            "pulled_at": datetime.now(timezone.utc).isoformat(),
-            "hf_repo": manifest["hf_repo"],
-            "local_dir": str(local_dir),
-            "venv_path": str(venv_path),
-            "python_path": str(venv_python(venv_path)),
-            "enabled": True,
-            "source": uri,
-            "manifest": manifest,
-        }
-        resolved_revision = manifest.get("revision")
-        if resolved_revision:
-            entry["revision"] = resolved_revision
-        if artifact_provenance:
-            entry["artifact_provenance"] = copy.deepcopy(artifact_provenance)
-        code_revision = (manifest.get("capabilities") or {}).get("code_revision")
-        if code_revision:
-            entry["code_revision"] = code_revision
-        if effective_base_override:
-            entry["base_override"] = effective_base_override
-        catalog[model_id] = _preserve_operator_state(
-            entry,
-            catalog.get(model_id),
-        )
-        _write_catalog(catalog)
+    with _storage_cache_lock():
+        with _hf_quiet_if_needed():
+            local_dir = resolved.download(weights_cache)
+        # Commit the reference before releasing the storage lock; see the
+        # bundled path above for the cleaner race this prevents.
+        with _CATALOG_WRITE_LOCK:
+            catalog = _read_catalog()
+            entry = {
+                "pulled_at": datetime.now(timezone.utc).isoformat(),
+                "hf_repo": manifest["hf_repo"],
+                "local_dir": str(local_dir),
+                "venv_path": str(venv_path),
+                "python_path": str(venv_python(venv_path)),
+                "enabled": True,
+                "source": uri,
+                "manifest": manifest,
+            }
+            resolved_revision = manifest.get("revision")
+            if resolved_revision:
+                entry["revision"] = resolved_revision
+            if artifact_provenance:
+                entry["artifact_provenance"] = copy.deepcopy(artifact_provenance)
+            code_revision = (manifest.get("capabilities") or {}).get("code_revision")
+            if code_revision:
+                entry["code_revision"] = code_revision
+            if effective_base_override:
+                entry["base_override"] = effective_base_override
+            catalog[model_id] = _preserve_operator_state(
+                entry,
+                catalog.get(model_id),
+            )
+            _write_catalog(catalog)
     _reset_known_models_cache()
 
 
@@ -2258,11 +2376,28 @@ def _owned_weights_purge_path(
             f"at owned root {resolved_root}, not a model directory"
         )
     try:
-        resolved_path.relative_to(resolved_root)
+        relative = resolved_path.relative_to(resolved_root)
     except ValueError:
-        # Bundled pulls normally live in Hugging Face's shared cache. Muse
-        # does not own that location, so unregister while preserving it.
+        # Legacy bundled pulls may live in Hugging Face's shared cache. Muse
+        # does not own an external location, so unregister while preserving it.
         return None
+
+    # Hugging Face snapshots contain symlinks into a sibling ``blobs``
+    # directory. Removing only ``snapshots/<commit>`` reclaims almost no
+    # space and strands the actual weights. Treat one cache repository as
+    # the deletion unit; reference checks below preserve it while any other
+    # catalog entry points at any revision in that repository.
+    if relative.parts and relative.parts[0].startswith("models--"):
+        if (
+            len(relative.parts) != 3
+            or relative.parts[1] != "snapshots"
+            or _CONCRETE_HF_REVISION_RE.fullmatch(relative.parts[2]) is None
+        ):
+            raise CatalogError(
+                f"refusing to purge model {model_id!r}: catalog local_dir "
+                "does not have a canonical Hugging Face snapshot layout"
+            )
+        return resolved_root / relative.parts[0]
     return resolved_path
 
 
@@ -2361,12 +2496,11 @@ def _remove_locked(model_id: str, *, purge: bool = False) -> None:
 
     When `purge=True`:
       - rmtree the venv directory unless another catalog entry references it.
-      - rmtree the resolver weights cache at `~/.muse/weights/<dir>/`
-        IF the entry's `local_dir` resolves under the muse-owned
-        weights tree and no other catalog entry references it.
-        Bundled-pulled models that store weights in the shared HF cache
-        (`~/.cache/huggingface`) are left alone; muse does not own that,
-        and `huggingface-cli delete-cache` is the right tool for it.
+      - rmtree a Muse-owned artifact bundle, or the complete Hugging Face
+        cache repository containing the entry's snapshot, IF no other
+        catalog entry references that ownership unit. Legacy bundled pulls
+        stored in the shared HF cache (`~/.cache/huggingface`) are left alone;
+        Muse does not own that location.
 
     Tolerates either path being already gone. Once catalog removal commits,
     every independent owned target is attempted; unsafe or failed filesystem
@@ -2439,21 +2573,51 @@ def _remove_locked(model_id: str, *, purge: bool = False) -> None:
     if not purge:
         return
     failures: list[str] = []
-    for label, target in (
-        ("venv", venv_target),
-        ("weights", weights_target),
-    ):
-        if target is None:
-            continue
+    if venv_target is not None:
         try:
             _purge_owned_directory(
-                target,
+                venv_target,
                 model_id=model_id,
-                label=label,
+                label="venv",
             )
         except CatalogError as exc:
-            # Attempt every independently-owned target so one filesystem
-            # failure does not strand the other resource unnecessarily.
+            failures.append(str(exc))
+    if weights_target is not None:
+        try:
+            # Pulls and storage pruning take this same process-wide/file lock.
+            # The model lock remains outermost, preserving the established
+            # model -> resource -> storage ordering used by pull/remove.
+            with _storage_cache_lock():
+                # A pull for a *different* model id may have downloaded and
+                # cataloged another revision of this HF repository after the
+                # unregister transaction above. Re-read while holding the
+                # storage lock before deleting the repository ownership unit.
+                # Pulls cannot add another weight reference until this lock is
+                # released; removals can only make deletion more conservative.
+                with _CATALOG_WRITE_LOCK:
+                    current_catalog = _read_catalog()
+                    other_model_id = _other_catalog_path_reference(
+                        current_catalog,
+                        model_id=model_id,
+                        field_name="local_dir",
+                        target=weights_target,
+                    )
+                if other_model_id is not None:
+                    logger.info(
+                        "preserving weights for model %s because model %s "
+                        "acquired a reference to %s",
+                        model_id,
+                        other_model_id,
+                        weights_target,
+                    )
+                else:
+                    _purge_owned_directory(
+                        weights_target,
+                        model_id=model_id,
+                        label="weights",
+                    )
+        except CatalogError as exc:
+            # Attempt both independently-owned targets even when one fails.
             failures.append(str(exc))
     if failures:
         raise CatalogError("; ".join(failures))
