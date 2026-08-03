@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 # CLI binary, GitHub repo, and project identity stay `muse`; only the
 # PyPI label is `museq`. See docs/superpowers/specs/ for context.
 name = "museq"
-version = "0.59.0"
+version = "0.59.1"
 authors = [
   { name="Alex Towell", email="lex@metafunctor.com" },
 ]

@@ -227,6 +227,13 @@ def build_gateway(
         try:
             yield
         finally:
+            # Signal shutdown while Uvicorn's event loop is still alive.
+            # Cold loads run in asyncio's default executor; their readiness
+            # waits consume this event and unwind before asyncio joins that
+            # executor. Without this early signal, Ctrl+C can appear to finish
+            # Uvicorn while the supervisor remains hidden for up to 120s.
+            if state is not None:
+                state.stop_event.set()
             try:
                 from muse.admin.jobs import get_default_store
                 get_default_store().shutdown(timeout=5.0)

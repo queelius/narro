@@ -117,6 +117,16 @@ class OperationError(Exception):
         self.retryable = retryable
 
 
+def _ensure_server_running(state: SupervisorState) -> None:
+    """Reject new worker starts once gateway shutdown has begun."""
+    if state.stop_event.is_set():
+        raise OperationError(
+            "server_shutting_down",
+            "server shutdown is in progress; worker startup cancelled",
+            status=503,
+        )
+
+
 def find_worker_for_model(state: SupervisorState, model_id: str) -> WorkerSpec | None:
     """Return the WorkerSpec hosting `model_id`, or None if no worker hosts it.
 
@@ -163,6 +173,7 @@ def enable_model(
     """
     store.update(job.job_id, state="running")
     try:
+        _ensure_server_running(state)
         catalog_known = known_models()
         if model_id not in catalog_known:
             raise OperationError(
@@ -284,7 +295,12 @@ def enable_model(
 
         if plan == "restart_sibling":
             try:
-                _restart_worker_inplace(spec_ref, device=state.device, log_hub=getattr(state, "log_hub", None))
+                _restart_worker_inplace(
+                    spec_ref,
+                    device=state.device,
+                    log_hub=getattr(state, "log_hub", None),
+                    stop_event=state.stop_event,
+                )
             except Exception:
                 with state.lock:
                     spec_ref.status = "dead"
@@ -305,12 +321,23 @@ def enable_model(
 
         if plan == "spawn_new":
             try:
-                spawn_worker(spec_ref, device=state.device, log_hub=getattr(state, "log_hub", None))
-                wait_for_ready(port=spec_ref.port, timeout=120.0)
+                _ensure_server_running(state)
+                spawn_worker(
+                    spec_ref,
+                    device=state.device,
+                    log_hub=getattr(state, "log_hub", None),
+                )
+                wait_for_ready(
+                    port=spec_ref.port,
+                    timeout=120.0,
+                    stop_event=state.stop_event,
+                )
             except Exception:
+                _shutdown_workers([spec_ref])
                 with state.lock:
                     spec_ref.status = "dead"
                     spec_ref.job_id = None
+                _ensure_server_running(state)
                 raise
             with state.lock:
                 spec_ref.status = "running"
@@ -367,6 +394,7 @@ def load_model_into_worker(model_id: str, *, state: SupervisorState) -> int:
     not pulled, no venv on record). Other exceptions propagate to the
     director, which cleans up its in-flight Event and re-raises.
     """
+    _ensure_server_running(state)
     catalog_known = known_models()
     if model_id not in catalog_known:
         raise OperationError(
@@ -447,7 +475,12 @@ def load_model_into_worker(model_id: str, *, state: SupervisorState) -> int:
 
     if plan == "restart_sibling":
         try:
-            _restart_worker_inplace(spec_ref, device=state.device, log_hub=getattr(state, "log_hub", None))
+            _restart_worker_inplace(
+                spec_ref,
+                device=state.device,
+                log_hub=getattr(state, "log_hub", None),
+                stop_event=state.stop_event,
+            )
         except Exception:
             with state.lock:
                 spec_ref.status = "dead"
@@ -459,12 +492,23 @@ def load_model_into_worker(model_id: str, *, state: SupervisorState) -> int:
 
     if plan == "spawn_new":
         try:
-            spawn_worker(spec_ref, device=state.device, log_hub=getattr(state, "log_hub", None))
-            wait_for_ready(port=spec_ref.port, timeout=120.0)
+            _ensure_server_running(state)
+            spawn_worker(
+                spec_ref,
+                device=state.device,
+                log_hub=getattr(state, "log_hub", None),
+            )
+            wait_for_ready(
+                port=spec_ref.port,
+                timeout=120.0,
+                stop_event=state.stop_event,
+            )
         except Exception:
+            _shutdown_workers([spec_ref])
             with state.lock:
                 spec_ref.status = "dead"
                 spec_ref.job_id = None
+            _ensure_server_running(state)
             raise
         with state.lock:
             spec_ref.status = "running"
@@ -543,7 +587,12 @@ def unload_model_from_worker(model_id: str, *, state: SupervisorState) -> None:
 
     assert spec_to_restart is not None
     try:
-        _restart_worker_inplace(spec_to_restart, device=state.device, log_hub=getattr(state, "log_hub", None))
+        _restart_worker_inplace(
+            spec_to_restart,
+            device=state.device,
+            log_hub=getattr(state, "log_hub", None),
+            stop_event=state.stop_event,
+        )
     except Exception:
         with state.lock:
             spec_to_restart.status = "dead"
@@ -639,7 +688,12 @@ def disable_model(model_id: str, *, state: SupervisorState) -> dict:
 
     assert spec_to_restart is not None
     try:
-        _restart_worker_inplace(spec_to_restart, device=state.device, log_hub=getattr(state, "log_hub", None))
+        _restart_worker_inplace(
+            spec_to_restart,
+            device=state.device,
+            log_hub=getattr(state, "log_hub", None),
+            stop_event=state.stop_event,
+        )
     except Exception:
         # M12: invariant on restart failure in the disable path.
         #
@@ -884,7 +938,11 @@ def _run_subprocess_into_job(
 
 
 def _restart_worker_inplace(
-    spec: WorkerSpec, *, device: str, log_hub: "Any | None" = None,
+    spec: WorkerSpec,
+    *,
+    device: str,
+    log_hub: "Any | None" = None,
+    stop_event: "threading.Event | None" = None,
 ) -> None:
     """Terminate + respawn one worker with its current `spec.models`.
 
@@ -900,10 +958,28 @@ def _restart_worker_inplace(
     """
     _shutdown_workers([spec])
     spec.process = None
+    if stop_event is not None and stop_event.is_set():
+        raise OperationError(
+            "server_shutting_down",
+            "server shutdown is in progress; worker restart cancelled",
+            status=503,
+        )
     spec.failure_count = 0
     spec.restart_count += 1
-    spawn_worker(spec, device=device, log_hub=log_hub)
-    wait_for_ready(port=spec.port, timeout=120.0)
+    try:
+        spawn_worker(spec, device=device, log_hub=log_hub)
+        wait_for_ready(
+            port=spec.port, timeout=120.0, stop_event=stop_event,
+        )
+    except Exception:
+        _shutdown_workers([spec])
+        if stop_event is not None and stop_event.is_set():
+            raise OperationError(
+                "server_shutting_down",
+                "server shutdown is in progress; worker restart cancelled",
+                status=503,
+            ) from None
+        raise
     spec.status = "running"
 
 

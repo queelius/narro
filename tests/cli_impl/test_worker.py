@@ -1,9 +1,33 @@
 """Smoke tests for run_worker (single-worker mode)."""
+import os
+import signal
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from muse.cli_impl.worker import run_worker
+
+
+def test_parent_watchdog_terminates_worker_when_supervisor_disappears():
+    from muse.cli_impl.worker import _watch_parent
+
+    with patch("muse.cli_impl.worker.os.getppid", return_value=999), \
+         patch("muse.cli_impl.worker.os.kill") as mock_kill:
+        _watch_parent(expected_parent_pid=123, poll_interval=0)
+
+    mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+
+@patch("muse.cli_impl.worker.run_uvicorn")
+def test_worker_starts_parent_watchdog_from_supervisor_env(
+    mock_run_uvicorn, monkeypatch,
+):
+    monkeypatch.setenv("MUSE_SUPERVISOR_PID", "12345")
+
+    with patch("muse.cli_impl.worker._start_parent_watchdog") as mock_watchdog:
+        run_worker(host="127.0.0.1", port=9999, models=[], device="cpu")
+
+    mock_watchdog.assert_called_once_with(12345)
 
 
 def _collect_route_paths(app) -> set:

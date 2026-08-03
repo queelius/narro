@@ -9,6 +9,9 @@ Can also be run standalone for debugging. Not advertised in top-level help.
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import threading
 from pathlib import Path
 
 from muse.cli_impl.serve_util import run_uvicorn
@@ -19,6 +22,38 @@ from muse.core.registry import ModalityRegistry
 from muse.core.server import create_app
 
 log = logging.getLogger(__name__)
+
+_SUPERVISOR_PID_ENV = "MUSE_SUPERVISOR_PID"
+
+
+def _watch_parent(
+    *, expected_parent_pid: int, poll_interval: float = 1.0,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Terminate this worker if it is reparented away from its supervisor."""
+    stopper = stop_event or threading.Event()
+    while not stopper.is_set():
+        if os.getppid() != expected_parent_pid:
+            log.warning(
+                "supervisor pid %d disappeared; terminating orphan worker",
+                expected_parent_pid,
+            )
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+            except OSError:
+                pass
+            return
+        stopper.wait(poll_interval)
+
+
+def _start_parent_watchdog(expected_parent_pid: int) -> None:
+    """Start the supervisor parent-death guard for a managed worker."""
+    threading.Thread(
+        target=_watch_parent,
+        kwargs={"expected_parent_pid": expected_parent_pid},
+        daemon=True,
+        name="muse-parent-watchdog",
+    ).start()
 
 
 def _bundled_modalities_dir() -> Path:
@@ -69,6 +104,16 @@ def run_worker(*, host: str, port: int, models: list[str], device: str) -> int:
     `models == []` is a valid test configuration (empty-registry
     router mounting smoke test); it does not trigger the fail-fast.
     """
+    raw_supervisor_pid = os.environ.get(_SUPERVISOR_PID_ENV)
+    if raw_supervisor_pid:
+        try:
+            supervisor_pid = int(raw_supervisor_pid)
+        except ValueError:
+            log.warning("ignoring invalid %s=%r", _SUPERVISOR_PID_ENV, raw_supervisor_pid)
+        else:
+            if supervisor_pid > 0:
+                _start_parent_watchdog(supervisor_pid)
+
     registry = ModalityRegistry()
     routers: dict = {}
     failures: list[str] = []

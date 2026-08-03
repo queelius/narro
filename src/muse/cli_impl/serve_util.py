@@ -21,6 +21,7 @@ second Ctrl-C remains an immediate force-quit, unchanged.
 from __future__ import annotations
 
 import math
+import threading
 
 import uvicorn
 
@@ -32,6 +33,23 @@ from muse.core import config
 # (e.g. "1" for near-instant dev restarts, or a larger value to let a
 # genuine in-flight generation finish during a rolling restart).
 _DEFAULT_GRACE_SECONDS = 10.0
+
+
+class _ShutdownAwareServer(uvicorn.Server):
+    """Uvicorn server that exposes signal receipt to supervisor threads."""
+
+    def __init__(
+        self,
+        config: uvicorn.Config,
+        shutdown_event: threading.Event | None = None,
+    ) -> None:
+        super().__init__(config)
+        self._muse_shutdown_event = shutdown_event
+
+    def handle_exit(self, sig: int, frame) -> None:
+        if self._muse_shutdown_event is not None:
+            self._muse_shutdown_event.set()
+        super().handle_exit(sig, frame)
 
 
 def shutdown_grace_seconds() -> float:
@@ -52,11 +70,18 @@ def shutdown_grace_seconds() -> float:
     return value
 
 
-def build_uvicorn_server(app, *, host: str, port: int) -> uvicorn.Server:
+def build_uvicorn_server(
+    app,
+    *,
+    host: str,
+    port: int,
+    shutdown_event: threading.Event | None = None,
+) -> uvicorn.Server:
     """Construct a uvicorn.Server with a bounded graceful-shutdown timeout.
 
     Callers run it with ``.run()`` (blocking, installs SIGINT/SIGTERM
-    handlers exactly like ``uvicorn.run``).
+    handlers exactly like ``uvicorn.run``). When supplied, `shutdown_event`
+    is set directly from Uvicorn's signal handler before graceful draining.
     """
     config = uvicorn.Config(
         app,
@@ -65,18 +90,30 @@ def build_uvicorn_server(app, *, host: str, port: int) -> uvicorn.Server:
         log_config=None,
         timeout_graceful_shutdown=shutdown_grace_seconds(),
     )
-    return uvicorn.Server(config)
+    return _ShutdownAwareServer(config, shutdown_event=shutdown_event)
 
 
-def run_uvicorn(app, *, host: str, port: int) -> None:
+def run_uvicorn(
+    app,
+    *,
+    host: str,
+    port: int,
+    shutdown_event: threading.Event | None = None,
+) -> None:
     """Blocking uvicorn run with a bounded graceful-shutdown timeout.
 
     Drop-in replacement for ``uvicorn.run(app, host=host, port=port,
     log_config=None)`` that guarantees Ctrl-C exits within
-    ``shutdown_grace_seconds()`` even with lingering connections.
+    ``shutdown_grace_seconds()`` even with lingering connections. A supplied
+    `shutdown_event` is signalled immediately on SIGINT/SIGTERM.
     """
     try:
-        build_uvicorn_server(app, host=host, port=port).run()
+        build_uvicorn_server(
+            app,
+            host=host,
+            port=port,
+            shutdown_event=shutdown_event,
+        ).run()
     except KeyboardInterrupt:
         # uvicorn re-raises the SIGINT it captured once the graceful
         # shutdown completes. uvicorn.run() swallows that KeyboardInterrupt

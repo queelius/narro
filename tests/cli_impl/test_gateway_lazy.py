@@ -124,6 +124,20 @@ def _wire_async_client_json(
     return mock_client
 
 
+@pytest.mark.asyncio
+async def test_gateway_lifespan_signals_supervisor_shutdown_before_cleanup():
+    state = _make_state_with_director()
+    app = build_gateway(state=state)
+
+    store = MagicMock()
+    with patch("muse.admin.jobs.get_default_store", return_value=store):
+        async with app.router.lifespan_context(app):
+            assert not state.stop_event.is_set()
+
+    assert state.stop_event.is_set()
+    store.shutdown.assert_called_once_with(timeout=5.0)
+
+
 # =============================================================================
 # F1: per-request acquire + release wrap
 # =============================================================================

@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -45,6 +46,8 @@ from muse.observability.sampler import Sampler
 from muse.observability.logs import LogHub
 
 logger = logging.getLogger(__name__)
+
+_SUPERVISOR_PID_ENV = "MUSE_SUPERVISOR_PID"
 
 
 @dataclass
@@ -127,10 +130,11 @@ class SupervisorState:
     `unservable_reasons`. v1 uses one global lock; per-model locks
     are deferred until contention becomes measurable.
 
-    `stop_event` is the supervisor-wide shutdown signal. Set on
-    KeyboardInterrupt / SIGTERM in `run_supervisor`'s cleanup; consumed
-    by the auto-restart monitor and the idle sweeper so a single
-    Ctrl+C unblocks every supervisor-owned daemon thread at once.
+    `stop_event` is the supervisor-wide shutdown signal. Set as soon as
+    Uvicorn receives SIGINT / SIGTERM (and again in `run_supervisor`'s
+    cleanup); consumed by readiness waits, the auto-restart monitor, and
+    the idle sweeper so a single Ctrl+C unblocks every supervisor-owned
+    thread at once.
     A bare default state (e.g. one returned by `get_supervisor_state`
     when nothing is registered) gets a fresh Event so admin or test
     code that touches `state.stop_event` doesn't crash on None.
@@ -238,9 +242,10 @@ def spawn_worker(spec: WorkerSpec, *, device: str, log_hub: "Any | None" = None)
     `_pump_worker_logs`, keyed by the worker's first model id (lazy-load
     spawns one model per worker, so this is the common case; a
     multi-model worker's logs are attributed to `spec.models[0]` only).
-    When `log_hub` is None (telemetry disabled, the default), spawning
-    is unchanged from before Task 11: a bare `Popen(cmd)` with inherited
-    stdio.
+    Every worker receives the supervisor PID for its parent-death watchdog.
+    On POSIX it also gets a new session, keeping terminal signals directed at
+    the supervisor; the supervisor remains responsible for orderly worker
+    teardown and can signal the whole worker process group if needed.
     """
     spec.device = device
     cmd = [
@@ -252,10 +257,16 @@ def spawn_worker(spec: WorkerSpec, *, device: str, log_hub: "Any | None" = None)
     for m in spec.models:
         cmd.extend(["--model", m])
     logger.info("spawning worker: %s", " ".join(cmd))
+    child_env = os.environ.copy()
+    child_env[_SUPERVISOR_PID_ENV] = str(os.getpid())
+    popen_kwargs: dict[str, Any] = {
+        "env": child_env,
+        "start_new_session": os.name == "posix",
+    }
     if log_hub is not None:
         spec.process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, **popen_kwargs,
         )
         model_id = spec.models[0] if spec.models else "worker"
         t = threading.Thread(
@@ -264,29 +275,39 @@ def spawn_worker(spec: WorkerSpec, *, device: str, log_hub: "Any | None" = None)
         )
         t.start()
     else:
-        spec.process = subprocess.Popen(cmd)
+        spec.process = subprocess.Popen(cmd, **popen_kwargs)
     spec.last_spawn_at = time.monotonic()
 
 
 def wait_for_ready(
     *, port: int, timeout: float = 60.0, poll_interval: float = 0.5,
+    stop_event: "threading.Event | None" = None,
 ) -> None:
     """Block until http://127.0.0.1:<port>/health returns 200, or timeout.
 
-    Raises TimeoutError if the worker never becomes ready. Polls with
-    short sleeps so slow workers (big model loads) still get through.
+    Raises TimeoutError if the worker never becomes ready. If `stop_event`
+    is supplied, shutdown aborts the wait promptly instead of leaving an
+    executor thread parked for the full model-load timeout.
     """
     deadline = time.monotonic() + timeout
     url = f"http://127.0.0.1:{port}/health"
     last_err: Exception | None = None
     while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("worker startup cancelled: supervisor shutdown requested")
         try:
             r = httpx.get(url, timeout=2.0)
             if r.status_code == 200:
                 return
         except httpx.HTTPError as e:
             last_err = e
-        time.sleep(poll_interval)
+        if stop_event is not None:
+            if stop_event.wait(poll_interval):
+                raise RuntimeError(
+                    "worker startup cancelled: supervisor shutdown requested"
+                )
+        else:
+            time.sleep(poll_interval)
     raise TimeoutError(
         f"worker on port {port} did not become ready within {timeout}s "
         f"(last error: {last_err})"
@@ -359,16 +380,10 @@ def _attempt_restart(
     if stop_event.wait(backoff):
         return
 
-    # Terminate existing process if still alive (best-effort)
+    # Terminate existing process if still alive (best-effort).
     if spec.process is not None and spec.process.poll() is None:
-        try:
-            spec.process.terminate()
-            try:
-                spec.process.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                spec.process.kill()
-        except Exception as e:
-            logger.warning("worker on port %d: terminate failed: %s", spec.port, e)
+        _shutdown_workers([spec], grace=3.0)
+    spec.process = None
 
     # Respawn. restart_count bumps ONLY on failure below (see docstring):
     # a successful respawn must not count toward the unsuccessful-attempts
@@ -377,11 +392,13 @@ def _attempt_restart(
     # having a run of consecutive failures.
     try:
         spawn_worker(spec, device=spec.device, log_hub=log_hub)
-        wait_for_ready(port=spec.port, timeout=ready_timeout)
+        wait_for_ready(
+            port=spec.port, timeout=ready_timeout, stop_event=stop_event,
+        )
         spec.failure_count = 0
         spec.status = "running"
         logger.info("worker on port %d: successfully restarted", spec.port)
-    except (subprocess.SubprocessError, TimeoutError, OSError) as e:
+    except (subprocess.SubprocessError, TimeoutError, OSError, RuntimeError) as e:
         # OSError covers FileNotFoundError / PermissionError from Popen when
         # the venv python is missing or non-executable (e.g. the venv was
         # deleted, or its python symlink broke on a system upgrade). Without
@@ -389,6 +406,7 @@ def _attempt_restart(
         # monitor daemon thread, silently disabling health-monitoring and
         # auto-restart for ALL workers (M10).
         logger.error("worker on port %d: restart failed: %s", spec.port, e)
+        _shutdown_workers([spec])
         spec.restart_count += 1
         spec.status = "unhealthy"
 
@@ -478,24 +496,67 @@ def _monitor_workers(
             return
 
 
-def _shutdown_workers(specs: list[WorkerSpec], grace: float = 5.0) -> None:
-    """SIGTERM all workers; SIGKILL any that don't exit within `grace` seconds."""
-    for spec in specs:
-        if spec.process is None:
-            continue
+def _signal_worker_process(
+    proc: Any, sig: signal.Signals, *, force: bool = False,
+) -> None:
+    """Signal a worker and, on POSIX, any descendants in its own session."""
+    if os.name == "posix":
         try:
-            spec.process.terminate()
+            pid = int(proc.pid)
+            # Never allow invalid/mock metadata to become killpg(1), which is
+            # kill(-1) at the syscall layer and broadcasts to every process
+            # the caller may signal. Also refuse our own process group: real
+            # workers are spawned with start_new_session=True, so neither
+            # guard excludes a legitimate managed worker.
+            if pid <= 1:
+                raise ValueError(f"unsafe worker pid {pid}")
+            pgid = os.getpgid(pid)
+            if pgid <= 1 or pgid != pid or pgid == os.getpgrp():
+                raise ValueError(f"unsafe worker process group {pgid}")
+            os.killpg(pgid, sig)
+            return
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+    if force:
+        proc.kill()
+    else:
+        proc.terminate()
+
+
+def _shutdown_workers(specs: list[WorkerSpec], grace: float = 5.0) -> None:
+    """SIGTERM worker groups, then SIGKILL and reap processes that linger."""
+    # Snapshot both spec and process. Concurrent restart paths may replace
+    # spec.process while we wait; shutdown must keep targeting the process it
+    # originally claimed rather than a newly spawned replacement.
+    targets = [(spec, spec.process) for spec in list(specs) if spec.process is not None]
+
+    for spec, proc in targets:
+        try:
+            if proc.poll() is None:
+                _signal_worker_process(proc, signal.SIGTERM)
         except Exception as e:
             logger.warning("failed to SIGTERM worker on port %d: %s", spec.port, e)
 
-    for spec in specs:
-        if spec.process is None:
-            continue
+    for spec, proc in targets:
         try:
-            spec.process.wait(timeout=grace)
+            proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
-            logger.warning("worker on port %d did not exit in %ds; killing", spec.port, grace)
-            spec.process.kill()
+            logger.warning(
+                "worker on port %d did not exit in %.1fs; killing",
+                spec.port, grace,
+            )
+            try:
+                _signal_worker_process(
+                    proc,
+                    getattr(signal, "SIGKILL", signal.SIGTERM),
+                    force=True,
+                )
+                # Reap after SIGKILL so no zombie remains owned by Muse.
+                proc.wait(timeout=max(1.0, min(grace, 2.0)))
+            except Exception as e:
+                logger.warning(
+                    "failed to kill/reap worker on port %d: %s", spec.port, e,
+                )
         except Exception as e:
             logger.warning("error waiting for worker on port %d: %s", spec.port, e)
 
@@ -1288,7 +1349,9 @@ def run_supervisor(*, host: str, port: int, device: str) -> int:
         # (SSE stream / long inference / idle keep-alive). uvicorn.run's
         # default (None) waits forever, stranding port 8000 and forcing the
         # operator to kill the process before restarting.
-        run_uvicorn(app, host=host, port=port)
+        run_uvicorn(
+            app, host=host, port=port, shutdown_event=stop_event,
+        )
     except KeyboardInterrupt:
         logger.info("shutting down (SIGINT)")
     finally:

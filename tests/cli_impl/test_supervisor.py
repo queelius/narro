@@ -1,6 +1,7 @@
 """Tests for the supervisor: catalog -> worker specs."""
 import json
 import os
+import signal
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
@@ -69,6 +70,9 @@ class TestSpawnWorker:
         assert "--model" in args and "soprano-80m" in args
         assert "--device" in args and "cpu" in args
         assert spec.process is mock_popen.return_value
+        kwargs = mock_popen.call_args.kwargs
+        assert kwargs["env"]["MUSE_SUPERVISOR_PID"] == str(os.getpid())
+        assert kwargs["start_new_session"] is (os.name == "posix")
 
     @patch("muse.cli_impl.supervisor.subprocess.Popen")
     def test_spawn_worker_passes_all_models_in_group(self, mock_popen):
@@ -114,6 +118,78 @@ class TestWaitForReady:
             ]
             wait_for_ready(port=9001, timeout=5.0, poll_interval=0.001)
             assert mock_get.call_count == 3
+
+    def test_aborts_when_supervisor_shutdown_is_requested(self):
+        from muse.cli_impl.supervisor import wait_for_ready
+        import threading
+
+        stop_event = threading.Event()
+        stop_event.set()
+        with patch("muse.cli_impl.supervisor.httpx.get") as mock_get:
+            with pytest.raises(RuntimeError, match="shutdown requested"):
+                wait_for_ready(
+                    port=9001,
+                    timeout=120.0,
+                    poll_interval=0.01,
+                    stop_event=stop_event,
+                )
+        mock_get.assert_not_called()
+
+
+class TestShutdownWorkers:
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+    def test_signals_worker_process_group_on_posix(self):
+        from muse.cli_impl.supervisor import _shutdown_workers
+
+        proc = MagicMock(pid=12345)
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        spec.process = proc
+
+        with patch("muse.cli_impl.supervisor.os.getpgid", return_value=12345), \
+             patch("muse.cli_impl.supervisor.os.getpgrp", return_value=54321), \
+             patch("muse.cli_impl.supervisor.os.killpg") as mock_killpg:
+            _shutdown_workers([spec])
+
+        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+        proc.terminate.assert_not_called()
+        proc.wait.assert_called_once_with(timeout=5.0)
+
+    def test_mock_pid_cannot_broadcast_to_process_group_one(self):
+        from muse.cli_impl.supervisor import _signal_worker_process
+
+        proc = MagicMock()
+        # int(MagicMock()) == 1, matching the legacy restart-test shape that
+        # exposed this safety bug.
+        with patch("muse.cli_impl.supervisor.os.killpg") as mock_killpg:
+            _signal_worker_process(proc, signal.SIGTERM)
+
+        mock_killpg.assert_not_called()
+        proc.terminate.assert_called_once_with()
+
+    def test_kills_and_reaps_worker_that_ignores_sigterm(self):
+        from muse.cli_impl.supervisor import _shutdown_workers
+        import subprocess
+
+        proc = MagicMock(pid=12345)
+        proc.poll.return_value = None
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="worker", timeout=0.01),
+            0,
+        ]
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        spec.process = proc
+
+        with patch("muse.cli_impl.supervisor._signal_worker_process") as mock_signal:
+            _shutdown_workers([spec], grace=0.01)
+
+        assert [call.args[1] for call in mock_signal.call_args_list] == [
+            signal.SIGTERM,
+            getattr(signal, "SIGKILL", signal.SIGTERM),
+        ]
+        assert mock_signal.call_args_list[1].kwargs == {"force": True}
+        assert proc.wait.call_count == 2
 
 
 class TestRunSupervisor:
@@ -294,6 +370,29 @@ class TestAttemptRestart:
 
         assert spec.restart_count == 1  # counter still increments
         assert spec.status != "running"  # spawn tried, but didn't become ready
+
+    def test_readiness_failure_terminates_partial_respawn(self):
+        from muse.cli_impl.supervisor import _attempt_restart
+        import threading
+
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cpu")
+        spec.process = MagicMock(poll=MagicMock(return_value=1))
+        stop_event = threading.Event()
+
+        with patch("muse.cli_impl.supervisor.spawn_worker"), \
+             patch(
+                 "muse.cli_impl.supervisor.wait_for_ready",
+                 side_effect=TimeoutError("never ready"),
+             ) as mock_wait, \
+             patch("muse.cli_impl.supervisor._shutdown_workers") as mock_shutdown:
+            _attempt_restart(
+                spec, stop_event=stop_event, max_restarts=10, backoff_base=0,
+            )
+
+        mock_wait.assert_called_once_with(
+            port=9001, timeout=60.0, stop_event=stop_event,
+        )
+        mock_shutdown.assert_called_once_with([spec])
 
     def test_oserror_from_spawn_does_not_propagate(self):
         """M10: a broken/missing venv python makes subprocess.Popen raise

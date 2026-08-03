@@ -118,7 +118,9 @@ class TestEnableModel:
         assert job.result["spawned_new"] is True
         assert job.result["worker_port"] == 9123
         mock_spawn.assert_called_once()
-        mock_wait.assert_called_once_with(port=9123, timeout=120.0)
+        mock_wait.assert_called_once_with(
+            port=9123, timeout=120.0, stop_event=state.stop_event,
+        )
         assert len(state.workers) == 1
         assert state.workers[0].port == 9123
 
@@ -152,7 +154,12 @@ class TestEnableModel:
         assert job.result["spawned_new"] is False
         assert "soprano-80m" in spec.models
         assert "kokoro-82m" in spec.models
-        mock_restart.assert_called_once_with(spec, device="cpu", log_hub=None)
+        mock_restart.assert_called_once_with(
+            spec,
+            device="cpu",
+            log_hub=None,
+            stop_event=state.stop_event,
+        )
 
     def test_unpulled_model_marks_failed(self, tmp_catalog, state, store):
         # Bundled known but not yet in catalog.json.
@@ -223,6 +230,81 @@ class TestEnableModel:
 
 
 class TestLoadModelIntoWorkerDeadSpec:
+    def test_refuses_cold_load_after_shutdown_starts(self, state):
+        from muse.admin.operations import load_model_into_worker
+
+        state.stop_event.set()
+        with patch("muse.admin.operations.spawn_worker") as mock_spawn:
+            with pytest.raises(OperationError) as exc:
+                load_model_into_worker("kokoro-82m", state=state)
+
+        assert exc.value.code == "server_shutting_down"
+        assert exc.value.status == 503
+        mock_spawn.assert_not_called()
+
+    def test_readiness_failure_terminates_partial_worker(
+        self, tmp_catalog, state,
+    ):
+        from muse.admin.operations import load_model_into_worker
+
+        _seed_catalog({
+            "kokoro-82m": {
+                "pulled_at": "...", "hf_repo": "k", "local_dir": "/k",
+                "venv_path": "/venv/k", "python_path": "/venv/k/bin/python",
+                "enabled": True,
+            },
+        })
+        child = MagicMock()
+
+        def _spawn(spec, **_kwargs):
+            spec.process = child
+
+        with patch("muse.admin.operations.spawn_worker", side_effect=_spawn), \
+             patch(
+                 "muse.admin.operations.wait_for_ready",
+                 side_effect=TimeoutError("never ready"),
+             ) as mock_wait, \
+             patch("muse.admin.operations.find_free_port", return_value=9200), \
+             patch("muse.admin.operations._shutdown_workers") as mock_shutdown:
+            with pytest.raises(TimeoutError, match="never ready"):
+                load_model_into_worker("kokoro-82m", state=state)
+
+        spec = state.workers[0]
+        mock_wait.assert_called_once_with(
+            port=9200, timeout=120.0, stop_event=state.stop_event,
+        )
+        mock_shutdown.assert_called_once_with([spec])
+        assert spec.status == "dead"
+        assert spec.job_id is None
+
+    def test_shutdown_during_readiness_returns_service_unavailable(
+        self, tmp_catalog, state,
+    ):
+        from muse.admin.operations import load_model_into_worker
+
+        _seed_catalog({
+            "kokoro-82m": {
+                "pulled_at": "...", "hf_repo": "k", "local_dir": "/k",
+                "venv_path": "/venv/k", "python_path": "/venv/k/bin/python",
+                "enabled": True,
+            },
+        })
+
+        def _cancel_wait(**_kwargs):
+            state.stop_event.set()
+            raise RuntimeError("worker startup cancelled")
+
+        with patch("muse.admin.operations.spawn_worker"), \
+             patch("muse.admin.operations.wait_for_ready", side_effect=_cancel_wait), \
+             patch("muse.admin.operations.find_free_port", return_value=9200), \
+             patch("muse.admin.operations._shutdown_workers") as mock_shutdown:
+            with pytest.raises(OperationError) as exc:
+                load_model_into_worker("kokoro-82m", state=state)
+
+        assert exc.value.code == "server_shutting_down"
+        assert exc.value.status == 503
+        mock_shutdown.assert_called_once_with([state.workers[0]])
+
     def test_respawns_dead_worker_instead_of_returning_dead_port(
         self, tmp_catalog, state,
     ):
@@ -420,6 +502,44 @@ class TestLoadModelIntoWorkerDeadSpec:
         assert state.workers[0].job_id is None
 
 
+class TestRestartWorkerCleanup:
+    def test_readiness_failure_terminates_replacement(self, state):
+        from muse.admin.operations import _restart_worker_inplace
+
+        old_process = MagicMock(name="old_process")
+        new_process = MagicMock(name="new_process")
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        spec.process = old_process
+        stopped_processes = []
+
+        def _shutdown(specs):
+            stopped_processes.append(specs[0].process)
+
+        def _spawn(worker_spec, **_kwargs):
+            worker_spec.process = new_process
+
+        with patch(
+            "muse.admin.operations._shutdown_workers",
+            side_effect=_shutdown,
+        ), patch(
+            "muse.admin.operations.spawn_worker", side_effect=_spawn,
+        ), patch(
+            "muse.admin.operations.wait_for_ready",
+            side_effect=TimeoutError("never ready"),
+        ) as mock_wait:
+            with pytest.raises(TimeoutError, match="never ready"):
+                _restart_worker_inplace(
+                    spec,
+                    device="cpu",
+                    stop_event=state.stop_event,
+                )
+
+        assert stopped_processes == [old_process, new_process]
+        mock_wait.assert_called_once_with(
+            port=9001, timeout=120.0, stop_event=state.stop_event,
+        )
+
+
 class TestDisableModel:
     def test_unknown_raises_operation_error(self, tmp_catalog, state):
         _seed_catalog({})
@@ -486,7 +606,12 @@ class TestDisableModel:
         assert out["worker_terminated"] is False
         assert "kokoro-82m" in out["remaining_models_in_worker"]
         assert "soprano-80m" not in spec.models
-        mock_restart.assert_called_once_with(spec, device="cpu", log_hub=None)
+        mock_restart.assert_called_once_with(
+            spec,
+            device="cpu",
+            log_hub=None,
+            stop_event=state.stop_event,
+        )
 
 
 class TestOrphanRespawnGuard:

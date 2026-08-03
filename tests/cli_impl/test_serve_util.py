@@ -12,6 +12,8 @@ serve_util centralizes uvicorn construction with a BOUNDED graceful
 timeout so the first Ctrl-C always exits within a fixed window.
 """
 import os
+import signal
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,6 +32,21 @@ def test_build_uvicorn_server_sets_bounded_graceful_timeout():
     # host/port must round-trip so the gateway still binds where asked.
     assert server.config.host == "127.0.0.1"
     assert server.config.port == 8000
+
+
+def test_server_signals_shutdown_event_as_soon_as_signal_arrives():
+    shutdown_event = threading.Event()
+    server = serve_util.build_uvicorn_server(
+        object(),
+        host="127.0.0.1",
+        port=8000,
+        shutdown_event=shutdown_event,
+    )
+
+    server.handle_exit(signal.SIGTERM, None)
+
+    assert shutdown_event.is_set()
+    assert server.should_exit is True
 
 
 def test_shutdown_grace_seconds_default():
