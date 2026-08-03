@@ -212,9 +212,11 @@ def build_image_processor(
             image_std=overrides.get("image_std"),
         )
 
+    auto_error: Exception | None = None
     try:
         return _load_auto_image_processor(src)
     except Exception as e_auto:  # noqa: BLE001
+        auto_error = e_auto
         logger.debug(
             "AutoImageProcessor.from_pretrained(%s) failed: %s",
             src, e_auto,
@@ -242,10 +244,16 @@ def build_image_processor(
             image_std=hints.get("image_std"),
         )
 
+    if auto_error is None:  # defensive: the failed auto path must set this
+        auto_error = RuntimeError("unknown AutoImageProcessor failure")
+    auto_message = str(auto_error).strip()
+    auto_detail = type(auto_error).__name__
+    if auto_message:
+        auto_detail += f": {auto_message}"
     raise ImageProcessorError(
         f"Cannot load image processor for {src!r}: AutoImageProcessor "
-        f"failed and config.json provided no usable encoder hints "
-        f"(checked: num_channels, image_size). Add "
+        f"failed ({auto_detail}) and config.json provided no encoder hints "
+        f"with explicit image_mean/image_std. Add "
         f"capabilities.image_processor_overrides in the manifest with "
         f"explicit values, e.g. {{num_channels: 1, image_size: 448}}."
-    )
+    ) from auto_error

@@ -101,6 +101,11 @@ def test_extract_failure_reason_load_failed():
     assert "load failed" in out
 
 
+def test_extract_failure_reason_skips_blank_load_prefix():
+    captured = "baseline RAM=1.2 GB\nload failed:\nAssertionError\n"
+    assert smoke._extract_failure_reason(captured) == "AssertionError"
+
+
 def test_extract_failure_reason_empty():
     """_extract_failure_reason handles empty input gracefully."""
     assert smoke._extract_failure_reason("") == "no output"
@@ -272,7 +277,7 @@ def test_smoke_curated_resolver_success(tmp_path):
     assert catalog_dir.name.startswith("muse-catalog-")
 
 
-def test_smoke_curated_resolver_pull_fails(tmp_path):
+def test_smoke_curated_resolver_pull_fails(tmp_path, caplog):
     """muse pull exits non-zero -> ok=False, error mentions 'pull'."""
     fail = MagicMock(
         returncode=1,
@@ -287,6 +292,7 @@ def test_smoke_curated_resolver_pull_fails(tmp_path):
     assert result.ok is False
     assert "pull" in result.error
     assert "FAIL" in result.label
+    assert "sentencepiece" in caplog.text
 
 
 def test_smoke_curated_resolver_missing_python_path(tmp_path):

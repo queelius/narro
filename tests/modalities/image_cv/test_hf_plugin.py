@@ -95,6 +95,11 @@ def test_resolve_keypoint_dispatches_to_keypoint_runtime():
     assert caps["supports_keypoints"] is True
     assert caps["supports_depth"] is False
     assert caps["supports_detection"] is False
+    assert "torch>=2.1.0" in result.manifest["pip_extras"]
+    assert any(
+        extra.startswith("torchvision")
+        for extra in result.manifest["pip_extras"]
+    )
 
 
 def test_resolve_object_detection_dispatches_to_detection_runtime():

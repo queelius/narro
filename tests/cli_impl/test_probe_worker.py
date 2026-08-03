@@ -122,6 +122,25 @@ def test_probe_worker_load_failure_emits_error_record(capsys):
     assert record["ran_inference"] is False
 
 
+def test_probe_worker_load_failure_never_emits_blank_exception(capsys):
+    fake_entry = _fake_entry(device_cap="cpu")
+
+    from muse.core import catalog as catalog_mod
+    with patch.object(catalog_mod, "known_models", return_value={"x": fake_entry}), \
+         patch.object(catalog_mod, "load_backend", side_effect=AssertionError()):
+        rc = run_probe_worker(
+            model_id="x",
+            device="cpu",
+            run_inference=False,
+        )
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "load failed: AssertionError" in captured.err
+    record = json.loads(captured.out.splitlines()[-1])
+    assert record["error"] == "load failed: AssertionError"
+
+
 def test_probe_worker_inference_failure_records_error_but_keeps_weights(capsys):
     """Inference exception: load result preserved, inference_error captured."""
     fake_backend = MagicMock()

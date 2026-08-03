@@ -31,6 +31,8 @@ _RUNTIME_PATH = (
 )
 _PIP_EXTRAS = (
     "torch>=2.1.0",
+    # Transformers 5 image processors use torchvision-backed operations.
+    "torchvision>=0.16.0",
     "transformers>=4.36.0",
     "Pillow>=9.1.0",
 )

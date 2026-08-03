@@ -1,11 +1,11 @@
 """m-a-p/MERT-v1-95M (MERT music understanding audio embedder).
 
-Curated default for `audio/embedding`. ~95MB on disk; CPU-friendly.
+Curated default for `audio/embedding`. ~95M parameters; CPU-friendly.
 768-dim embeddings via mean-pool over the time dimension of the
 last hidden state. Trained on music with masked acoustic modeling
 (MERT v1).
 
-License: MIT.
+License: CC-BY-NC-4.0 (non-commercial).
 
 MERT ships custom model code in the repo, so loading requires
 `trust_remote_code=True`; Muse pins and downloads that code with the weights.
@@ -67,11 +67,15 @@ MANIFEST = {
     # Reviewed 2026-08-02. Source: official Hugging Face model API.
     "revision": "12af15fef9d0ac838c3f475bfbbf26d2060dd4f5",
     "description": (
-        "MERT v1 95M: music understanding, 768-dim audio embeddings, MIT"
+        "MERT v1 95M: music understanding, 768-dim audio embeddings, "
+        "CC-BY-NC-4.0 (non-commercial)"
     ),
-    "license": "MIT",
+    "license": "CC-BY-NC-4.0",
     "pip_extras": (
-        "torch>=2.1.0",
+        # The pinned repo has only a pickle pytorch_model.bin checkpoint.
+        # Current Transformers rejects torch.load below 2.6 because of
+        # CVE-2025-32434, even when weights_only=True.
+        "torch>=2.6.0",
         "transformers>=4.36.0",
         "librosa>=0.10.0",
         # numpy is pulled by librosa but the runtime imports it directly;
@@ -87,15 +91,15 @@ MANIFEST = {
         "sample_rate": 24000,
         "max_duration_seconds": 60.0,
         "supports_text_embeddings_too": False,
-        # MERT ships a custom feature extractor in the repo.
+        # MERT ships custom model architecture/config code in the repo.
         "trust_remote_code": True,
         # Measured peak inference, MERT v1 95M at fp32, single 1s 24kHz clip.
         "memory_gb": 0.5,
     },
-    # MERT ships preprocessor_config.json + safetensors + custom .py for
-    # the feature extractor (required by trust_remote_code path).
+    # This immutable MERT revision ships pytorch_model.bin plus custom model
+    # architecture/config .py files required by the trust_remote_code path.
     "allow_patterns": [
-        "*.safetensors", "*.json", "*.txt", "*.md",
+        "pytorch_model.bin", "*.json", "*.txt", "*.md",
         "*.py",
         "preprocessor_config.json",
     ],

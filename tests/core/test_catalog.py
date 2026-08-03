@@ -3193,7 +3193,8 @@ def test_pull_bundled_projects_top_level_revision_and_filters(tmp_catalog):
     kwargs = mock_download.call_args.kwargs
     revision = "12af15fef9d0ac838c3f475bfbbf26d2060dd4f5"
     assert kwargs["revision"] == revision
-    assert "*.safetensors" in kwargs["allow_patterns"]
+    assert "pytorch_model.bin" in kwargs["allow_patterns"]
+    assert "*.safetensors" not in kwargs["allow_patterns"]
     assert "*.py" in kwargs["allow_patterns"]
     assert _read_catalog()["mert-v1-95m"]["revision"] == revision
 

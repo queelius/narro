@@ -25,6 +25,12 @@ from datetime import datetime, timezone
 log = logging.getLogger("muse.probe_worker")
 
 
+def _exception_summary(exc: BaseException) -> str:
+    """Return a non-empty, type-qualified exception description."""
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -155,11 +161,12 @@ def run_probe_worker(*, model_id: str, device: str, run_inference: bool) -> int:
     try:
         backend = load_backend(model_id, device=device)
     except Exception as e:  # noqa: BLE001
-        print(f"load failed: {e}", file=sys.stderr)
+        detail = _exception_summary(e)
+        print(f"load failed: {detail}", file=sys.stderr)
         record = {
             "model_id": model_id,
             "device": actual_device,
-            "error": f"load failed: {e}",
+            "error": f"load failed: {detail}",
             "probed_at": _utcnow_iso(),
             "ran_inference": False,
         }
@@ -203,8 +210,9 @@ def run_probe_worker(*, model_id: str, device: str, run_inference: bool) -> int:
             record["peak_bytes"] = _inference_peak_bytes(
                 peak_bytes, weights_bytes, nvml_meter)
         except Exception as e:  # noqa: BLE001
-            print(f"inference probe failed: {e}", file=sys.stderr)
-            record["inference_error"] = str(e)
+            detail = _exception_summary(e)
+            print(f"inference probe failed: {detail}", file=sys.stderr)
+            record["inference_error"] = detail
 
     # Drop references so any GC happens before exit.
     del backend

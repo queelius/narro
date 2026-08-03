@@ -33,5 +33,10 @@ def test_pip_extras_requires_transformers_4_46():
     assert "4.46" in pin or ">4.46" in pin or ">=4.46" in pin
 
 
+def test_pip_extras_include_transformers_5_image_processor_dependency():
+    assert "torch>=2.1.0" in MANIFEST["pip_extras"]
+    assert any(e.startswith("torchvision") for e in MANIFEST["pip_extras"])
+
+
 def test_license():
     assert MANIFEST["license"] == "Apache 2.0"

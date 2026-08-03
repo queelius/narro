@@ -103,6 +103,10 @@ def test_manifest_required_fields():
     assert any("Pillow" in x for x in m["pip_extras"])
 
 
+def test_manifest_includes_transformers_5_image_processor_dependency():
+    assert any(x.startswith("torchvision") for x in _manifest()["pip_extras"])
+
+
 def test_manifest_capabilities_shape():
     caps = _manifest()["capabilities"]
     assert caps["device"] == "auto"

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from muse.core.sse import iter_sse_events
 from muse.modalities.audio_speech import routes as routes_mod
 from muse.modalities.audio_speech.protocol import AudioChunk, AudioResult
 from muse.modalities.audio_speech.routes import build_router
@@ -124,11 +125,10 @@ def test_streaming_yields_multiple_events_progressively(client):
     })
     assert r.status_code == 200
     assert "text/event-stream" in r.headers["content-type"]
-    text = r.text
     # FakeTTS yields 3 chunks then "done". Expect at least 3 data events + done.
-    data_event_count = text.count("data: ")  # each SSE event starts with "data: "
-    assert data_event_count >= 3
-    assert "event: done" in text
+    events = list(iter_sse_events(r.text.splitlines()))
+    assert len([event for event in events if event[0] is None]) >= 3
+    assert events[-1] == ("done", "")
 
 
 def test_encoding_failure_returns_openai_error_envelope(monkeypatch):

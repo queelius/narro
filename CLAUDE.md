@@ -186,9 +186,10 @@ is multipart-in (one or more `file` parts, mirroring
 (`{object: "list", data, model, usage}`). Audio decoding goes through
 `librosa` (already installed for Whisper) inside the runtime/script,
 which resamples on the way in to each model's preferred rate (CLAP
-48kHz, MERT 24kHz). The bundled `mert-v1-95m` (MIT, 95MB, 768-dim
-music understanding via mean-pool over time, `trust_remote_code=True`
-for the custom feature extractor) is the default; the curated
+48kHz, MERT 24kHz). The bundled `mert-v1-95m` (CC-BY-NC-4.0
+non-commercial, 95M parameters, 768-dim music understanding via
+mean-pool over time, `trust_remote_code=True` for its custom model
+architecture/config) is the default; the curated
 `clap-htsat-fused` adds 512-dim audio + text-aligned embeddings
 (BSD-3, supports_text_embeddings_too=True). The HF resolver sniffs
 any repo with `feature-extraction` tag plus a name pattern matching

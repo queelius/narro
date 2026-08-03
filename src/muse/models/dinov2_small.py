@@ -58,6 +58,8 @@ MANIFEST = {
     "license": "Apache 2.0",
     "pip_extras": (
         "torch>=2.1.0",
+        # Transformers 5 image processors use torchvision-backed operations.
+        "torchvision>=0.16.0",
         "transformers>=4.36.0",
         "Pillow>=9.1.0",
         # numpy is pulled by transformers but the runtime imports it

@@ -111,7 +111,7 @@ def test_manifest_required_fields():
     assert m["modality"] == "audio/embedding"
     assert m["hf_repo"] == "m-a-p/MERT-v1-95M"
     assert "pip_extras" in m
-    assert "torch>=2.1.0" in m["pip_extras"]
+    assert "torch>=2.6.0" in m["pip_extras"]
     assert any("transformers" in x for x in m["pip_extras"])
     assert any("librosa" in x for x in m["pip_extras"])
 
@@ -128,10 +128,10 @@ def test_manifest_capabilities_shape():
 
 
 def test_manifest_allow_patterns_includes_required_files():
-    """preprocessor_config.json + .py is essential for trust_remote_code path."""
+    """Weights, processor config, and code are all required locally."""
     patterns = _manifest()["allow_patterns"]
     assert any("preprocessor_config" in p for p in patterns)
-    assert any(".safetensors" in p for p in patterns)
+    assert "pytorch_model.bin" in patterns
     assert any(".py" in p for p in patterns)
 
 
@@ -141,8 +141,8 @@ def test_manifest_pins_reviewed_remote_code_revision():
     assert all(c in "0123456789abcdef" for c in revision)
 
 
-def test_manifest_license_is_mit():
-    assert _manifest()["license"] == "MIT"
+def test_manifest_license_is_noncommercial_cc_by_nc_4_0():
+    assert _manifest()["license"] == "CC-BY-NC-4.0"
 
 
 def test_model_class_exists():

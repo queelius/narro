@@ -22,7 +22,10 @@ MANIFEST = {
         "CPU-friendly default OCR for line-level extraction."
     ),
     "license": "MIT",
-    "pip_extras": ["torch>=2.1.0", "transformers>=4.40.0", "Pillow"],
+    "pip_extras": [
+        "torch>=2.1.0", "torchvision>=0.16.0",
+        "transformers>=4.40.0", "Pillow",
+    ],
     "system_packages": [],
     "capabilities": {
         "device": "auto",

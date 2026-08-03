@@ -30,7 +30,7 @@ def chunk_to_sse_data(chunk: ChatChunk) -> str:
     """JSON-encode a chunk ready for an SSE `data:` line.
 
     Returns only the JSON body; the transport layer (EventSourceResponse
-    in routes.py) handles the `data: ` prefix and `\\n\\n` separator.
+    in routes.py) handles the `data:` field and event separator.
     """
     return json.dumps(chunk_to_openai_dict(chunk), separators=(",", ":"))
 

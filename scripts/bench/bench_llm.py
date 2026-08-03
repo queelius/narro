@@ -19,6 +19,7 @@ import time
 
 import httpx
 
+from muse.core.sse import iter_sse_events
 from scripts.bench._stats import median, tok_per_s, write_reports
 
 SHORT_PROMPT = "List five uses for a brick, one line each."
@@ -64,11 +65,15 @@ class MuseClient:
                 json={"model": self.model, "messages": messages,
                       "max_tokens": max_tokens, "stream": True}) as r:
             r.raise_for_status()
-            for line in r.iter_lines():
-                if not line.startswith("data: "):
-                    continue
-                payload = line[6:]
+            content_type = r.headers.get("content-type", "")
+            if "text/event-stream" not in content_type.lower():
+                raise RuntimeError("Muse stream response is not text/event-stream")
+            saw_done = False
+            for event_type, payload in iter_sse_events(r.iter_lines()):
+                if event_type == "error":
+                    raise RuntimeError(f"Muse stream failed: {payload}")
                 if payload.strip() == "[DONE]":
+                    saw_done = True
                     break
                 delta = (json.loads(payload)["choices"][0]
                          .get("delta", {}).get("content"))
@@ -81,6 +86,8 @@ class MuseClient:
                     gaps.append(now - last)
                 last = now
                 n += 1
+            if not saw_done:
+                raise RuntimeError("Muse stream ended before the [DONE] sentinel")
         return {"ttft": ttft, "gap_median": median(gaps) if gaps else 0.0,
                 "tokens": n, "elapsed": time.monotonic() - t0}
 

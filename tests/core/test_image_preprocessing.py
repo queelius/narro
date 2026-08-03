@@ -216,8 +216,10 @@ def test_build_image_processor_all_tiers_exhausted_raises(tmp_path, monkeypatch)
     ImageProcessorError with override-hatch hint in the message."""
     from muse.core import image_preprocessing as mod
 
+    underlying = ImportError("requires torchvision")
+
     def _failing(src):
-        raise RuntimeError("no preprocessor_config.json")
+        raise underlying
     monkeypatch.setattr(mod, "_load_auto_image_processor", _failing)
 
     with pytest.raises(mod.ImageProcessorError) as exc_info:
@@ -225,9 +227,11 @@ def test_build_image_processor_all_tiers_exhausted_raises(tmp_path, monkeypatch)
             str(tmp_path), overrides=None, model_id="m",
         )
     msg = str(exc_info.value)
+    assert "ImportError: requires torchvision" in msg
     assert "image_processor_overrides" in msg
-    assert "num_channels" in msg
-    assert "image_size" in msg
+    assert "image_mean" in msg
+    assert "image_std" in msg
+    assert exc_info.value.__cause__ is underlying
 
 
 def test_build_image_processor_empty_overrides_treated_as_none(tmp_path, monkeypatch):

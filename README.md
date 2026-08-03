@@ -108,6 +108,7 @@ curl -X POST http://localhost:8000/v1/images/embeddings \
   -d "{\"input\":\"data:image/png;base64,${IMG_B64}\",\"model\":\"dinov2-small\"}"
 
 # Audio embeddings (multipart upload; one or more `file` parts; mirrors /v1/embeddings envelope)
+# The bundled MERT default is CC-BY-NC-4.0 and restricted to non-commercial use.
 curl -X POST http://localhost:8000/v1/audio/embeddings \
   -F "file=@clip.wav" \
   -F "model=mert-v1-95m"
@@ -677,7 +678,7 @@ See the "Federation" section of `CLAUDE.md` for the full design.
   - `bart_large_cnn.py` (text/summarization; facebook/bart-large-cnn, Apache 2.0, ~400MB CPU-friendly)
   - `m2m100_418m.py` (text/translation; facebook/m2m100_418M, MIT, ~2GB, all-pairs across 100 languages)
   - `dinov2_small.py` (image/embedding; facebook/dinov2-small, Apache 2.0, 88MB, 384-dim CPU-friendly)
-  - `mert_v1_95m.py` (audio/embedding; m-a-p/MERT-v1-95M, MIT, 95MB, 768-dim music understanding via mean-pool over time)
+  - `mert_v1_95m.py` (audio/embedding; m-a-p/MERT-v1-95M, CC-BY-NC-4.0 non-commercial, 95M parameters, 768-dim music understanding via mean-pool over time)
   - `wan2_1_t2v_1_3b.py` (video/generation; Wan-AI/Wan2.1-T2V-1.3B, Apache 2.0, ~3GB at fp16, 5s clips at 832x480, GPU-required)
 - `muse.core.resolvers`: URI -> ResolvedModel dispatch for `muse pull hf://...`.
   - `resolvers_hf` registers the `hf://` resolver for HuggingFace GGUF + sentence-transformers repos.

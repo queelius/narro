@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 
 logger = logging.getLogger("muse.smoke")
+_FAILED_OUTPUT_LIMIT = 16 * 1024
 
 
 @dataclasses.dataclass
@@ -155,13 +156,27 @@ def _extract_failure_reason(captured: str) -> str:
         if line.startswith("ImportError:"):
             return line.strip()
         if line.startswith("load failed:"):
-            return line.strip()
+            detail = line.removeprefix("load failed:").strip()
+            if detail:
+                return f"load failed: {detail}"
     # Fall back to the last non-empty line of stderr-style output.
     for line in reversed(captured.splitlines()):
         s = line.strip()
-        if s and not s.startswith("{"):
+        if s and s != "load failed:" and not s.startswith("{"):
             return s[:200]
     return "unknown failure"
+
+
+def _log_failed_subprocess_output(stage: str, captured: str) -> None:
+    """Surface a bounded tail of captured output for CI diagnosis."""
+    output = captured.strip()
+    if not output:
+        return
+    truncated = len(output) > _FAILED_OUTPUT_LIMIT
+    if truncated:
+        output = output[-_FAILED_OUTPUT_LIMIT:]
+    marker = " (tail; earlier output truncated)" if truncated else ""
+    logger.error("%s subprocess output%s:\n%s", stage, marker, output)
 
 
 def _smoke_pulled_model(model_id: str, venv_root: Path) -> SmokeResult:
@@ -188,8 +203,10 @@ def _smoke_pulled_model(model_id: str, venv_root: Path) -> SmokeResult:
         cmd, capture_output=True, text=True, env=env, cwd=str(repo_root),
     )
     if proc.returncode != 0:
+        captured = proc.stdout + proc.stderr
+        _log_failed_subprocess_output("pull", captured)
         duration = time.monotonic() - t0
-        reason = _extract_failure_reason(proc.stdout + proc.stderr)
+        reason = _extract_failure_reason(captured)
         return SmokeResult(
             model_id=model_id,
             ok=False,
@@ -228,6 +245,7 @@ def _smoke_pulled_model(model_id: str, venv_root: Path) -> SmokeResult:
     probe = _run_inference_probe if run_inference else _run_load_only
     rc, captured = probe(Path(python_path), model_id, env=env)
     if rc != 0:
+        _log_failed_subprocess_output("probe", captured)
         duration = time.monotonic() - t0
         reason = _extract_failure_reason(captured)
         stage = "inference" if run_inference else "load"

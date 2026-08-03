@@ -33,9 +33,10 @@ def test_plugin_runtime_path():
     )
 
 
-def test_plugin_pip_extras_includes_torch_and_transformers_and_pillow():
+def test_plugin_pip_extras_include_image_processor_runtime_dependencies():
     extras = HF_PLUGIN["pip_extras"]
-    assert any("torch" in e for e in extras)
+    assert "torch>=2.1.0" in extras
+    assert any(e.startswith("torchvision") for e in extras)
     assert any("transformers" in e for e in extras)
     assert any("Pillow" in e for e in extras)
 
@@ -291,7 +292,8 @@ def test_resolve_includes_pip_extras_in_manifest():
     )
     resolved = HF_PLUGIN["resolve"]("acme/x", None, info)
     extras = resolved.manifest["pip_extras"]
-    assert any("torch" in e for e in extras)
+    assert "torch>=2.1.0" in extras
+    assert any(e.startswith("torchvision") for e in extras)
     assert any("transformers" in e for e in extras)
     assert any("Pillow" in e for e in extras)
 

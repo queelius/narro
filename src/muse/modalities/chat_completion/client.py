@@ -8,13 +8,14 @@ from typing import Iterator
 import httpx
 
 from muse.core import config
+from muse.core.sse import iter_sse_events
 
 
 logger = logging.getLogger(__name__)
 
 
 class ChatStreamError(RuntimeError):
-    """Raised when a chat stream carries a mid-stream `event: error` frame.
+    """Raised when a chat stream reports an error or violates its protocol.
 
     `error` is the parsed OpenAI error envelope's inner dict
     (``{"code", "message", "type"}``) when the payload is JSON, else a
@@ -68,22 +69,17 @@ class ChatClient:
             timeout=self.timeout,
         ) as r:
             r.raise_for_status()
-            # Track the current SSE `event:` type. The server signals a
-            # mid-stream backend failure with an `event: error` frame whose
-            # `data:` line carries the OpenAI error envelope; without honoring
-            # the event type we would yield that envelope as a normal chunk
-            # and callers iterating chunk["choices"] would KeyError (L6).
-            event_type: str | None = None
-            for line in r.iter_lines():
-                if not line:
-                    event_type = None  # blank line terminates an SSE event
-                    continue
-                if line.startswith("event: "):
-                    event_type = line[len("event: "):].strip()
-                    continue
-                if not line.startswith("data: "):
-                    continue
-                payload = line[len("data: "):]
+            content_type = r.headers.get("content-type", "")
+            if "text/event-stream" not in content_type.lower():
+                raise ChatStreamError({
+                    "code": "invalid_stream_response",
+                    "message": "chat stream response is not text/event-stream",
+                    "type": "server_error",
+                })
+            # The server signals a mid-stream backend failure with an
+            # `event: error` frame. Parse complete events so compact fields
+            # (`data:value`) and multiline data follow the SSE contract.
+            for event_type, payload in iter_sse_events(r.iter_lines()):
                 if event_type == "error":
                     try:
                         envelope = json.loads(payload)
@@ -97,3 +93,8 @@ class ChatClient:
                     yield json.loads(payload)
                 except json.JSONDecodeError as e:
                     logger.warning("malformed SSE chunk: %s (%s)", payload, e)
+            raise ChatStreamError({
+                "code": "incomplete_stream",
+                "message": "chat stream ended before the [DONE] sentinel",
+                "type": "server_error",
+            })

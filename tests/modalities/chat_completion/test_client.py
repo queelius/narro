@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from muse.modalities.chat_completion.client import ChatClient
+from muse.modalities.chat_completion.client import ChatClient, ChatStreamError
 
 
 def test_client_non_streaming_returns_dict():
@@ -32,12 +32,13 @@ def test_client_streaming_yields_chunks():
     """stream=True: client opens a stream and yields parsed chunk dicts."""
     fake_response = MagicMock()
     fake_response.status_code = 200
+    fake_response.headers = {"content-type": "text/event-stream; charset=utf-8"}
     fake_response.iter_lines.return_value = [
-        "data: " + '{"choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":null}]}',
+        "data:" + '{"choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":null}]}',
         "",
         "data: " + '{"choices":[{"delta":{"content":"hi"},"index":0,"finish_reason":null}]}',
         "",
-        "data: [DONE]",
+        "data:[DONE]",
         "",
     ]
     fake_response.raise_for_status = MagicMock()
@@ -57,15 +58,14 @@ def test_client_streaming_yields_chunks():
 def test_client_streaming_raises_on_sse_error_frame():
     """L6: a mid-stream `event: error` frame must raise, not be yielded as a
     normal chunk (callers iterating chunk["choices"] would KeyError)."""
-    from muse.modalities.chat_completion.client import ChatStreamError
-
     fake_response = MagicMock()
     fake_response.status_code = 200
+    fake_response.headers = {"content-type": "text/event-stream"}
     fake_response.iter_lines.return_value = [
         "data: " + '{"choices":[{"delta":{"content":"partial"},"index":0}]}',
         "",
-        "event: error",
-        "data: " + '{"error":{"code":"internal","message":"backend blew up","type":"server_error"}}',
+        "event:error",
+        "data:" + '{"error":{"code":"internal","message":"backend blew up","type":"server_error"}}',
         "",
         "data: [DONE]",
         "",
@@ -85,6 +85,47 @@ def test_client_streaming_raises_on_sse_error_frame():
             next(gen)
         assert "backend blew up" in str(exc.value)
         assert exc.value.error["code"] == "internal"
+
+
+def test_client_streaming_rejects_non_sse_response():
+    fake_response = MagicMock()
+    fake_response.headers = {"content-type": "application/json"}
+    fake_response.iter_lines.return_value = []
+
+    fake_stream_cm = MagicMock()
+    fake_stream_cm.__enter__ = lambda s: fake_response
+    fake_stream_cm.__exit__ = lambda s, a, b, c: None
+
+    with patch(
+        "muse.modalities.chat_completion.client.httpx.stream",
+        return_value=fake_stream_cm,
+    ):
+        client = ChatClient(base_url="http://x")
+        with pytest.raises(ChatStreamError) as exc:
+            list(client.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert exc.value.error["code"] == "invalid_stream_response"
+
+
+def test_client_streaming_rejects_eof_before_done():
+    fake_response = MagicMock()
+    fake_response.headers = {"content-type": "text/event-stream"}
+    fake_response.iter_lines.return_value = [
+        'data: {"choices":[{"delta":{"content":"partial"}}]}',
+        "",
+    ]
+
+    fake_stream_cm = MagicMock()
+    fake_stream_cm.__enter__ = lambda s: fake_response
+    fake_stream_cm.__exit__ = lambda s, a, b, c: None
+
+    with patch(
+        "muse.modalities.chat_completion.client.httpx.stream",
+        return_value=fake_stream_cm,
+    ):
+        client = ChatClient(base_url="http://x")
+        with pytest.raises(ChatStreamError) as exc:
+            list(client.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert exc.value.error["code"] == "incomplete_stream"
 
 
 def test_client_uses_muse_server_env_var(monkeypatch):

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from muse.core.registry import ModalityRegistry
 from muse.core.server import create_app
+from muse.core.sse import iter_sse_events
 from muse.modalities.chat_completion.protocol import (
     ChatChoice,
     ChatChunk,
@@ -86,8 +87,10 @@ def test_streaming_returns_sse(client):
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/event-stream")
         body = r.read().decode()
-    lines = [line for line in body.splitlines() if line.startswith("data: ")]
-    payloads = [line[len("data: "):] for line in lines]
+    payloads = [
+        data for event_type, data in iter_sse_events(body.splitlines())
+        if event_type is None
+    ]
     assert payloads[-1] == "[DONE]"
     parsed = [json.loads(p) for p in payloads[:-1]]
     assert len(parsed) == 3
@@ -132,21 +135,7 @@ def test_streaming_backend_error_emits_sse_error_event():
         assert r.status_code == 200
         body = r.read().decode()
 
-    # Parse the SSE stream into (event, data) pairs by walking blank-
-    # line-separated blocks. sse-starlette emits CRLF line endings.
-    events: list[tuple[str | None, str]] = []
-    normalized = body.replace("\r\n", "\n")
-    for block in normalized.split("\n\n"):
-        if not block.strip():
-            continue
-        event_name: str | None = None
-        data_lines: list[str] = []
-        for line in block.splitlines():
-            if line.startswith("event: "):
-                event_name = line[len("event: "):]
-            elif line.startswith("data: "):
-                data_lines.append(line[len("data: "):])
-        events.append((event_name, "\n".join(data_lines)))
+    events = list(iter_sse_events(body.splitlines()))
 
     # Expected sequence: at least one normal data chunk, then an error
     # event, then [DONE].

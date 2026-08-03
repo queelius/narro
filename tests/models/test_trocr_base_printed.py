@@ -28,7 +28,8 @@ def test_pip_extras_includes_pillow():
     test (fresh-venv-smoke.yml) catches a load-time ImportError."""
     extras = MANIFEST["pip_extras"]
     assert any("Pillow" in e for e in extras)
-    assert any(e.startswith("torch") for e in extras)
+    assert "torch>=2.1.0" in extras
+    assert any(e.startswith("torchvision") for e in extras)
     assert any(e.startswith("transformers") for e in extras)
 
 

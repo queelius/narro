@@ -34,7 +34,17 @@ def test_build_uvicorn_server_sets_bounded_graceful_timeout():
     assert server.config.port == 8000
 
 
-def test_server_signals_shutdown_event_as_soon_as_signal_arrives():
+def test_server_signals_shutdown_event_as_soon_as_signal_arrives(monkeypatch):
+    # sse-starlette patches uvicorn.Server.handle_exit and records shutdown
+    # in process-global state. Mock the superclass method so this unit test
+    # verifies delegation without cancelling later in-process SSE responses.
+    delegated: list[tuple[object, int, object]] = []
+
+    def _base_handle_exit(server, sig, frame):
+        delegated.append((server, sig, frame))
+        server.should_exit = True
+
+    monkeypatch.setattr(serve_util.uvicorn.Server, "handle_exit", _base_handle_exit)
     shutdown_event = threading.Event()
     server = serve_util.build_uvicorn_server(
         object(),
@@ -47,6 +57,7 @@ def test_server_signals_shutdown_event_as_soon_as_signal_arrives():
 
     assert shutdown_event.is_set()
     assert server.should_exit is True
+    assert delegated == [(server, signal.SIGTERM, None)]
 
 
 def test_shutdown_grace_seconds_default():

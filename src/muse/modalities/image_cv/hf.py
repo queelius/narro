@@ -47,7 +47,14 @@ _DETECTION_RUNTIME = (
     "muse.modalities.image_cv.runtimes.hf_object_detection"
     ":HFObjectDetectionRuntime"
 )
-_PIP_EXTRAS_BASE = ("torch>=2.1.0", "transformers>=4.46.0", "Pillow", "numpy")
+_PIP_EXTRAS_BASE = (
+    "torch>=2.1.0",
+    # Transformers 5 image processors use torchvision-backed operations.
+    "torchvision>=0.16.0",
+    "transformers>=4.46.0",
+    "Pillow",
+    "numpy",
+)
 # Detection adds timm for backbones (DETR, RT-DETR-ResNet).
 _PIP_EXTRAS_DETECTION = (*_PIP_EXTRAS_BASE, "timm")
 
