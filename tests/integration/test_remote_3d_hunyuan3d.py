@@ -100,7 +100,7 @@ def test_protocol_text_to_3d_glb_magic_bytes(base_url, hunyuan_loaded):
 
 
 def test_protocol_capability_advertised_in_models(base_url, hunyuan_loaded):
-    """The /v1/models endpoint advertises both directions + trust_remote_code."""
+    """The endpoint advertises both SDK-backed generation directions."""
     r = requests.get(f"{base_url}/v1/models", timeout=10)
     r.raise_for_status()
     entries = [m for m in r.json()["data"] if m["id"] == HUNYUAN3D_MODEL_ID]
@@ -108,7 +108,7 @@ def test_protocol_capability_advertised_in_models(base_url, hunyuan_loaded):
     caps = entries[0].get("capabilities") or {}
     assert caps.get("supports_image_to_3d") is True
     assert caps.get("supports_text_to_3d") is True
-    assert caps.get("trust_remote_code") is True
+    assert "trust_remote_code" not in caps
 
 
 def test_protocol_legacy_string_prompt_unaffected(base_url, hunyuan_loaded):

@@ -37,6 +37,27 @@ torch: Any = None
 SentenceTransformer: Any = None
 
 
+class _PinnedCodeRevisionKwargs(dict[str, Any]):
+    """Keep a code pin when SentenceTransformers probes module classes.
+
+    SentenceTransformers 5 consumes ``model_kwargs['code_revision']`` with
+    ``pop`` while resolving a modules.json class before it constructs the
+    underlying Transformers AutoModel.  An external auto_map (Nomic) needs
+    the same pin at both boundaries. Returning the value without deleting it
+    preserves that invariant and remains an ordinary dict for downstream
+    ``**kwargs`` expansion.
+    """
+
+    def pop(self, key: str, *default: Any) -> Any:
+        if key == "code_revision":
+            if key in self:
+                return self[key]
+            if default:
+                return default[0]
+            raise KeyError(key)
+        return super().pop(key, *default)
+
+
 def _ensure_deps() -> None:
     """Lazy-import torch + sentence-transformers (per-symbol; test-safe)."""
     global torch, SentenceTransformer
@@ -62,7 +83,8 @@ class SentenceTransformerModel:
       - hf_repo (required, fallback weight source)
       - local_dir (optional, preferred over hf_repo)
       - device ("auto" | "cpu" | "cuda" | "mps")
-      - trust_remote_code (default False; set True for Qwen3-Embedding, Nomic, etc.)
+      - trust_remote_code (default False; set True for reviewed custom models)
+      - code_revision (optional immutable commit for an external auto_map repo)
       - other kwargs absorbed by **_
     """
 
@@ -77,6 +99,7 @@ class SentenceTransformerModel:
         local_dir: str | None = None,
         device: str = "auto",
         trust_remote_code: bool = False,
+        code_revision: str | None = None,
         **_: Any,
     ) -> None:
         _ensure_deps()
@@ -92,10 +115,21 @@ class SentenceTransformerModel:
             "loading SentenceTransformer from %s (device=%s, trust_remote_code=%s)",
             src, self._device, trust_remote_code,
         )
+        remote_code_kwargs: dict[str, Any] = {}
+        if code_revision is not None:
+            # Transformers distinguishes the model revision from code hosted
+            # in a different repository named by config.auto_map.
+            remote_code_kwargs["model_kwargs"] = _PinnedCodeRevisionKwargs(
+                code_revision=code_revision,
+            )
+            remote_code_kwargs["config_kwargs"] = {
+                "code_revision": code_revision,
+            }
         self._model = SentenceTransformer(
             src,
             device=self._device,
             trust_remote_code=trust_remote_code,
+            **remote_code_kwargs,
         )
         self.dimensions = int(self._model.get_sentence_embedding_dimension())
 

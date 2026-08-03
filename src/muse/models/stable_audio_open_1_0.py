@@ -60,6 +60,7 @@ MANIFEST = {
     "model_id": "stable-audio-open-1.0",
     "modality": "audio/generation",
     "hf_repo": "stabilityai/stable-audio-open-1.0",
+    "revision": "f21265c1e2710b3bd2386596943f0007f55f802e",
     "description": (
         "Stable Audio Open 1.0: 47s music + SFX, 44.1kHz stereo, "
         "Apache 2.0"

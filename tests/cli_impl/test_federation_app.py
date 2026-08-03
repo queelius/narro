@@ -167,3 +167,57 @@ def test_failover_502_when_all_nodes_fail(monkeypatch):
     c = TestClient(app)
     r = c.post("/v1/chat/completions", json={"model": "m", "messages": []})
     assert r.status_code == 502 and r.json()["error"]["code"] == "no_node_available"
+
+
+def test_read_timeout_maps_504_without_failover(monkeypatch):
+    class FakeReg:
+        def snapshot(self):
+            return [
+                NodeState(
+                    NodeSpec("http://a:8000", "a"), True,
+                    {"m": ModelAvail(True, True)}, 0, 0.0,
+                ),
+                NodeState(
+                    NodeSpec("http://b:8000", "b"), True,
+                    {"m": ModelAvail(True, True)}, 0, 0.0,
+                ),
+            ]
+
+    seen = []
+
+    async def fake_forward(request, target_url, timeout):
+        seen.append(target_url)
+        raise httpx.ReadTimeout("accepted but stalled")
+
+    monkeypatch.setattr(fed, "_forward", fake_forward)
+    app = fed.build_coordinator(FakeReg(), timeout=5)
+    r = TestClient(app).post(
+        "/v1/chat/completions", json={"model": "m", "messages": []},
+    )
+
+    assert r.status_code == 504
+    assert r.json()["error"]["code"] == "node_timeout"
+    assert len(seen) == 1
+
+
+def test_nonconnect_transport_failure_maps_502_without_failover(monkeypatch):
+    class FakeReg:
+        def snapshot(self):
+            return [
+                NodeState(
+                    NodeSpec("http://a:8000", "a"), True,
+                    {"m": ModelAvail(True, True)}, 0, 0.0,
+                ),
+            ]
+
+    async def fake_forward(request, target_url, timeout):
+        raise httpx.RemoteProtocolError("truncated response")
+
+    monkeypatch.setattr(fed, "_forward", fake_forward)
+    app = fed.build_coordinator(FakeReg(), timeout=5)
+    r = TestClient(app).post(
+        "/v1/chat/completions", json={"model": "m", "messages": []},
+    )
+
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "node_forward_failed"

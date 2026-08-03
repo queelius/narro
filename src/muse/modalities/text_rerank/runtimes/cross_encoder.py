@@ -55,6 +55,8 @@ class CrossEncoderRuntime:
         local_dir: str | None = None,
         device: str = "auto",
         max_length: int = 512,
+        trust_remote_code: bool = False,
+        code_revision: str | None = None,
         **_: Any,
     ) -> None:
         _ensure_deps()
@@ -72,8 +74,20 @@ class CrossEncoderRuntime:
             "loading cross-encoder reranker from %s (device=%s, max_length=%d)",
             src, self._device, max_length,
         )
+        remote_code_kwargs: dict[str, Any] = {}
+        if code_revision is not None:
+            remote_code_kwargs["model_kwargs"] = {
+                "code_revision": code_revision,
+            }
+            remote_code_kwargs["config_kwargs"] = {
+                "code_revision": code_revision,
+            }
         self._model = CrossEncoder(
-            src, max_length=max_length, device=self._device,
+            src,
+            max_length=max_length,
+            device=self._device,
+            trust_remote_code=trust_remote_code,
+            **remote_code_kwargs,
         )
 
     def rerank(

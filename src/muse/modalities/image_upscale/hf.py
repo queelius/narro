@@ -24,7 +24,7 @@ from typing import Any, Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _RUNTIME_PATH = (
@@ -103,6 +103,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "device": "cuda",
         "memory_gb": 6.0,
     }
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "image/upscale",
@@ -113,6 +114,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     siblings = [s.rfilename for s in getattr(info, "siblings", [])]
     has_fp16_variants = any(".fp16." in name for name in siblings)
@@ -139,6 +142,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             repo_id=repo_id,
             cache_dir=str(cache_root) if cache_root else None,
             allow_patterns=allow_patterns,
+            revision=revision,
         ))
 
     return ResolvedModel(

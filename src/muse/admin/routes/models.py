@@ -57,13 +57,16 @@ def build_models_router() -> APIRouter:
             return error_response(
                 404, "model_not_found", f"unknown model {model_id!r}",
             )
-        job = launch_async(
-            enable_model,
-            op_name="enable",
-            model_id=model_id,
-            store=store,
-            state=state,
-        )
+        try:
+            job = launch_async(
+                enable_model,
+                op_name="enable",
+                model_id=model_id,
+                store=store,
+                state=state,
+            )
+        except OperationError as e:
+            return _operation_error_to_response(e)
         return JSONResponse(
             status_code=202,
             content={"job_id": job.job_id, "status": job.state},
@@ -105,14 +108,17 @@ def build_models_router() -> APIRouter:
         body = body or {}
         no_inference = bool(body.get("no_inference", False))
         device = body.get("device")
-        job = launch_async(
-            probe_model,
-            op_name="probe",
-            model_id=model_id,
-            store=store,
-            no_inference=no_inference,
-            device=device,
-        )
+        try:
+            job = launch_async(
+                probe_model,
+                op_name="probe",
+                model_id=model_id,
+                store=store,
+                no_inference=no_inference,
+                device=device,
+            )
+        except OperationError as e:
+            return _operation_error_to_response(e)
         return JSONResponse(
             status_code=202,
             content={"job_id": job.job_id, "status": job.state},
@@ -141,13 +147,16 @@ def build_models_router() -> APIRouter:
         # was the `_` placeholder; that way job.model_id is the meaningful
         # identifier the user pulled. op_args supplies the positional
         # identifier argument that pull_model expects.
-        job = launch_async(
-            pull_model,
-            op_name="pull",
-            model_id=identifier,
-            store=store,
-            op_args=(identifier,),
-        )
+        try:
+            job = launch_async(
+                pull_model,
+                op_name="pull",
+                model_id=identifier,
+                store=store,
+                op_args=(identifier,),
+            )
+        except OperationError as e:
+            return _operation_error_to_response(e)
         return JSONResponse(
             status_code=202,
             content={"job_id": job.job_id, "status": job.state},

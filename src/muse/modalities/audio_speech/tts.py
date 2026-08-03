@@ -77,7 +77,12 @@ class Narro:
 
         self.model_id = model_path if model_path else MODEL_ID
         from .backends.transformers import TransformersModel
-        self.pipeline = TransformersModel(model_path=model_path, compile=compile,
+        # ``TransformersModel`` deliberately accepts ``hf_repo`` and
+        # ``local_dir``.  Passing the historical ``model_path`` keyword was
+        # silently absorbed by its compatibility ``**_`` and caused the
+        # encoder to fall back to the mutable default Hub repository while
+        # only the decoder used Muse's pulled snapshot.
+        self.pipeline = TransformersModel(local_dir=model_path, compile=compile,
                                           quantize=quantize, device=device)
 
         from .decode_only import load_decoder

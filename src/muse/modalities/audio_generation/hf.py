@@ -23,7 +23,7 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _RUNTIME_PATH = (
@@ -97,6 +97,7 @@ def _stable_audio_capabilities() -> dict:
 
 
 def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "audio/generation",
@@ -109,6 +110,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": ["ffmpeg"],
         "capabilities": _stable_audio_capabilities(),
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     siblings = [s.rfilename for s in getattr(info, "siblings", [])]
     has_fp16 = any(".fp16." in f for f in siblings)
@@ -138,6 +141,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             repo_id=repo_id,
             cache_dir=str(cache_root) if cache_root else None,
             allow_patterns=allow_patterns,
+            revision=revision,
         ))
 
     return ResolvedModel(

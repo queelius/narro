@@ -1,9 +1,9 @@
 """TRELLISRuntime: image-to-3D via Microsoft's TRELLIS SDK.
 
 Wraps the official TrellisImageTo3DPipeline from the TRELLIS standalone
-library (https://github.com/microsoft/TRELLIS). The SDK is a custom
-library installed as a pip package (git+https://...) rather than a
-standard HuggingFace transformers or diffusers pipeline.
+library (https://github.com/microsoft/TRELLIS). Muse materializes the SDK
+as an immutable reviewed sparse checkout rather than treating it as a
+standard Hugging Face Transformers or Diffusers pipeline.
 
 API VERIFIED (2026-05-06): The TRELLIS pipeline is loaded via
 `TrellisImageTo3DPipeline.from_pretrained(repo_or_local_path)` where
@@ -21,10 +21,9 @@ Device placement: use `pipeline.cuda()` (not `.to(device)`) for GPU.
 The pipeline does not inherit from nn.Module, so `.to()` is not
 universally available.
 
-Verified against the TRELLIS GitHub source at
-https://github.com/microsoft/TRELLIS/blob/main/trellis/pipelines/trellis_image_to_3d.py
-and https://github.com/microsoft/TRELLIS/blob/main/trellis/representations/mesh/cube2mesh.py
-on 2026-05-06. If the SDK changes upstream, update mocks in
+Verified against TRELLIS commit
+442aa1e1afb9014e80681d3bf604e8d728a86ee7 on 2026-05-06. If the SDK
+pin changes, update mocks in
 tests/modalities/model_3d_generation/runtimes/test_trellis.py and the
 _TRELLIS_PIPELINE sentinel logic here.
 
@@ -96,8 +95,9 @@ class TRELLISRuntime:
       - ``model_id`` (required): catalog id; echoed in result envelope.
       - ``hf_repo``, ``local_dir``: standard weight source.
       - ``device``, ``dtype``: standard device + dtype selection.
-      - ``trust_remote_code``: accepted but not forwarded (TRELLIS uses
-        a direct pip install, not transformers trust_remote_code).
+      - ``trust_remote_code``: deprecated compatibility kwarg, accepted but
+        not forwarded (TRELLIS uses a direct pip install, not Transformers
+        dynamic modules).
       - ``sparse_structure_steps`` (default 12): denoising steps for the
         sparse structure sampler. The official TRELLIS default is 25;
         12 is faster and adequate for most inputs.
@@ -117,7 +117,7 @@ class TRELLISRuntime:
         local_dir: str | None = None,
         device: str = "auto",
         dtype: str = "fp16",
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         seed: int | None = None,
         sparse_structure_steps: int = 12,
         slat_steps: int = 12,
@@ -132,9 +132,12 @@ class TRELLISRuntime:
             )
         if _TRELLIS_PIPELINE is None:
             raise RuntimeError(
-                "TRELLIS SDK not available: `trellis` package not installed. "
-                f"Run `muse models refresh {model_id}`. The TRELLIS SDK is "
-                "installed via `pip install git+https://github.com/microsoft/TRELLIS`."
+                "TRELLIS SDK source or its native CUDA dependencies are not "
+                f"importable. Run `muse models refresh {model_id}` to repair "
+                "the reviewed source checkout and basic dependencies. TRELLIS "
+                "also requires the CUDA/PyTorch-specific native packages from "
+                "Microsoft's pinned setup instructions (spconv and either "
+                "flash-attn or xformers at minimum)."
             )
         if trimesh is None:
             raise RuntimeError(

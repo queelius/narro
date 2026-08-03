@@ -16,6 +16,7 @@ MANIFEST = {
     "model_id": "smolvlm-256m-instruct",
     "modality": "chat/completion",
     "hf_repo": "HuggingFaceTB/SmolVLM-256M-Instruct",
+    "revision": "7e3e67edbbed1bf9888184d9df282b700a323964",
     "description": (
         "SmolVLM-256M-Instruct: tiny CPU-runnable VLM, ~500MB. "
         "Image captioning, basic VQA, multi-image."

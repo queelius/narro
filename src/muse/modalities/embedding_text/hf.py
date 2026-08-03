@@ -15,11 +15,11 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _RUNTIME_PATH = "muse.modalities.embedding_text.runtimes.sentence_transformers:SentenceTransformerModel"
-_PIP_EXTRAS = ("torch>=2.1.0", "sentence-transformers>=2.2.0")
+_PIP_EXTRAS = ("torch>=2.1.0", "sentence-transformers>=5.0.0")
 
 
 def _model_id(repo_id: str) -> str:
@@ -42,6 +42,7 @@ def _sniff(info) -> bool:
 
 
 def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "embedding/text",
@@ -52,6 +53,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": {},
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         # Mirror the v0.16.1 image_generation/hf.py fp16 handling so we
@@ -65,11 +68,17 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         else:
             allow_patterns = ["*.safetensors", "*.json", "*.txt", "*.md"]
         allow_patterns.append("pytorch_model.bin")
-        return Path(snapshot_download(
-            repo_id=repo_id,
-            allow_patterns=allow_patterns,
-            cache_dir=str(cache_root) if cache_root else None,
-        ))
+        # Inert unless trust_remote_code is enabled by a curated overlay,
+        # but required locally when it is (Nomic/Jina-style repositories).
+        allow_patterns.append("*.py")
+        download_kwargs = {
+            "repo_id": repo_id,
+            "allow_patterns": allow_patterns,
+            "cache_dir": str(cache_root) if cache_root else None,
+        }
+        if revision is not None:
+            download_kwargs["revision"] = revision
+        return Path(snapshot_download(**download_kwargs))
 
     return ResolvedModel(
         manifest=manifest,

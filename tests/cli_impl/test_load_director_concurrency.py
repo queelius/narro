@@ -160,6 +160,7 @@ class TestEvictionEpoch:
         # candidate.
         director.acquire("Z", manifest=_manifest(memory_gb=2.0, device="cuda"))
         director.release("Z")
+        free["v"] = 1.0  # force a real eviction instead of the live-fit fast path
 
         epoch_before = director._inflight_epoch
         director._evict_lru_until_fits(

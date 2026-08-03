@@ -46,6 +46,7 @@ MANIFEST = {
     "model_id": "bark-small",
     "modality": "audio/speech",
     "hf_repo": "suno/bark-small",
+    "revision": "1dbd7a128513b8ae4a4e2130fed57b7ac9da5bcd",
     "description": "Multilingual TTS with voice cloning, 24kHz",
     "license": "MIT",
     # transformers pulls torch + numpy transitively, but declaring them

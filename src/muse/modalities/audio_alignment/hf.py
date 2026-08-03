@@ -7,7 +7,12 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, ResolverError, SearchResult
+from muse.core.resolvers import (
+    ResolvedModel,
+    ResolverError,
+    SearchResult,
+    hf_commit_revision,
+)
 
 
 _RUNTIME = (
@@ -80,6 +85,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         raise ResolverError(
             f"unsupported audio-alignment checkpoint shape for {repo_id!r}"
         )
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "audio/alignment",
@@ -103,12 +109,15 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             "supported_languages": list(_SUPPORTED_LANGUAGES),
         },
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         return Path(snapshot_download(
             repo_id=repo_id,
             allow_patterns=list(_ALLOW_PATTERNS),
             cache_dir=str(cache_root) if cache_root else None,
+            revision=revision,
         ))
 
     return ResolvedModel(

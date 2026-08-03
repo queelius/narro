@@ -24,6 +24,19 @@ def _reset_supervisor_state():
 
 
 @pytest.fixture(autouse=True)
+def _mock_resource_registry(monkeypatch):
+    """Keep supervisor unit tests off the host process registry."""
+    monkeypatch.setattr(
+        "muse.cli_impl.supervisor.register_process",
+        lambda **kwargs: f"test-resource-{kwargs['pid']}",
+    )
+    monkeypatch.setattr(
+        "muse.cli_impl.supervisor.unregister_process",
+        lambda resource_id: bool(resource_id),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_pynvml_sentinels():
     """Prevent supervisor tests from polluting memory_probe module-level
     pynvml sentinels via run_supervisor's lazy-load validate_catalog_at_boot
@@ -75,6 +88,38 @@ class TestSpawnWorker:
         assert kwargs["start_new_session"] is (os.name == "posix")
 
     @patch("muse.cli_impl.supervisor.subprocess.Popen")
+    def test_spawn_worker_assigns_a_fresh_readiness_nonce(
+        self, mock_popen, monkeypatch,
+    ):
+        from muse.cli_impl.supervisor import spawn_worker
+
+        monkeypatch.delenv("MUSE_WORKER_NONCE", raising=False)
+        processes = [MagicMock(pid=12345), MagicMock(pid=12346)]
+        mock_popen.side_effect = processes
+        specs = [
+            WorkerSpec(models=["model-a"], python_path="/a/python", port=9001),
+            WorkerSpec(models=["model-b"], python_path="/b/python", port=9002),
+        ]
+
+        with patch(
+            "muse.cli_impl.supervisor.secrets.token_urlsafe",
+            side_effect=["nonce-a", "nonce-b"],
+        ) as token_urlsafe, patch(
+            "muse.cli_impl.supervisor._validated_worker_process_group",
+            return_value=None,
+        ):
+            for spec in specs:
+                spawn_worker(spec, device="cpu")
+
+        assert token_urlsafe.call_args_list == [call(32), call(32)]
+        child_envs = [popen_call.kwargs["env"] for popen_call in mock_popen.call_args_list]
+        assert [env["MUSE_WORKER_NONCE"] for env in child_envs] == [
+            "nonce-a", "nonce-b",
+        ]
+        assert [spec.worker_nonce for spec in specs] == ["nonce-a", "nonce-b"]
+        assert "MUSE_WORKER_NONCE" not in os.environ
+
+    @patch("muse.cli_impl.supervisor.subprocess.Popen")
     def test_spawn_worker_passes_all_models_in_group(self, mock_popen):
         spec = WorkerSpec(
             models=["model-a", "model-b"],
@@ -97,6 +142,86 @@ class TestWaitForReady:
             mock_get.return_value = MagicMock(status_code=200)
             # Should return cleanly
             wait_for_ready(port=9001, timeout=5.0, poll_interval=0.01)
+
+    def test_accepts_only_the_matching_nonce_for_the_exact_generation(self):
+        from muse.cli_impl.supervisor import wait_for_ready
+
+        process = MagicMock(pid=12345, returncode=None)
+        process.poll.return_value = None
+        spec = WorkerSpec(
+            models=["x"], python_path="/p", port=9001,
+            process=process, worker_nonce="current-nonce",
+        )
+        response = MagicMock(
+            status_code=200,
+            headers={"X-Muse-Worker-Nonce": "current-nonce"},
+        )
+
+        with patch("muse.cli_impl.supervisor.httpx.get", return_value=response):
+            wait_for_ready(
+                port=9001,
+                timeout=5.0,
+                poll_interval=0,
+                expected_nonce=spec.worker_nonce,
+                worker=spec,
+            )
+
+    def test_rejects_a_healthy_response_with_a_mismatched_nonce(self):
+        from muse.cli_impl.supervisor import WorkerIdentityError, wait_for_ready
+
+        process = MagicMock(pid=12345, returncode=None)
+        process.poll.return_value = None
+        spec = WorkerSpec(
+            models=["x"], python_path="/p", port=9001,
+            process=process, worker_nonce="current-nonce",
+        )
+        response = MagicMock(
+            status_code=200,
+            headers={"X-Muse-Worker-Nonce": "stale-nonce"},
+        )
+
+        with patch("muse.cli_impl.supervisor.httpx.get", return_value=response):
+            with pytest.raises(WorkerIdentityError, match="nonce mismatch"):
+                wait_for_ready(
+                    port=9001,
+                    timeout=5.0,
+                    poll_interval=0,
+                    expected_nonce=spec.worker_nonce,
+                    worker=spec,
+                )
+
+    def test_rejects_a_generation_swap_during_the_health_request(self):
+        from muse.cli_impl.supervisor import WorkerIdentityError, wait_for_ready
+
+        original = MagicMock(pid=12345, returncode=None)
+        original.poll.return_value = None
+        replacement = MagicMock(pid=12346, returncode=None)
+        replacement.poll.return_value = None
+        spec = WorkerSpec(
+            models=["x"], python_path="/p", port=9001,
+            process=original, worker_nonce="current-nonce",
+        )
+        response = MagicMock(
+            status_code=200,
+            headers={"X-Muse-Worker-Nonce": "current-nonce"},
+        )
+
+        def swap_generation(*_args, **_kwargs):
+            spec.process = replacement
+            return response
+
+        with patch(
+            "muse.cli_impl.supervisor.httpx.get",
+            side_effect=swap_generation,
+        ):
+            with pytest.raises(WorkerIdentityError, match="changed process generation"):
+                wait_for_ready(
+                    port=9001,
+                    timeout=5.0,
+                    poll_interval=0,
+                    expected_nonce=spec.worker_nonce,
+                    worker=spec,
+                )
 
     def test_raises_timeouterror_when_worker_never_responds(self):
         from muse.cli_impl.supervisor import wait_for_ready
@@ -146,50 +271,182 @@ class TestShutdownWorkers:
         proc.wait.return_value = 0
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
         spec.process = proc
+        spec.process_group_id = 12345
 
         with patch("muse.cli_impl.supervisor.os.getpgid", return_value=12345), \
              patch("muse.cli_impl.supervisor.os.getpgrp", return_value=54321), \
+             patch(
+                 "muse.cli_impl.supervisor._supports_pinned_worker_leader",
+                 return_value=True,
+             ), \
+             patch(
+                 "muse.cli_impl.supervisor._worker_process_state_locked",
+                 side_effect=(True, False, False, False, False),
+             ), \
              patch("muse.cli_impl.supervisor.os.killpg") as mock_killpg:
-            _shutdown_workers([spec])
+            _shutdown_workers([spec], grace=0.0)
 
-        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+        assert [item.args for item in mock_killpg.call_args_list] == [
+            (12345, signal.SIGTERM),
+            (12345, signal.SIGKILL),
+        ]
+        proc.wait.assert_called_once_with(timeout=0.0)
         proc.terminate.assert_not_called()
-        proc.wait.assert_called_once_with(timeout=5.0)
 
     def test_mock_pid_cannot_broadcast_to_process_group_one(self):
         from muse.cli_impl.supervisor import _signal_worker_process
 
         proc = MagicMock()
-        # int(MagicMock()) == 1, matching the legacy restart-test shape that
-        # exposed this safety bug.
+        proc.poll.return_value = None
+        # A non-concrete mock PID cannot reach killpg.  Because the exact
+        # generation is proven alive, the Popen-scoped fallback is safe.
         with patch("muse.cli_impl.supervisor.os.killpg") as mock_killpg:
-            _signal_worker_process(proc, signal.SIGTERM)
+            assert _signal_worker_process(proc, signal.SIGTERM) is True
 
         mock_killpg.assert_not_called()
         proc.terminate.assert_called_once_with()
 
-    def test_kills_and_reaps_worker_that_ignores_sigterm(self):
-        from muse.cli_impl.supervisor import _shutdown_workers
-        import subprocess
+    def test_ambiguous_process_state_is_never_signalled(self):
+        from muse.cli_impl.supervisor import _signal_worker_process
 
         proc = MagicMock(pid=12345)
-        proc.poll.return_value = None
-        proc.wait.side_effect = [
-            subprocess.TimeoutExpired(cmd="worker", timeout=0.01),
-            0,
-        ]
+        proc.poll.side_effect = OSError("cannot inspect child")
+
+        with patch("muse.cli_impl.supervisor.os.killpg") as mock_killpg:
+            assert _signal_worker_process(proc, signal.SIGTERM) is False
+
+        mock_killpg.assert_not_called()
+        proc.terminate.assert_not_called()
+        proc.kill.assert_not_called()
+
+    def test_concurrent_reap_finishes_before_shutdown_without_stale_signal(self):
+        """The shared identity lock closes the poll/reap -> PGID reuse race."""
+        from muse.cli_impl.supervisor import _shutdown_workers
+        import threading
+
+        proc = MagicMock(pid=12345)
+        proc.poll.return_value = 0
+        proc.wait.return_value = 0
+        spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
+        spec.process = proc
+        poll_locked = threading.Event()
+        release_poll = threading.Event()
+
+        def reap_first():
+            with spec.process_lock:
+                poll_locked.set()
+                assert release_poll.wait(timeout=1.0)
+                assert proc.poll() == 0
+
+        reaper = threading.Thread(target=reap_first)
+        reaper.start()
+        assert poll_locked.wait(timeout=1.0)
+
+        shutdown = threading.Thread(target=_shutdown_workers, args=([spec],))
+        with patch("muse.cli_impl.supervisor.os.killpg") as mock_killpg:
+            shutdown.start()
+            release_poll.set()
+            reaper.join(timeout=1.0)
+            shutdown.join(timeout=1.0)
+
+        assert not reaper.is_alive()
+        assert not shutdown.is_alive()
+        mock_killpg.assert_not_called()
+        proc.terminate.assert_not_called()
+        proc.kill.assert_not_called()
+        assert spec.process is None
+
+    def test_kills_and_reaps_worker_that_ignores_sigterm(self):
+        from muse.cli_impl.supervisor import _shutdown_workers
+
+        proc = MagicMock(pid=12345)
+        proc.wait.return_value = 0
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001)
         spec.process = proc
 
-        with patch("muse.cli_impl.supervisor._signal_worker_process") as mock_signal:
-            _shutdown_workers([spec], grace=0.01)
+        with patch(
+            "muse.cli_impl.supervisor._worker_process_state_locked",
+            side_effect=(True, True, True, False, False),
+        ):
+            _shutdown_workers([spec], grace=0.0)
 
-        assert [call.args[1] for call in mock_signal.call_args_list] == [
-            signal.SIGTERM,
-            getattr(signal, "SIGKILL", signal.SIGTERM),
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+        proc.wait.assert_called_once_with(timeout=0.0)
+        assert spec.process is None
+
+    def test_bulk_shutdown_uses_shared_term_and_kill_deadlines(self):
+        from muse.cli_impl.supervisor import _shutdown_workers
+
+        clock = {"now": 0.0}
+
+        processes = [MagicMock(pid=1001), MagicMock(pid=1002)]
+        specs = [
+            WorkerSpec(models=["a"], python_path="/a", port=9001),
+            WorkerSpec(models=["b"], python_path="/b", port=9002),
         ]
-        assert mock_signal.call_args_list[1].kwargs == {"force": True}
-        assert proc.wait.call_count == 2
+        for spec, proc in zip(specs, processes):
+            proc.poll.return_value = None
+            spec.process = proc
+
+        with patch(
+            "muse.cli_impl.supervisor.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch(
+            "muse.cli_impl.supervisor.time.sleep",
+            side_effect=lambda seconds: clock.__setitem__(
+                "now", clock["now"] + seconds,
+            ),
+        ):
+            result = _shutdown_workers(specs, grace=0.05)
+
+        # TERM (0.05s) and final-KILL (minimum 1.0s) are each one shared
+        # deadline for the batch, not multiplied by two targets.
+        assert 1.04 <= clock["now"] <= 1.06
+        for proc in processes:
+            proc.terminate.assert_called_once_with()
+            proc.kill.assert_called_once_with()
+        assert result.retained == tuple(specs)
+
+    def test_bulk_shutdown_shares_one_log_reader_join_deadline(self):
+        from muse.cli_impl.supervisor import _shutdown_workers
+
+        clock = {"now": 0.0}
+        join_timeouts: list[list[float]] = [[], []]
+        processes = [MagicMock(pid=1001), MagicMock(pid=1002)]
+        specs = [
+            WorkerSpec(models=["a"], python_path="/a", port=9001),
+            WorkerSpec(models=["b"], python_path="/b", port=9002),
+        ]
+        for index, (spec, proc) in enumerate(zip(specs, processes)):
+            proc.wait.return_value = 0
+            thread = MagicMock()
+            thread.is_alive.return_value = True
+
+            def join(*, timeout, worker=index):
+                join_timeouts[worker].append(timeout)
+                clock["now"] += timeout
+
+            thread.join.side_effect = join
+            spec.process = proc
+            spec.log_thread = thread
+
+        with patch(
+            "muse.cli_impl.supervisor.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch(
+            "muse.cli_impl.supervisor._signal_worker_process",
+            return_value=True,
+        ), patch(
+            "muse.cli_impl.supervisor._BACKGROUND_JOIN_TIMEOUT_SECONDS",
+            3.0,
+        ):
+            result = _shutdown_workers(specs)
+
+        assert join_timeouts == [[3.0], [0.0]]
+        assert result.retained == tuple(specs)
+        for proc in processes:
+            proc.stdout.close.assert_not_called()
 
 
 class TestRunSupervisor:
@@ -284,7 +541,9 @@ class TestAttemptRestart:
         spec = WorkerSpec(
             models=["x"], python_path="/p", port=9001, device="cpu",
         )
-        spec.process = MagicMock(poll=MagicMock(return_value=1))  # already exited
+        spec.process = MagicMock(
+            pid=12345, poll=MagicMock(return_value=1),
+        )  # already exited
         stop_event = threading.Event()
 
         with patch("muse.cli_impl.supervisor.spawn_worker") as mock_spawn, \
@@ -298,6 +557,28 @@ class TestAttemptRestart:
         # restart that succeeds must not bump it.
         assert spec.restart_count == 0
         assert spec.failure_count == 0
+        assert spec.status == "running"
+
+    def test_successful_recovery_resets_prior_restart_failures(self):
+        from muse.cli_impl.supervisor import _attempt_restart
+        import threading
+
+        spec = WorkerSpec(
+            models=["x"], python_path="/p", port=9001, device="cpu",
+            restart_count=4,
+        )
+        spec.process = MagicMock(pid=12345, poll=MagicMock(return_value=1))
+
+        with patch("muse.cli_impl.supervisor.spawn_worker"), \
+             patch("muse.cli_impl.supervisor.wait_for_ready"):
+            _attempt_restart(
+                spec,
+                stop_event=threading.Event(),
+                max_restarts=10,
+                backoff_base=0,
+            )
+
+        assert spec.restart_count == 0
         assert spec.status == "running"
 
     def test_many_successful_restarts_do_not_exhaust_budget(self):
@@ -314,7 +595,9 @@ class TestAttemptRestart:
         with patch("muse.cli_impl.supervisor.spawn_worker"), \
              patch("muse.cli_impl.supervisor.wait_for_ready"):
             for _ in range(15):  # more than _MAX_RESTARTS=10, all successful
-                spec.process = MagicMock(poll=MagicMock(return_value=1))
+                spec.process = MagicMock(
+                    pid=12345, poll=MagicMock(return_value=1),
+                )
                 _attempt_restart(
                     spec, stop_event=stop_event, max_restarts=10, backoff_base=0,
                 )
@@ -328,7 +611,10 @@ class TestAttemptRestart:
         import threading
 
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cpu")
-        old_process = MagicMock(poll=MagicMock(return_value=None))  # still alive
+        old_process = MagicMock(
+            pid=12345,
+            poll=MagicMock(side_effect=(None, 0)),
+        )  # exits after TERM
         spec.process = old_process
         stop_event = threading.Event()
 
@@ -346,7 +632,7 @@ class TestAttemptRestart:
             models=["x"], python_path="/p", port=9001, device="cpu",
             restart_count=10,  # already at budget
         )
-        spec.process = MagicMock(poll=MagicMock(return_value=1))
+        spec.process = MagicMock(pid=12345, poll=MagicMock(return_value=1))
         stop_event = threading.Event()
 
         with patch("muse.cli_impl.supervisor.spawn_worker") as mock_spawn:
@@ -360,7 +646,7 @@ class TestAttemptRestart:
         import threading
 
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cpu")
-        spec.process = MagicMock(poll=MagicMock(return_value=1))
+        spec.process = MagicMock(pid=12345, poll=MagicMock(return_value=1))
         stop_event = threading.Event()
 
         with patch("muse.cli_impl.supervisor.spawn_worker"), \
@@ -376,23 +662,44 @@ class TestAttemptRestart:
         import threading
 
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cpu")
-        spec.process = MagicMock(poll=MagicMock(return_value=1))
+        old_process = MagicMock(poll=MagicMock(return_value=1))
+        new_process = MagicMock(poll=MagicMock(return_value=None))
+        spec.process = old_process
         stop_event = threading.Event()
 
-        with patch("muse.cli_impl.supervisor.spawn_worker"), \
+        stopped_processes = []
+
+        def shutdown_exact(_specs, **_kwargs):
+            stopped_processes.append(spec.process)
+            spec.process = None
+
+        def spawn_replacement(_spec, **_kwargs):
+            assert spec.process is None
+            spec.process = new_process
+            spec.worker_nonce = "replacement-nonce"
+
+        with patch(
+            "muse.cli_impl.supervisor.spawn_worker",
+            side_effect=spawn_replacement,
+        ), \
              patch(
                  "muse.cli_impl.supervisor.wait_for_ready",
                  side_effect=TimeoutError("never ready"),
              ) as mock_wait, \
-             patch("muse.cli_impl.supervisor._shutdown_workers") as mock_shutdown:
+             patch(
+                 "muse.cli_impl.supervisor._shutdown_workers",
+                 side_effect=shutdown_exact,
+             ):
             _attempt_restart(
                 spec, stop_event=stop_event, max_restarts=10, backoff_base=0,
             )
 
         mock_wait.assert_called_once_with(
             port=9001, timeout=60.0, stop_event=stop_event,
+            expected_nonce="replacement-nonce", worker=spec,
         )
-        mock_shutdown.assert_called_once_with([spec])
+        assert stopped_processes == [old_process, new_process]
+        assert spec.process is None
 
     def test_oserror_from_spawn_does_not_propagate(self):
         """M10: a broken/missing venv python makes subprocess.Popen raise
@@ -404,7 +711,7 @@ class TestAttemptRestart:
 
         spec = WorkerSpec(models=["x"], python_path="/gone/python", port=9001,
                           device="cpu")
-        spec.process = MagicMock(poll=MagicMock(return_value=1))
+        spec.process = MagicMock(pid=12345, poll=MagicMock(return_value=1))
         stop_event = threading.Event()
 
         with patch("muse.cli_impl.supervisor.spawn_worker") as mock_spawn:
@@ -441,7 +748,9 @@ class TestMonitorLoop:
         import threading
 
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cpu")
-        spec.process = MagicMock(poll=MagicMock(return_value=None))  # alive
+        spec.process = MagicMock(
+            pid=12345, poll=MagicMock(return_value=None),
+        )  # alive
         stop_event = threading.Event()
 
         # First 3 checks fail, then we stop
@@ -467,8 +776,9 @@ class TestMonitorLoop:
         import threading
 
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cpu")
-        spec.process = MagicMock(poll=MagicMock(return_value=None))
+        spec.process = MagicMock(pid=12345, poll=MagicMock(return_value=None))
         spec.failure_count = 2  # close to threshold
+        spec.restart_count = 4
         stop_event = threading.Event()
 
         call_count = {"n": 0}
@@ -486,6 +796,7 @@ class TestMonitorLoop:
             )
 
         assert spec.failure_count == 0
+        assert spec.restart_count == 0
         assert spec.status == "running"
         mock_restart.assert_not_called()
 
@@ -494,7 +805,7 @@ class TestMonitorLoop:
         import threading
 
         spec = WorkerSpec(models=["x"], python_path="/p", port=9001, device="cpu")
-        spec.process = MagicMock(poll=MagicMock(return_value=None))
+        spec.process = MagicMock(pid=12345, poll=MagicMock(return_value=None))
         stop_event = threading.Event()
         stop_event.set()  # already stopped
 
@@ -512,7 +823,9 @@ class TestMonitorLoop:
         import threading
 
         alive_spec = WorkerSpec(models=["a"], python_path="/p", port=9001, device="cpu")
-        alive_spec.process = MagicMock(poll=MagicMock(return_value=None))
+        alive_spec.process = MagicMock(
+            pid=12345, poll=MagicMock(return_value=None),
+        )
         dead_spec = WorkerSpec(models=["b"], python_path="/p", port=9002, device="cpu")
         dead_spec.status = "dead"
 

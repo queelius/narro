@@ -16,7 +16,12 @@ from typing import Any, Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, ResolverError, SearchResult
+from muse.core.resolvers import (
+    ResolvedModel,
+    ResolverError,
+    SearchResult,
+    hf_commit_revision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +215,7 @@ def _resolve_lora(
             # Adapter + runtime overhead margin on top of base weights.
             capabilities["memory_gb"] = round(est + 0.3, 1)
 
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "image/generation",
@@ -220,6 +226,8 @@ def _resolve_lora(
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         # Adapter repos are flat: weights + configs at the top level,
@@ -228,6 +236,7 @@ def _resolve_lora(
             repo_id=repo_id,
             cache_dir=str(cache_root) if cache_root else None,
             allow_patterns=["*.safetensors", "*.json", "*.txt"],
+            revision=revision,
         ))
 
     return ResolvedModel(
@@ -269,6 +278,7 @@ def _resolve(
     *,
     base_override: str | None = None,
 ) -> ResolvedModel:
+    revision = hf_commit_revision(info)
     siblings = [s.rfilename for s in getattr(info, "siblings", [])]
     tags = getattr(info, "tags", None) or []
     has_pipeline_config = any(
@@ -302,6 +312,8 @@ def _resolve(
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     # SDXL-Turbo and similar repos ship fp32 + fp16 + standalone single-file
     # checkpoints simultaneously (~47GB total). The diffusers runtime only
@@ -333,6 +345,7 @@ def _resolve(
             repo_id=repo_id,
             cache_dir=str(cache_root) if cache_root else None,
             allow_patterns=allow_patterns,
+            revision=revision,
         ))
 
     return ResolvedModel(

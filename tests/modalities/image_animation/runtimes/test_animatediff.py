@@ -24,7 +24,7 @@ def _patched_pipe():
     return fake_pipe
 
 
-def test_construction_loads_pipeline_and_adapter():
+def test_construction_loads_pipeline_and_adapter_from_bundle(tmp_path):
     fake_pipe_class = MagicMock()
     fake_pipe_class.from_pretrained.return_value = _patched_pipe()
     fake_adapter_class = MagicMock()
@@ -40,16 +40,79 @@ def test_construction_loads_pipeline_and_adapter():
         "muse.modalities.image_animation.runtimes.animatediff.torch",
         MagicMock(),
     ):
+        adapter_dir = tmp_path / "motion_adapter"
+        base_dir = tmp_path / "base_model"
+        adapter_dir.mkdir()
+        base_dir.mkdir()
         m = AnimateDiffRuntime(
             hf_repo="guoyww/animatediff-motion-adapter-v1-5-3",
-            local_dir="/fake/adapter",
+            local_dir=str(tmp_path),
             device="cpu",
             model_id="adv3",
             base_model="emilianJR/epiCRealism",
+            adapter_model_subdir="motion_adapter",
+            base_model_subdir="base_model",
         )
     fake_adapter_class.from_pretrained.assert_called_once()
     fake_pipe_class.from_pretrained.assert_called_once()
+    assert fake_adapter_class.from_pretrained.call_args.args[0] == str(adapter_dir)
+    assert fake_pipe_class.from_pretrained.call_args.args[0] == str(base_dir)
     assert m.model_id == "adv3"
+
+
+def test_device_move_keeps_the_created_pipeline():
+    fake_pipe = _patched_pipe()
+    fake_pipe.to.return_value = MagicMock(name="unrelated-fluent-result")
+    fake_pipe_class = MagicMock()
+    fake_pipe_class.from_pretrained.return_value = fake_pipe
+    fake_adapter_class = MagicMock()
+    fake_adapter_class.from_pretrained.return_value = MagicMock()
+
+    with patch(
+        "muse.modalities.image_animation.runtimes.animatediff.AnimateDiffPipeline",
+        fake_pipe_class,
+    ), patch(
+        "muse.modalities.image_animation.runtimes.animatediff.MotionAdapter",
+        fake_adapter_class,
+    ), patch(
+        "muse.modalities.image_animation.runtimes.animatediff.torch",
+        MagicMock(),
+    ):
+        runtime = AnimateDiffRuntime(
+            hf_repo="org/adapter",
+            local_dir=None,
+            device="cuda",
+            model_id="m",
+            base_model="org/base",
+        )
+
+    assert runtime._pipe is fake_pipe
+    fake_pipe.to.assert_called_once_with("cuda")
+
+
+def test_legacy_local_entry_refuses_hidden_base_download():
+    fake_pipe_class = MagicMock()
+    fake_adapter_class = MagicMock()
+    with patch(
+        "muse.modalities.image_animation.runtimes.animatediff.AnimateDiffPipeline",
+        fake_pipe_class,
+    ), patch(
+        "muse.modalities.image_animation.runtimes.animatediff.MotionAdapter",
+        fake_adapter_class,
+    ), patch(
+        "muse.modalities.image_animation.runtimes.animatediff.torch",
+        MagicMock(),
+    ):
+        with pytest.raises(RuntimeError, match="re-pull"):
+            AnimateDiffRuntime(
+                hf_repo="org/adapter",
+                local_dir="/legacy",
+                device="cpu",
+                model_id="m",
+                base_model="org/base",
+            )
+    fake_adapter_class.from_pretrained.assert_not_called()
+    fake_pipe_class.from_pretrained.assert_not_called()
 
 
 def test_generate_returns_animation_result():
@@ -71,7 +134,7 @@ def test_generate_returns_animation_result():
     ):
         m = AnimateDiffRuntime(
             hf_repo="guoyww/animatediff-motion-adapter-v1-5-3",
-            local_dir="/fake/adapter",
+            local_dir=None,
             device="cpu",
             model_id="adv3",
             base_model="emilianJR/epiCRealism",
@@ -103,7 +166,7 @@ def test_generate_request_overrides_defaults():
         MagicMock(),
     ):
         m = AnimateDiffRuntime(
-            hf_repo="x", local_dir="/fake", device="cpu",
+            hf_repo="x", local_dir=None, device="cpu",
             model_id="m", base_model="b",
             default_frames=16, default_fps=8, default_steps=25, default_guidance=7.5,
         )
@@ -132,7 +195,7 @@ def test_generate_passes_negative_prompt_when_set():
         MagicMock(),
     ):
         m = AnimateDiffRuntime(
-            hf_repo="x", local_dir="/fake", device="cpu",
+            hf_repo="x", local_dir=None, device="cpu",
             model_id="m", base_model="b",
         )
         m.generate("a fox", negative_prompt="blurry, ugly")
@@ -157,7 +220,7 @@ def test_generate_omits_negative_prompt_when_none():
         MagicMock(),
     ):
         m = AnimateDiffRuntime(
-            hf_repo="x", local_dir="/fake", device="cpu",
+            hf_repo="x", local_dir=None, device="cpu",
             model_id="m", base_model="b",
         )
         m.generate("a fox")
@@ -182,7 +245,7 @@ def test_construction_absorbs_unknown_kwargs():
         MagicMock(),
     ):
         AnimateDiffRuntime(
-            hf_repo="x", local_dir="/fake", device="cpu", model_id="m",
+            hf_repo="x", local_dir=None, device="cpu", model_id="m",
             base_model="b",
             future_unrecognized_flag="whatever",
             supports_text_to_animation=True,

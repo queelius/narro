@@ -35,8 +35,8 @@ same model. If no other candidate exists, or the retry also fails, the
 coordinator returns 502 `no_node_available`. A `httpx.ReadTimeout` (the
 node accepted the request and is processing or stuck) is deliberately
 NOT a failover trigger: retrying would re-execute a full, possibly
-non-idempotent generation on a second node. A ReadTimeout propagates
-straight to the client instead.
+non-idempotent generation on a second node. A ReadTimeout is mapped to a
+504 response without retrying.
 
 `run_coordinator` is this module's other export: it resolves the node
 list (CLI `--node` entries merged with an optional `federation.yaml`),
@@ -81,7 +81,7 @@ _forward = _forward
 # non-idempotent) generation on a second node. Only connect-phase
 # failures (the node is unreachable/down) trigger failover; a request
 # the node has already accepted is never retried elsewhere and any
-# ReadTimeout propagates straight to the client.
+# ReadTimeout maps to 504 without failover.
 _FAILOVER_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
 
 
@@ -252,6 +252,34 @@ def build_coordinator(
                     f"failed for model {model_id!r}",
                     error_type="server_error",
                 )
+            except httpx.TimeoutException:
+                return _openai_error(
+                    504, "node_timeout",
+                    f"node {fallback.spec.url!r} timed out while serving "
+                    f"model {model_id!r}",
+                    error_type="server_error",
+                )
+            except httpx.TransportError:
+                return _openai_error(
+                    502, "node_forward_failed",
+                    f"node {fallback.spec.url!r} failed while serving "
+                    f"model {model_id!r}",
+                    error_type="server_error",
+                )
+        except httpx.TimeoutException:
+            return _openai_error(
+                504, "node_timeout",
+                f"node {node.spec.url!r} timed out while serving "
+                f"model {model_id!r}",
+                error_type="server_error",
+            )
+        except httpx.TransportError:
+            return _openai_error(
+                502, "node_forward_failed",
+                f"node {node.spec.url!r} failed while serving "
+                f"model {model_id!r}",
+                error_type="server_error",
+            )
 
     return app
 

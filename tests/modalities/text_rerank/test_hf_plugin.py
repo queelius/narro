@@ -5,13 +5,52 @@ from unittest.mock import MagicMock
 from muse.modalities.text_rerank.hf import HF_PLUGIN
 
 
-def _fake_info(repo_id, tags=(), siblings=(), card=None):
+_FAKE_REVISION = "1" * 40
+
+
+def _fake_info(repo_id, tags=(), siblings=(), card=None, sha=_FAKE_REVISION):
     return SimpleNamespace(
         id=repo_id,
         tags=list(tags),
         siblings=[SimpleNamespace(rfilename=s) for s in siblings],
         card_data=card,
+        sha=sha,
     )
+
+
+def test_download_uses_resolved_commit_and_includes_dynamic_modules(
+    tmp_path, monkeypatch,
+):
+    import muse.modalities.text_rerank.hf as plugin_module
+
+    calls = {}
+    monkeypatch.setattr(
+        plugin_module,
+        "snapshot_download",
+        lambda **kwargs: calls.update(kwargs) or str(tmp_path / "snapshot"),
+    )
+    result = HF_PLUGIN["resolve"](
+        "jinaai/jina-reranker-v2-base-multilingual",
+        None,
+        _fake_info(
+            "jinaai/jina-reranker-v2-base-multilingual",
+            tags=["cross-encoder"],
+        ),
+    )
+    result.download(tmp_path)
+
+    assert result.manifest["revision"] == _FAKE_REVISION
+    assert calls["revision"] == _FAKE_REVISION
+    assert "*.py" in calls["allow_patterns"]
+
+
+def test_nonhex_hub_sha_is_not_persisted_as_revision():
+    result = HF_PLUGIN["resolve"](
+        "org/reranker",
+        None,
+        _fake_info("org/reranker", tags=["cross-encoder"], sha="z" * 40),
+    )
+    assert "revision" not in result.manifest
 
 
 def test_plugin_keys_present():

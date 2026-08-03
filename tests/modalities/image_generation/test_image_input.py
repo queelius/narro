@@ -135,6 +135,20 @@ async def test_decode_rejects_corrupt_image_bytes():
         await decode_image_input(data_url)
 
 
+@pytest.mark.asyncio
+async def test_decode_rejects_pixel_bomb_before_raster_load(monkeypatch):
+    from PIL import Image
+
+    raw = _png_bytes(width=32, height=32)
+    data_url = f"data:image/png;base64,{base64.b64encode(raw).decode()}"
+    load = MagicMock(side_effect=AssertionError("raster load should not run"))
+    monkeypatch.setattr(Image.Image, "load", load)
+
+    with pytest.raises(ValueError, match="exceeds max input pixels"):
+        await decode_image_input(data_url, max_pixels=100)
+    load.assert_not_called()
+
+
 def test_bytes_to_pil_rejects_decompression_bomb(monkeypatch):
     """A decompression bomb must surface as ValueError (-> 400), not the raw
     Image.DecompressionBombError (which would escape to a 500). PIL still
@@ -245,6 +259,46 @@ async def test_decode_image_file_reads_png_from_upload():
     upload = _FakeUploadFile(raw)
     img = await decode_image_file(upload)
     assert img.size == (48, 24)
+
+
+@pytest.mark.asyncio
+async def test_decode_image_file_closes_upload_after_bounded_read():
+    from muse.modalities.image_generation.image_input import decode_image_file
+
+    upload = _FakeUploadFile(_png_bytes(width=2, height=3))
+    upload.close = AsyncMock()
+    image = await decode_image_file(upload)
+
+    upload.close.assert_awaited_once()
+    image.close()
+
+
+@pytest.mark.asyncio
+async def test_decode_image_file_closes_upload_when_read_fails():
+    from muse.modalities.image_generation.image_input import decode_image_file
+
+    upload = _FakeUploadFile(b"")
+    upload.read = AsyncMock(side_effect=RuntimeError("disk read failed"))
+    upload.close = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="disk read failed"):
+        await decode_image_file(upload)
+    upload.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_decode_image_file_rejects_nonpositive_cap_before_read():
+    from muse.modalities.image_generation.image_input import decode_image_file
+
+    upload = MagicMock()
+    upload.read = AsyncMock()
+    upload.close = AsyncMock()
+
+    with pytest.raises(ValueError, match="max_bytes must be a positive integer"):
+        await decode_image_file(upload, max_bytes=0)
+
+    upload.read.assert_not_awaited()
+    upload.close.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -367,6 +421,56 @@ def test_default_max_bytes_helper_reads_env(monkeypatch):
     from muse.modalities.image_generation.image_input import _default_max_bytes
     monkeypatch.setenv("MUSE_IMAGE_INPUT_MAX_BYTES", "20971520")  # 20MB
     assert _default_max_bytes() == 20 * 1024 * 1024
+
+
+def test_default_max_pixels_helper_reads_env(monkeypatch):
+    from muse.core import config as cfg
+    from muse.modalities.image_generation.image_input import _default_max_pixels
+
+    monkeypatch.setenv("MUSE_IMAGE_INPUT_MAX_PIXELS", "123456")
+    cfg.reset_config()
+    try:
+        assert _default_max_pixels() == 123456
+    finally:
+        cfg.reset_config()
+
+
+def test_validate_total_image_pixels_rejects_aggregate_and_closes_cleanly():
+    from muse.modalities.image_generation.image_input import (
+        close_decoded_images,
+        validate_total_image_pixels,
+    )
+
+    first = MagicMock()
+    first.size = (8, 8)
+    second = MagicMock()
+    second.size = (8, 8)
+    with pytest.raises(ValueError, match="aggregate limit 100"):
+        validate_total_image_pixels(
+            [first, second], max_total_pixels=100,
+        )
+    close_decoded_images([first, second])
+    first.close.assert_called_once_with()
+    second.close.assert_called_once_with()
+
+
+def test_close_decoded_images_deduplicates_aliased_images():
+    from muse.modalities.image_generation.image_input import close_decoded_images
+
+    image = MagicMock()
+    close_decoded_images([image, image])
+    image.close.assert_called_once_with()
+
+
+def test_bytes_to_pil_closes_image_rejected_by_side_limit():
+    from muse.modalities.image_generation.image_input import _bytes_to_pil
+
+    opened = MagicMock()
+    opened.size = (64, 32)
+    with patch("PIL.Image.open", return_value=opened):
+        with pytest.raises(ValueError, match="exceeds max input side"):
+            _bytes_to_pil(b"not-read", max_side=32)
+    opened.close.assert_called_once_with()
 
 
 # ---------------- config-hierarchy migration (limits.image_input_max_bytes) ----------------

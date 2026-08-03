@@ -57,7 +57,7 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _RUNTIME_PATH = (
@@ -146,6 +146,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
     if pair is not None:
         capabilities["source_language"], capabilities["target_language"] = pair
 
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "text/translation",
@@ -156,6 +157,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         # Keep weights light: prefer safetensors, drop tf/flax/onnx.
@@ -182,6 +185,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             repo_id=repo_id,
             allow_patterns=allow_patterns,
             cache_dir=str(cache_root) if cache_root else None,
+            revision=revision,
         ))
 
     return ResolvedModel(

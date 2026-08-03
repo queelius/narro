@@ -11,7 +11,8 @@ Behavior:
   - For each: invoke <venv>/bin/pip install --upgrade <muse-target>[server,<modality-extras>],
     where <muse-target> is `-e <source-tree>` from a checkout or the
     published `museq` distribution from a wheel/PyPI install.
-  - Then (unless --no-extras): pip install --upgrade <model's pip_extras...>.
+  - Then (unless --no-extras): refresh the model's pip extras and immutable
+    non-packaged Python sources.
   - Continue past failures; aggregate at the end.
 
 The supervisor is NOT restarted. To pick up a refreshed venv, the
@@ -21,17 +22,30 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from muse.core.catalog import (
-    _PYPI_DIST,
+    ModelInUseError,
+    _catalog_dir,
+    _ensure_owned_directory,
+    _installed_muse_requirement,
     _is_muse_pyproject,
+    _model_pull_lock,
+    _model_resource_lease,
     _read_catalog,
+    _validate_model_id_for_fs,
     get_manifest,
     is_enabled,
+)
+from muse.core.venv import (
+    install_python_sources,
+    run_owned_command,
+    venv_python,
+    venv_transaction,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,9 +102,8 @@ def _infer_extras(modality: str) -> list[str]:
     return list(MODALITY_EXTRAS.get(modality, []))
 
 
-# `_PYPI_DIST` (published wheel name) and `_is_muse_pyproject` (source-tree
-# sniff) are shared with core.catalog, which applies the same wheel-vs-source
-# fork to `muse pull`'s venv creation. Imported rather than duplicated.
+# The source-tree sniff and exact installed-distribution requirement are shared
+# with core.catalog, which applies the same fork to `muse pull` venv creation.
 
 
 def _muse_repo_root() -> Path | None:
@@ -115,28 +128,57 @@ def _pip_target(extras: list[str]) -> str:
     """Build the museq install spec: <target>[server,extra1,extra2,...].
 
     `<target>` is the local source tree (editable refresh) when muse runs
-    from a checkout, else the published `museq` distribution so pip
-    upgrades from PyPI. `server` is always present; modality extras
-    append. Bracket-comma syntax matches PEP 508 extras.
+    from a checkout, else the exact invoking `museq` distribution version.
+    `server` is always present; modality extras append. Bracket-comma syntax
+    matches PEP 508 extras.
     """
-    spec = ",".join(["server", *extras])
     root = _muse_repo_root()
-    base = str(root) if root is not None else _PYPI_DIST
-    return f"{base}[{spec}]"
+    if root is not None:
+        spec = ",".join(["server", *extras])
+        return f"{root}[{spec}]"
+    return _installed_muse_requirement(["server", *extras])
 
 
 def _pip_target_args(extras: list[str]) -> list[str]:
     """pip target args for refreshing muse inside a per-model venv.
 
-    From a source checkout: ``-e <root>[extras]`` (editable, tracks the
-    working tree). From a wheel/PyPI install: ``museq[extras]`` (no -e;
-    pip resolves museq from PyPI). Returning args rather than a bare
-    string lets the caller splat them without re-deciding editability.
+    Source-tree detection is performed once so a concurrent filesystem change
+    cannot pair an editable flag with a distribution target (or vice versa).
     """
-    target = _pip_target(extras)
-    if _muse_repo_root() is not None:
-        return ["-e", target]
-    return [target]
+    root = _muse_repo_root()
+    if root is not None:
+        spec = ",".join(["server", *extras])
+        return ["-e", f"{root}[{spec}]"]
+    return [_installed_muse_requirement(["server", *extras])]
+
+
+def _validated_refresh_venv(model_id: str, entry: dict) -> tuple[Path, Path]:
+    """Require the catalog entry to name this model's canonical owned venv."""
+    _validate_model_id_for_fs(model_id)
+    venvs_root = _catalog_dir() / "venvs"
+    _ensure_owned_directory(venvs_root, private=True)
+    expected_venv = Path(os.path.abspath(venvs_root / model_id))
+    expected_python = Path(os.path.abspath(venv_python(expected_venv)))
+
+    raw_venv = entry.get("venv_path")
+    if raw_venv is not None:
+        catalog_venv = Path(os.path.abspath(os.fspath(raw_venv)))
+        if catalog_venv != expected_venv:
+            raise RuntimeError(
+                f"catalog venv_path for {model_id!r} is outside its owned path: "
+                f"expected {expected_venv}, got {raw_venv}"
+            )
+
+    raw_python = entry.get("python_path")
+    if not raw_python:
+        raise RuntimeError(f"catalog entry for {model_id!r} is missing python_path")
+    catalog_python = Path(os.path.abspath(os.fspath(raw_python)))
+    if catalog_python != expected_python:
+        raise RuntimeError(
+            f"catalog python_path for {model_id!r} is not its owned interpreter: "
+            f"expected {expected_python}, got {raw_python}"
+        )
+    return expected_venv, expected_python
 
 
 def refresh_one(
@@ -144,13 +186,32 @@ def refresh_one(
     *,
     no_extras: bool = False,
 ) -> RefreshResult:
+    """Refresh one model while excluding pull/remove/parallel refresh."""
+    with _model_pull_lock(model_id):
+        try:
+            with _model_resource_lease(model_id):
+                return _refresh_one_locked(model_id, no_extras=no_extras)
+        except ModelInUseError as exc:
+            return RefreshResult(model_id, "failed", str(exc))
+
+
+def _refresh_one_locked(
+    model_id: str,
+    *,
+    no_extras: bool = False,
+) -> RefreshResult:
     """Refresh a single model's venv.
 
-    Two pip invocations:
+    The caller holds the model's cross-thread/process pull lock for this
+    complete catalog-read and venv-mutation transaction.
+
+    Two pip invocations plus an optional reviewed-source refresh:
       1. install --upgrade <muse-target>[server,<modality-extras>]
          (editable `-e <tree>` from a checkout, else `museq` from PyPI)
       2. install --upgrade <model's pip_extras...>  (skipped if --no-extras
          or pip_extras is empty)
+      3. synchronize manifest `python_sources` into the same venv, including
+         revoking removed hooks when empty (skipped only with --no-extras)
 
     On any non-zero pip exit, returns RefreshResult(state='failed') with
     captured stdout+stderr and skips step 2. Catalog entries that point
@@ -160,8 +221,12 @@ def refresh_one(
     entry = catalog.get(model_id)
     if not entry:
         return RefreshResult(model_id, "skipped", "not in catalog")
-    python_path = entry.get("python_path")
-    if not python_path or not Path(python_path).exists():
+    try:
+        venv_path, validated_python = _validated_refresh_venv(model_id, entry)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return RefreshResult(model_id, "failed", f"unsafe catalog venv: {exc}")
+    python_path = str(validated_python)
+    if not validated_python.exists():
         return RefreshResult(
             model_id,
             "skipped",
@@ -174,14 +239,54 @@ def refresh_one(
         manifest = {}
     modality = manifest.get("modality") or entry.get("modality") or ""
     pip_extras_list = list(manifest.get("pip_extras") or ())
+    python_sources = list(manifest.get("python_sources") or ())
     muse_extras = _infer_extras(modality)
-    target_args = _pip_target_args(muse_extras)
+    try:
+        target_args = _pip_target_args(muse_extras)
+    except RuntimeError as exc:
+        return RefreshResult(model_id, "failed", str(exc), extras=muse_extras)
+    try:
+        with venv_transaction(venv_path) as tx:
+            result = _refresh_staged_venv(
+                model_id,
+                python_path=str(venv_python(tx.path)),
+                venv_path=tx.path,
+                target_args=target_args,
+                pip_extras_list=pip_extras_list,
+                python_sources=python_sources,
+                muse_extras=muse_extras,
+                no_extras=no_extras,
+            )
+            if result.state == "ok":
+                tx.commit()
+            return result
+    except (OSError, RuntimeError, ValueError) as exc:
+        return RefreshResult(
+            model_id,
+            "failed",
+            f"transactional venv refresh failed: {exc}",
+            extras=muse_extras,
+        )
+
+
+def _refresh_staged_venv(
+    model_id: str,
+    *,
+    python_path: str,
+    venv_path: Path,
+    target_args: list[str],
+    pip_extras_list: list[str],
+    python_sources: list[object],
+    muse_extras: list[str],
+    no_extras: bool,
+) -> RefreshResult:
+    """Apply one refresh to the transaction's private working copy."""
 
     cmd = [python_path, "-m", "pip", "install", "--upgrade", *target_args]
     logger.info("refresh %s: %s", model_id, " ".join(cmd))
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_PIP_TIMEOUT,
+        proc = run_owned_command(
+            cmd, capture_output=True, timeout=_PIP_TIMEOUT, check=False,
         )
     except subprocess.TimeoutExpired:
         return RefreshResult(
@@ -190,12 +295,19 @@ def refresh_one(
             f"museq[server] install timed out after {_PIP_TIMEOUT}s",
             extras=muse_extras,
         )
+    except (OSError, ValueError) as exc:
+        return RefreshResult(
+            model_id,
+            "failed",
+            f"could not start museq[server] install: {exc}",
+            extras=muse_extras,
+        )
     if proc.returncode != 0:
         return RefreshResult(
             model_id,
             "failed",
             "museq[server] install failed",
-            proc.stdout + proc.stderr,
+            (proc.stdout or "") + (proc.stderr or ""),
             extras=muse_extras,
         )
 
@@ -203,8 +315,8 @@ def refresh_one(
         cmd2 = [python_path, "-m", "pip", "install", "--upgrade", *pip_extras_list]
         logger.info("refresh %s extras: %s", model_id, " ".join(cmd2))
         try:
-            proc2 = subprocess.run(
-                cmd2, capture_output=True, text=True, timeout=_PIP_TIMEOUT,
+            proc2 = run_owned_command(
+                cmd2, capture_output=True, timeout=_PIP_TIMEOUT, check=False,
             )
         except subprocess.TimeoutExpired:
             return RefreshResult(
@@ -213,12 +325,49 @@ def refresh_one(
                 f"pip_extras install timed out after {_PIP_TIMEOUT}s",
                 extras=muse_extras,
             )
+        except (OSError, ValueError) as exc:
+            return RefreshResult(
+                model_id,
+                "failed",
+                f"could not start pip_extras install: {exc}",
+                extras=muse_extras,
+            )
         if proc2.returncode != 0:
             return RefreshResult(
                 model_id,
                 "failed",
                 "pip_extras install failed",
-                proc2.stdout + proc2.stderr,
+                (proc2.stdout or "") + (proc2.stderr or ""),
+                extras=muse_extras,
+            )
+
+    if not no_extras:
+        try:
+            install_python_sources(venv_path, python_sources)
+        except subprocess.TimeoutExpired as exc:
+            output = "".join(
+                str(part or "") for part in (exc.stdout, exc.stderr)
+            )
+            return RefreshResult(
+                model_id,
+                "failed",
+                f"python_sources install timed out after {_PIP_TIMEOUT}s",
+                output,
+                extras=muse_extras,
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+            output = "".join(
+                str(part or "")
+                for part in (
+                    getattr(exc, "stdout", None),
+                    getattr(exc, "stderr", None),
+                )
+            )
+            return RefreshResult(
+                model_id,
+                "failed",
+                f"python_sources install failed: {exc}",
+                output,
                 extras=muse_extras,
             )
 

@@ -15,26 +15,34 @@ on:
 
 jobs:
   fast-lane:
-    name: pytest -m "not slow" (py3.11, cpu)
-    runs-on: ubuntu-latest
+    name: pytest -m "not slow" (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-14
+            python-version: "3.12"
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: cache pip downloads
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-tests-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python-version }}-pip-tests-${{ hashFiles('pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-pip-tests-
-            ${{ runner.os }}-pip-
+            ${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python-version }}-pip-tests-
+            ${{ runner.os }}-${{ runner.arch }}-pip-
 
       - name: install muse with full CPU extras
         env:
@@ -45,3 +53,69 @@ jobs:
 
       - name: run fast lane
         run: pytest -m "not slow" -q
+
+  artifacts:
+    name: wheel and sdist release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "build>=1.2" "twine>=5"
+
+      - name: build and check source artifacts
+        run: |
+          set -euo pipefail
+          python -m build --sdist --wheel --outdir dist
+          python -m twine check dist/*
+
+      - name: rebuild wheel from sdist
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sdist-source" "$RUNNER_TEMP/sdist-wheel"
+          python - <<'PY'
+          import os
+          import tarfile
+          from pathlib import Path
+
+          archive = next(Path("dist").glob("*.tar.gz"))
+          destination = Path(os.environ["RUNNER_TEMP"]) / "sdist-source"
+          with tarfile.open(archive) as source:
+              source.extractall(destination, filter="data")
+          PY
+          SOURCE_DIR="$(find "$RUNNER_TEMP/sdist-source" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "$SOURCE_DIR"
+          python -m build --wheel --outdir "$RUNNER_TEMP/sdist-wheel" "$SOURCE_DIR"
+          python -m twine check "$RUNNER_TEMP"/sdist-wheel/*
+
+      - name: install and validate checkout-built wheel
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/direct-wheel-venv"
+          "$RUNNER_TEMP/direct-wheel-venv/bin/python" -m pip install --no-deps dist/*.whl
+          "$RUNNER_TEMP/direct-wheel-venv/bin/python" scripts/validate_installed_distribution.py
+
+      - name: install and validate sdist-built wheel
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/sdist-wheel-venv"
+          "$RUNNER_TEMP/sdist-wheel-venv/bin/python" -m pip install --no-deps "$RUNNER_TEMP"/sdist-wheel/*.whl
+          "$RUNNER_TEMP/sdist-wheel-venv/bin/python" scripts/validate_installed_distribution.py
+
+      - name: upload checked artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: museq-distributions
+          path: dist/*
+          if-no-files-found: error

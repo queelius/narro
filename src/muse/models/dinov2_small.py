@@ -51,6 +51,7 @@ MANIFEST = {
     "model_id": "dinov2-small",
     "modality": "image/embedding",
     "hf_repo": "facebook/dinov2-small",
+    "revision": "ed25f3a31f01632728cabb09d1542f84ab7b0056",
     "description": (
         "DINOv2 small: 88MB, 384-dim self-supervised image features, Apache 2.0"
     ),

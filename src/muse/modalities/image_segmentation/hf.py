@@ -31,7 +31,7 @@ from typing import Any, Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _RUNTIME_PATH = (
@@ -125,6 +125,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "device": "auto",
         **_infer_capabilities(repo_id),
     }
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "image/segmentation",
@@ -135,6 +136,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         # SAM-2 repos ship a small set of files: weights, config,
@@ -150,6 +153,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             repo_id=repo_id,
             cache_dir=str(cache_root) if cache_root else None,
             allow_patterns=allow_patterns,
+            revision=revision,
         ))
 
     return ResolvedModel(

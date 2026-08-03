@@ -69,6 +69,7 @@ MANIFEST = {
     # ships the native Wan layout (loose .pth files, no model_index.json)
     # which diffusers cannot load -- the "-Diffusers" suffix is the port.
     "hf_repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "revision": "0fad780a534b6463e45facd96134c9f345acfa5b",
     "description": (
         "Wan 2.1 T2V 1.3B: 5s videos at 832x480, Apache 2.0. The UMT5-XXL "
         "text encoder makes full-resident load ~11-12GB, so the bundle "

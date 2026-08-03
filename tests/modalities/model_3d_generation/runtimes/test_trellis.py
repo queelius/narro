@@ -221,8 +221,8 @@ def test_local_dir_preferred_over_hf_repo():
 
 
 def test_constructor_does_not_pass_trust_remote_code_to_from_pretrained():
-    """TRELLIS uses a direct pip install (not trust_remote_code); from_pretrained
-    must NOT receive a trust_remote_code kwarg (real SDK has no such param)."""
+    """TRELLIS uses a reviewed sparse checkout (not trust_remote_code);
+    from_pretrained omits the kwarg because the real SDK has no such param."""
     _wire_runtime()
     mod.TRELLISRuntime(
         model_id="trellis-image",

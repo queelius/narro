@@ -14,6 +14,7 @@ MANIFEST = {
     "model_id": "starvector-1b-im2svg",
     "modality": "image/vectorization",
     "hf_repo": "starvector/starvector-1b-im2svg",
+    "revision": _REVISION,
     "description": (
         "StarVector-1B im2svg: raster icons, logos, and diagrams to "
         "editable static SVG; Apache 2.0; 5.14GB checkpoint, fp16 load"

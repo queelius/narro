@@ -161,6 +161,15 @@ class TestVaryImage:
         assert call.kwargs["image"] == SAMPLE_PNG
         assert call.kwargs["n"] == 2
 
+    def test_non_string_image_input_returns_validation_error(self, server):
+        server.client.vary_image = MagicMock()
+        blocks = server.call_handler("muse_vary_image", {
+            "image_b64": {"unexpected": "object"},
+        })
+        body = _parse_text(blocks[0])
+        assert body["error"] == "image_b64 must be a string, got dict"
+        server.client.vary_image.assert_not_called()
+
 
 class TestUpscaleImage:
     def test_passes_scale(self, server):

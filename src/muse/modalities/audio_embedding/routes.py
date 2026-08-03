@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 MODALITY = "audio/embedding"
 
+_MAX_FILES = 32
+_MAX_TOTAL_UPLOAD_BYTES = 64 * 1024 * 1024
+
 
 
 def _max_upload_bytes() -> int:
@@ -74,11 +77,23 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 400, "invalid_parameter",
                 "at least one `file` part is required",
             )
+        if len(file) > _MAX_FILES:
+            return error_response(
+                413, "payload_too_large",
+                f"at most {_MAX_FILES} audio files are allowed per request",
+            )
 
         max_bytes = _max_upload_bytes()
         audio_bytes_list: list[bytes] = []
+        total_bytes = 0
         for idx, upload in enumerate(file):
-            data = await upload.read(max_bytes + 1)
+            try:
+                data = await upload.read(max_bytes + 1)
+            finally:
+                try:
+                    await upload.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("failed to close audio upload", exc_info=True)
             if len(data) > max_bytes:
                 return error_response(
                     413, "payload_too_large",
@@ -89,6 +104,13 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 return error_response(
                     400, "invalid_parameter",
                     f"file[{idx}] is empty",
+                )
+            total_bytes += len(data)
+            if total_bytes > _MAX_TOTAL_UPLOAD_BYTES:
+                return error_response(
+                    413, "payload_too_large",
+                    "aggregate audio upload exceeds "
+                    f"{_MAX_TOTAL_UPLOAD_BYTES} bytes",
                 )
             audio_bytes_list.append(data)
 

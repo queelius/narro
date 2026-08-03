@@ -1,6 +1,6 @@
 """muse models probe: measure model VRAM/RAM by loading + (default) inference.
 
-Spawns a subprocess in the model's per-model venv so the measurement is
+Spawns an owned subprocess group in the model's per-model venv so the measurement is
 clean (no test-fixture interference, no other-model confounding). The
 subprocess runs an internal entry point (`muse _probe_worker`) that
 imports the model, captures pre/post memory, optionally runs a
@@ -19,14 +19,21 @@ import sys
 from pathlib import Path
 
 from muse.core.catalog import (
+    ModelInUseError,
     _CATALOG_WRITE_LOCK,
+    _model_pull_lock,
+    _model_resource_lease,
     _read_catalog,
     _reset_known_models_cache,
     _write_catalog,
     is_pulled,
     known_models,
 )
-from muse.core.venv import venv_python
+from muse.core.venv import (
+    _OwnedProcessCleanupError,
+    run_owned_command,
+    venv_python,
+)
 
 
 log = logging.getLogger("muse.probe")
@@ -56,6 +63,36 @@ def run_probe(
         )
         return 2
 
+    with _model_pull_lock(model_id):
+        try:
+            with _model_resource_lease(model_id):
+                return _run_probe_locked(
+                    model_id=model_id,
+                    no_inference=no_inference,
+                    device=device,
+                    as_json=as_json,
+                )
+        except ModelInUseError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
+
+
+def _run_probe_locked(
+    *,
+    model_id: str,
+    no_inference: bool,
+    device: str | None,
+    as_json: bool,
+) -> int:
+    """Run one probe while holding the model's pull/refresh/remove lock."""
+    if not is_pulled(model_id):
+        print(
+            f"error: model {model_id!r} is no longer pulled; "
+            f"run `muse pull {model_id}` first",
+            file=sys.stderr,
+        )
+        return 2
+
     catalog = _read_catalog()
     venv_path_raw = catalog.get(model_id, {}).get("venv_path")
     if not venv_path_raw:
@@ -71,7 +108,10 @@ def run_probe(
     # Resolve the device the worker will pass to load_backend. Capability
     # device pin still takes precedence inside load_backend; this just
     # picks the request that gets forwarded.
-    entry = catalog_known[model_id]
+    entry = known_models().get(model_id)
+    if entry is None:
+        print(f"error: model {model_id!r} disappeared during probe", file=sys.stderr)
+        return 2
     cap_device = entry.extra.get("device", "auto")
     effective_device = device or cap_device or "auto"
 
@@ -90,9 +130,17 @@ def run_probe(
         print()
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = run_owned_command(
+            cmd, capture_output=True, timeout=600, check=False,
+        )
     except subprocess.TimeoutExpired:
         print("error: probe timed out (>10 min)", file=sys.stderr)
+        return 3
+    except _OwnedProcessCleanupError as exc:
+        print(f"error: probe subprocess cleanup failed: {exc}", file=sys.stderr)
+        return 3
+    except (OSError, ValueError) as exc:
+        print(f"error: could not start probe subprocess: {exc}", file=sys.stderr)
         return 3
 
     if result.returncode != 0:
@@ -103,7 +151,8 @@ def run_probe(
 
     # The worker writes progress logs on stderr; the final stdout line
     # is a JSON object the parent persists. Parse the last non-empty line.
-    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    stdout = result.stdout or ""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
     if not lines:
         print("error: probe produced no output", file=sys.stderr)
         return 4
@@ -111,7 +160,18 @@ def run_probe(
         record = json.loads(lines[-1])
     except json.JSONDecodeError:
         print("error: probe output was not JSON; full stdout:", file=sys.stderr)
-        print(result.stdout, file=sys.stderr)
+        print(stdout, file=sys.stderr)
+        return 4
+    if not isinstance(record, dict):
+        print("error: probe output JSON was not an object", file=sys.stderr)
+        return 4
+    record_model_id = record.get("model_id")
+    if record_model_id is not None and record_model_id != model_id:
+        print(
+            f"error: probe returned measurement for {record_model_id!r}, "
+            f"expected {model_id!r}",
+            file=sys.stderr,
+        )
         return 4
 
     # Persist under measurements.<device>. Per-device keying so the same
@@ -125,6 +185,9 @@ def run_probe(
         if model_id in catalog:
             catalog[model_id].setdefault("measurements", {})
             device_key = record.get("device", effective_device)
+            if not isinstance(device_key, str) or not device_key:
+                print("error: probe returned an invalid device", file=sys.stderr)
+                return 4
             catalog[model_id]["measurements"][device_key] = record
             _write_catalog(catalog)
     _reset_known_models_cache()

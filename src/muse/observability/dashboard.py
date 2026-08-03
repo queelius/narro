@@ -32,6 +32,8 @@ SupervisorState in production, or a SimpleNamespace in tests) exposing:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import math
 import queue
 import socket
 import time
@@ -78,11 +80,10 @@ async def _stream_model_logs(hub, model_id: str, request: Request):
     unbounded async generator before returning, i.e. would hang forever
     on a stream with no natural end).
     """
-    for line in hub.snapshot(model_id):
-        yield {"data": line}
-
-    q: queue.Queue = hub.subscribe(model_id)
+    history, q = hub.subscribe_with_snapshot(model_id)
     try:
+        for line in history:
+            yield {"data": line}
         while True:
             if await request.is_disconnected():
                 break
@@ -135,20 +136,31 @@ def build_dashboard_router(state) -> APIRouter:
         director = state.director
         gate = getattr(state, "concurrency_gate", None)
         depths = gate.depths() if gate is not None else {}
-        loaded = [
-            _loaded_entry_dict(model_id, entry,
-                               queue_depth=depths.get(model_id, 0))
-            for model_id, entry in director.loaded.items()
-        ]
+        director_lock = getattr(director, "lock", None)
+        lock_context = (
+            director_lock
+            if hasattr(director_lock, "__enter__")
+            else contextlib.nullcontext()
+        )
+        with lock_context:
+            loaded = [
+                _loaded_entry_dict(
+                    model_id,
+                    entry,
+                    queue_depth=depths.get(model_id, 0),
+                )
+                for model_id, entry in director.loaded.items()
+            ]
+            in_flight = len(getattr(director, "in_flight_loads", {}) or {})
+        loaded_ids = {entry["model_id"] for entry in loaded}
         # #331: waiters parked on a model during its own cold start are in
         # the gate but NOT in director.loaded -- exactly when the queue is
         # deepest. Surface them separately so the pressure is visible.
         queued = [
             {"model_id": model_id, "queue_depth": depth}
             for model_id, depth in sorted(depths.items())
-            if depth > 0 and model_id not in director.loaded
+            if depth > 0 and model_id not in loaded_ids
         ]
-        in_flight = len(getattr(director, "in_flight_loads", {}) or {})
         return {
             "node": _node_id(state),
             "loaded": loaded,
@@ -162,6 +174,12 @@ def build_dashboard_router(state) -> APIRouter:
         dependencies=[Depends(require_dashboard_auth)],
     )
     def series(metric: str = Query(...), window: float = Query(3600)) -> dict:
+        if not math.isfinite(window) or window <= 0:
+            raise _err(
+                400,
+                "invalid_window",
+                "Telemetry window must be a positive finite number of seconds",
+            )
         since_ts = time.time() - window
         bucket_seconds = max(window / _TARGET_BUCKET_COUNT, 1)
         try:

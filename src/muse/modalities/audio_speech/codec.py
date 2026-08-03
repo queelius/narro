@@ -6,15 +6,23 @@ from the modality-agnostic server framework.
 from __future__ import annotations
 
 import io
-import shutil
 import subprocess
+import shutil
+import tempfile
 import wave
+from pathlib import Path
 
 import numpy as np
+
+from muse.core.venv import run_owned_command
 
 
 class AudioFormatError(ValueError):
     """Raised when audio data cannot be encoded to the requested format."""
+
+
+_FFMPEG_TIMEOUT_SECONDS = 60.0
+_OPUS_OUTPUT_SLACK_BYTES = 1024 * 1024
 
 
 def float_to_pcm16(audio: np.ndarray) -> np.ndarray:
@@ -50,18 +58,41 @@ def wav_bytes_to_opus(wav_data: bytes) -> bytes:
 
     Raises AudioFormatError if ffmpeg is unavailable or conversion fails.
     """
-    if shutil.which("ffmpeg") is None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
         raise AudioFormatError("ffmpeg not found; cannot encode opus")
-    proc = subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "wav", "-i", "pipe:0",
-            "-c:a", "libopus", "-b:a", "64k",
-            "-f", "ogg", "pipe:1",
-        ],
-        input=wav_data,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise AudioFormatError(f"ffmpeg failed: {proc.stderr.decode()[:200]}")
-    return proc.stdout
+    with tempfile.TemporaryDirectory(prefix="muse-ffmpeg-") as raw_dir:
+        work_dir = Path(raw_dir)
+        input_path = work_dir / "input.wav"
+        output_path = work_dir / "output.ogg"
+        input_path.write_bytes(wav_data)
+        try:
+            proc = run_owned_command(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "wav", "-i", str(input_path),
+                    "-c:a", "libopus", "-b:a", "64k",
+                    "-f", "ogg", str(output_path),
+                ],
+                capture_output=True,
+                timeout=_FFMPEG_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AudioFormatError(
+                f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS:g}s"
+            ) from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or "")[:200]
+            raise AudioFormatError(f"ffmpeg failed: {detail}")
+        max_output = len(wav_data) + _OPUS_OUTPUT_SLACK_BYTES
+        try:
+            with output_path.open("rb") as handle:
+                output = handle.read(max_output + 1)
+        except OSError as exc:
+            raise AudioFormatError("ffmpeg produced no readable Opus output") from exc
+        if len(output) > max_output:
+            raise AudioFormatError("ffmpeg Opus output exceeded its safety bound")
+        if not output:
+            raise AudioFormatError("ffmpeg produced empty Opus output")
+        return output

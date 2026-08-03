@@ -30,7 +30,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 from fastapi import FastAPI, Request
@@ -80,6 +80,301 @@ from muse.cli_impl.queueing import QueueFull, QueueTimeout
 
 logger = logging.getLogger(__name__)
 
+_MB = 1024 * 1024
+_MAX_BUFFERED_WORKER_RESPONSE_BYTES = 1 * _MB
+_WORKER_RESPONSE_CHUNK_BYTES = 64 * 1024
+_MAX_MODEL_ID_CHARS = 512
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
+
+class RequestBodyTooLarge(ValueError):
+    """An inbound gateway request exceeded its configured byte budget."""
+
+    def __init__(self, *, limit: int, observed: int) -> None:
+        self.limit = limit
+        self.observed = observed
+        super().__init__(f"request body exceeds {limit} byte limit")
+
+
+class RequestBodyLimitMiddleware:
+    """Bound and replay every inbound HTTP body before route dispatch.
+
+    Enforcement at the ASGI boundary covers explicit admin, aggregation,
+    dashboard, and future routes as well as the catch-all inference proxy.
+    The downstream app receives one replayable request message, so FastAPI
+    body parsing and the proxy's own cache can consume it normally.
+    """
+
+    def __init__(self, app: Any, *, limit: int) -> None:
+        if isinstance(limit, bool) or type(limit) is not int or limit <= 0:
+            raise ValueError("request body limit must be a positive integer")
+        self.app = app
+        self.limit = limit
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared: int | None = None
+        for raw_name, raw_value in scope.get("headers", []):
+            if raw_name.lower() != b"content-length":
+                continue
+            try:
+                parsed = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                declared = parsed if declared is None else max(declared, parsed)
+        if declared is not None and declared > self.limit:
+            await self._reject(scope, receive, send)
+            return
+
+        chunks: list[bytes] = []
+        total = 0
+        terminal_message: dict | None = None
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                terminal_message = message
+                break
+            chunk = message.get("body", b"")
+            if not isinstance(chunk, bytes):
+                chunk = bytes(chunk)
+            total += len(chunk)
+            if total > self.limit:
+                await self._reject(scope, receive, send)
+                return
+            if chunk:
+                chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+
+        body = b"".join(chunks)
+        replayed = False
+
+        async def replay_receive() -> dict:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                if terminal_message is not None:
+                    return terminal_message
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    async def _reject(self, scope: dict, receive: Any, send: Any) -> None:
+        response = _openai_error(
+            413,
+            "request_too_large",
+            f"request body exceeds the configured {self.limit} byte limit",
+        )
+        await response(scope, receive, send)
+
+
+class ShutdownCancellationMiddleware:
+    """Suppress only shutdown-driven HTTP task cancellation.
+
+    Uvicorn may cancel handlers after its graceful-shutdown deadline.  Once
+    the supervisor's stop event is set, that cancellation is expected control
+    flow rather than an ASGI application failure.  Before response start we
+    make a best-effort OpenAI-shaped 503; after start we simply let the
+    connection close.  Client-disconnect cancellation while the server is
+    otherwise running still propagates unchanged.
+    """
+
+    def __init__(self, app: Any, *, stop_event: Any) -> None:
+        self.app = app
+        self.stop_event = stop_event
+
+    def _server_is_stopping(self) -> bool:
+        is_set = getattr(self.stop_event, "is_set", None)
+        return bool(callable(is_set) and is_set() is True)
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        response_started = False
+
+        async def tracking_send(message: dict) -> None:
+            nonlocal response_started
+            await send(message)
+            if message.get("type") == "http.response.start":
+                response_started = True
+
+        try:
+            await self.app(scope, receive, tracking_send)
+        except asyncio.CancelledError:
+            if not self._server_is_stopping():
+                raise
+            if response_started:
+                return
+            response = _openai_error(
+                503,
+                "server_shutting_down",
+                "request cancelled because the server is shutting down",
+                error_type="server_error",
+            )
+            try:
+                await response(scope, receive, send)
+            except asyncio.CancelledError:
+                # The transport may already be gone, or Uvicorn may issue a
+                # second cancellation. Shutdown remains clean either way.
+                return
+            except Exception:  # noqa: BLE001
+                return
+
+
+class _OwnedStreamingResponse(StreamingResponse):
+    """StreamingResponse whose ASGI call owns an idempotent async cleanup.
+
+    A normal generator ``finally`` is insufficient when sending
+    ``http.response.start`` fails before the first ``__anext__``.  The outer
+    response lifecycle always runs this callback; the relay generator invokes
+    the same callback for direct-iteration tests and early iterator close.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        cleanup: Callable[[], Awaitable[None]],
+        **kwargs: Any,
+    ) -> None:
+        self._cleanup = cleanup
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._cleanup()
+
+
+def _valid_model_id(value: Any) -> bool:
+    """Return whether a routing key is a bounded, printable string."""
+    return bool(
+        isinstance(value, str)
+        and value.strip()
+        and len(value) <= _MAX_MODEL_ID_CHARS
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+async def _prefetch_worker_response(
+    response: httpx.Response,
+    *,
+    limit: int = _MAX_BUFFERED_WORKER_RESPONSE_BYTES,
+) -> tuple[bytes | None, list[bytes], Any | None]:
+    """Buffer a small worker response, or hand off a bounded prefix.
+
+    ``httpx.Response.aread()`` has no byte ceiling.  A worker returning a
+    large image, audio file, or malformed endless response could therefore
+    make the gateway retain the entire body for every concurrent request.
+    Read raw bytes in fixed-size chunks instead.  Bodies at or below ``limit``
+    preserve the existing buffered ``Response`` path; larger bodies return a
+    prefix plus the still-open iterator so the caller can relay the remainder
+    with ``StreamingResponse``.
+
+    Raw bytes are intentional: content-encoding headers are forwarded, so the
+    gateway must not transparently decompress and then forward a stale header.
+    """
+    if limit <= 0:
+        raise ValueError("worker response buffer limit must be positive")
+
+    iterator = response.aiter_raw(
+        chunk_size=_WORKER_RESPONSE_CHUNK_BYTES,
+    ).__aiter__()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        try:
+            chunk = await iterator.__anext__()
+        except StopAsyncIteration:
+            return b"".join(chunks), [], None
+        if not chunk:
+            continue
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            return None, chunks, iterator
+
+
+def _proxy_headers(
+    headers: Any,
+    *,
+    exclude: frozenset[str] = frozenset(),
+) -> list[tuple[bytes, bytes]]:
+    """Copy end-to-end headers, removing RFC hop-by-hop fields.
+
+    In addition to the standard fixed names, HTTP/1.1 lets a sender nominate
+    extension hop-by-hop headers through ``Connection``.  Forwarding either
+    class through the gateway can leak connection-local state or confuse the
+    next server/client in the chain. Raw pairs are retained so repeatable
+    end-to-end fields (especially multiple ``Set-Cookie`` values) never collapse
+    through a dict/``Headers.items()`` conversion.
+    """
+    raw = getattr(headers, "raw", None)
+    if isinstance(raw, (list, tuple)):
+        pairs = [(bytes(key), bytes(value)) for key, value in raw]
+    else:
+        pairs = [
+            (
+                str(key).encode("latin-1"),
+                str(value).encode("latin-1"),
+            )
+            for key, value in headers.items()
+        ]
+
+    blocked = {
+        name.lower().encode("ascii")
+        for name in (_HOP_BY_HOP_HEADERS | exclude)
+    }
+    for key, value in pairs:
+        if key.lower() != b"connection":
+            continue
+        blocked.update(
+            token.strip().lower()
+            for token in value.split(b",")
+            if token.strip()
+        )
+    return [
+        (key, value)
+        for key, value in pairs
+        if key.lower() not in blocked
+    ]
+
+
+def _install_response_headers(
+    response: Response,
+    headers: list[tuple[bytes, bytes]],
+) -> Response:
+    """Install raw forwarded pairs without losing generated safe headers."""
+    forwarded_names = {key.lower() for key, _value in headers}
+    generated = [
+        (key, value)
+        for key, value in response.raw_headers
+        if key.lower() not in forwarded_names
+    ]
+    response.raw_headers = [*generated, *headers]
+    return response
+
 
 @dataclass(frozen=True)
 class WorkerRoute:
@@ -92,7 +387,47 @@ class WorkerRoute:
     worker_url: str
 
 
-async def extract_model_from_request(request: Any) -> str | None:
+async def cache_bounded_request_body(request: Request, *, limit: int) -> bytes:
+    """Read and cache at most ``limit`` bytes from an ASGI request stream.
+
+    ``Content-Length`` is only an early rejection optimization; chunked or
+    dishonest clients are still bounded while streaming.  Starlette normally
+    sets ``request._body`` in ``Request.body()``.  We set the same cache after
+    our bounded read so model extraction and the eventual worker forward see
+    exactly one body without consuming the receive channel twice.
+    """
+    if limit <= 0:
+        raise ValueError("request body limit must be positive")
+    cached = getattr(request, "_body", None)
+    if isinstance(cached, bytes):
+        if len(cached) > limit:
+            raise RequestBodyTooLarge(limit=limit, observed=len(cached))
+        return cached
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except (TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > limit:
+            raise RequestBodyTooLarge(limit=limit, observed=declared)
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise RequestBodyTooLarge(limit=limit, observed=total)
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    request._body = body
+    return body
+
+
+async def extract_model_from_request(request: Any) -> Any:
     """Extract the `model` field from a request.
 
     - POST with JSON body: body["model"]
@@ -120,6 +455,7 @@ async def extract_model_from_request(request: Any) -> str | None:
             except (json.JSONDecodeError, ValueError):
                 return None
         if "multipart/form-data" in content_type:
+            form = None
             try:
                 # Read body FIRST so Starlette caches it on _body.
                 # request.form() consumes the receive stream; without
@@ -134,6 +470,12 @@ async def extract_model_from_request(request: Any) -> str | None:
                 return model if isinstance(model, str) else None
             except Exception:  # noqa: BLE001
                 return None
+            finally:
+                if form is not None:
+                    try:
+                        await form.close()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("failed to close parsed multipart form", exc_info=True)
 
     return None
 
@@ -187,6 +529,7 @@ def build_gateway(
     *,
     state: "object | None" = None,
     aggregation_timeout: float | None = None,
+    max_request_body_bytes: int | None = None,
 ) -> FastAPI:
     """Build the gateway FastAPI app.
 
@@ -246,6 +589,30 @@ def build_gateway(
         {r.model_id: r for r in routes} if routes is not None else {}
     )
     app.state.timeout = timeout
+    app.state.max_request_body_bytes = (
+        max_request_body_bytes
+        if max_request_body_bytes is not None
+        else int(config.get("server.max_request_body_mb")) * _MB
+    )
+    if (
+        isinstance(app.state.max_request_body_bytes, bool)
+        or type(app.state.max_request_body_bytes) is not int
+        or app.state.max_request_body_bytes <= 0
+    ):
+        raise ValueError("max_request_body_bytes must be a positive integer")
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        limit=app.state.max_request_body_bytes,
+    )
+    stop_event = getattr(state, "stop_event", None) if state is not None else None
+    if callable(getattr(stop_event, "is_set", None)):
+        # Added after the body limiter so it is the outermost user middleware
+        # and covers body reads, queue waits, route dispatch, and response-body
+        # iteration rather than only selected awaits inside the proxy route.
+        app.add_middleware(
+            ShutdownCancellationMiddleware,
+            stop_event=stop_event,
+        )
     app.state.aggregation_timeout = (
         aggregation_timeout if aggregation_timeout is not None
         else config.get("server.aggregation_timeout_seconds")
@@ -295,7 +662,13 @@ def build_gateway(
                     r = await client.get(f"{url}/v1/models")
                     if r.status_code != 200:
                         return []
-                    return r.json().get("data", [])
+                    body = r.json()
+                    if not isinstance(body, dict):
+                        return []
+                    data = body.get("data", [])
+                    if not isinstance(data, list):
+                        return []
+                    return [item for item in data if isinstance(item, dict)]
                 except Exception as e:  # noqa: BLE001
                     # Broad on purpose: a worker is untrusted input once it
                     # answers at all. httpx.HTTPError covers transport
@@ -354,7 +727,8 @@ def build_gateway(
                     r = await client.get(f"{url}/health")
                     if r.status_code != 200:
                         return None
-                    return r.json()
+                    body = r.json()
+                    return body if isinstance(body, dict) else None
                 except Exception as e:  # noqa: BLE001
                     # See the matching comment in list_models: a 200 with a
                     # non-JSON body must degrade this worker to "down", not
@@ -371,8 +745,16 @@ def build_gateway(
             if body is None or isinstance(body, BaseException):
                 any_down = True
                 continue
-            modalities.update(body.get("modalities", []))
-            models.update(body.get("models", []))
+            raw_modalities = body.get("modalities", [])
+            raw_models = body.get("models", [])
+            if isinstance(raw_modalities, list):
+                modalities.update(
+                    value for value in raw_modalities if isinstance(value, str)
+                )
+            if isinstance(raw_models, list):
+                models.update(
+                    value for value in raw_models if isinstance(value, str)
+                )
         # v0.47.4: also report enabled-but-unloaded catalog models so the
         # serviceable surface matches /v1/models. A request naming one of
         # these triggers an on-demand load; reporting only resident
@@ -425,7 +807,25 @@ def build_gateway(
         # explicit routes registered BEFORE this catch-all, so they win
         # via FastAPI's registration order.
 
+        try:
+            await cache_bounded_request_body(
+                request, limit=app.state.max_request_body_bytes,
+            )
+        except RequestBodyTooLarge as exc:
+            return _openai_error(
+                413,
+                "request_too_large",
+                f"request body exceeds the configured {exc.limit} byte limit",
+            )
+
         model_id = await extract_model_from_request(request)
+        if model_id is not None and not _valid_model_id(model_id):
+            return _openai_error(
+                400,
+                "invalid_model",
+                "`model` must be a non-empty string of at most "
+                f"{_MAX_MODEL_ID_CHARS} characters without control characters",
+            )
         if model_id is None:
             # MODEL_OPTIONAL_PATHS seam (spec 2026-07-09): a modality
             # package may declare paths where `model` is optional (e.g.
@@ -478,7 +878,20 @@ def build_gateway(
             )
 
         target_url = f"{route.worker_url}/{full_path}"
-        return await _forward(request, target_url, app.state.timeout)
+        try:
+            return await _forward(request, target_url, app.state.timeout)
+        except httpx.TimeoutException:
+            return _openai_error(
+                504, "worker_timeout",
+                f"worker for model {model_id!r} timed out",
+                error_type="server_error",
+            )
+        except httpx.TransportError:
+            return _openai_error(
+                502, "worker_unavailable",
+                f"worker for model {model_id!r} is unavailable",
+                error_type="server_error",
+            )
 
     return app
 
@@ -591,6 +1004,24 @@ def _director_headroom(director: Any) -> dict[str, float]:
     return kwargs
 
 
+def _cold_model_needs_servability_check(director: Any, model_id: str) -> bool:
+    """Whether a real director has no resident entry for ``model_id``.
+
+    Boot validation cannot see models pulled or materially edited after the
+    supervisor starts.  Cold requests therefore re-check permanent fit even
+    when no old stamp exists.  Loose test doubles expose a fabricated
+    ``loaded`` mock; only a concrete dict opts into this additional path.
+    """
+    loaded = getattr(director, "loaded", None)
+    if not isinstance(loaded, dict):
+        return False
+    lock = getattr(director, "lock", None)
+    if lock is None:
+        return model_id not in loaded
+    with lock:
+        return model_id not in loaded
+
+
 async def _route_via_director(
     request: Request,
     full_path: str,
@@ -602,11 +1033,11 @@ async def _route_via_director(
 
     Order of operations:
 
-      1. Check `state.unservable_reasons[model_id]`. If set, return 503
-         with the reason text. The director is NOT called for unservable
-         models: the boot-validation step already decided they cannot be
-         served, so attempting a load would only stall the request before
-         failing.
+      1. Re-check permanent servability when the boot snapshot carries an
+         unservable stamp OR the model is cold (it may have been pulled or
+         edited after boot). If unservable, return 503 without calling the
+         director; transient pressure is not stamped and proceeds to the
+         director's admission/eviction path.
       2. Resolve the manifest via `muse.core.catalog.get_manifest`. The
          director's load + eviction decisions read `capabilities.memory_gb`
          and `capabilities.device` from this dict. KeyError (model not in
@@ -621,26 +1052,56 @@ async def _route_via_director(
          FastAPI's default 500 path.
       4. On a successful acquire, forward the request to the returned port.
          The release call MUST fire on completion regardless of outcome.
-         For non-streaming responses, the finally clause covers it. For
-         streaming responses, the relay generator's own finally clause
-         calls release at end-of-iteration (NOT at first-chunk dispatch).
+         Buffered responses release before returning. Streaming responses
+         release at end-of-iteration (NOT at first-chunk dispatch), with an
+         outer response-lifecycle callback covering a downstream send failure
+         before the relay generator is first advanced.
     """
-    # 1. Unservable short-circuit (BEFORE acquire). The boot-time
+    # Explicit model ids obey the same catalog activation flag as default
+    # resolution.  Historically only optional-model routing called
+    # is_enabled(), so a disabled model could still cold-load by name.
+    try:
+        catalog_entry = _read_catalog().get(model_id)
+    except CatalogError as exc:
+        return _openai_error(
+            503,
+            "catalog_unavailable",
+            f"model catalog is temporarily unavailable: {exc}",
+            error_type="server_error",
+        )
+    if (
+        isinstance(catalog_entry, dict)
+        and not bool(catalog_entry.get("enabled", True))
+    ):
+        return _openai_error(
+            409,
+            "model_disabled",
+            f"model {model_id!r} is disabled; enable it before requesting it",
+        )
+
+    # 1. Permanent-servability short-circuit (BEFORE acquire). The boot-time
     # validate_catalog_at_boot snapshot can go stale: a `muse models probe`
     # (or weights landing on disk) that arrives after boot makes a
-    # previously-unsizable model sizable, and freed memory can make a model
-    # that did not fit at boot fit now. When a stamp exists, re-derive the
-    # full verdict for THIS one model against the LIVE catalog + live free
-    # memory, so the probe (or memory change) takes effect without a
+    # previously-unsizable model sizable, while manifest, placement, or
+    # budget changes can alter its permanent fit. When a stamp exists,
+    # re-derive the full verdict for THIS one model against the LIVE catalog
+    # and current capacity ceiling, so those changes take effect without a
     # supervisor restart. revalidate_servability clears the stamp (returns
     # None) only when the model is sizable AND fits; a genuine "exceeds
     # device capacity" stamp is RETAINED, so an impossible-to-fit model 503s
     # here and never reaches the director's eviction loop (which would
     # otherwise evict the whole idle working set before 503'ing). Reading +
     # mutating the dict happens under state.lock inside revalidate_servability.
+    # A cold model with no stamp is checked too: it may have been pulled or
+    # grown after boot and could otherwise wipe the idle working set before
+    # the director discovered that it exceeds physical capacity.
     with state.lock:
         unservable_reason = state.unservable_reasons.get(model_id)
-    if unservable_reason is not None:
+    needs_servability_check = (
+        unservable_reason is not None
+        or _cold_model_needs_servability_check(state.director, model_id)
+    )
+    if needs_servability_check:
         # Thread the SAME headroom state.director was built with, not
         # revalidate_servability's hardcoded 1.0/2.0 defaults. Otherwise an
         # operator-configured server.gpu_headroom_gb / cpu_headroom_gb
@@ -650,9 +1111,21 @@ async def _route_via_director(
         # actually admit (or vice versa). state.director is guaranteed
         # non-None here (checked by the caller before dispatching to this
         # function).
-        unservable_reason = revalidate_servability(
-            state, model_id, **_director_headroom(state.director),
-        )
+        try:
+            unservable_reason = revalidate_servability(
+                state, model_id, **_director_headroom(state.director),
+            )
+        except CatalogError as exc:
+            logger.error(
+                "servability check for %r failed: catalog is unavailable: %s",
+                model_id, exc,
+            )
+            return _openai_error(
+                503,
+                "catalog_unavailable",
+                f"model catalog is temporarily unavailable: {exc}",
+                error_type="server_error",
+            )
     if unservable_reason is not None:
         return _openai_error(
             503,
@@ -701,7 +1174,23 @@ async def _route_via_director(
     # declares none, so backfill it from the catalog (probe measurement,
     # else on-disk weights) -- otherwise the director treats the model as
     # 0 GB and never evicts to make room for it.
-    manifest = backfill_manifest_memory(manifest, model_id)
+    try:
+        manifest = backfill_manifest_memory(
+            manifest, model_id, supervisor_device=state.device,
+        )
+    except CatalogError as exc:
+        # The catalog can change between get_manifest() and the sizing
+        # backfill. Preserve the same clean failure contract at both reads.
+        logger.error(
+            "capacity backfill for %r failed: catalog is unavailable: %s",
+            model_id, exc,
+        )
+        return _openai_error(
+            503,
+            "catalog_unavailable",
+            f"model catalog is temporarily unavailable: {exc}",
+            error_type="server_error",
+        )
 
     # 3. Queueing (spec 2026-07-08). ONE deadline covers the concurrency-gate
     # wait + the capacity wait + all retries. queue_timeout_seconds == 0
@@ -806,12 +1295,23 @@ async def _route_via_director(
             f"load of {model_id!r} failed",
             error_type="server_error",
         )
+    except asyncio.CancelledError:
+        # The off-loop callback releases any refcount acquired after this
+        # coroutine is cancelled. During normal client disconnects preserve
+        # cancellation semantics. During supervisor shutdown, Uvicorn sets
+        # stop_event before cancelling overdue handlers; return a clean 503
+        # so shutdown does not log an ASGI exception and emit a bare 500.
+        _release_slot()
+        stop_event = getattr(state, "stop_event", None)
+        is_set = getattr(stop_event, "is_set", None)
+        if callable(is_set) and is_set() is True:
+            return _openai_error(
+                503, "server_shutting_down",
+                "request cancelled because the server is shutting down",
+                error_type="server_error",
+            )
+        raise
     except BaseException:
-        # CancelledError (client disconnect / timeout mid capacity-wait): the
-        # gate slot was taken above; release it before propagating so a capped
-        # model's slot is not leaked. The director refcount, if the shielded
-        # acquire later succeeds, is released by _acquire_off_loop's own
-        # cancellation callback.
         _release_slot()
         raise
     queued_ms = (gate_wait_seconds + capacity_wait_seconds) * 1000.0
@@ -823,11 +1323,34 @@ async def _route_via_director(
     # raises). Both paths converge in `_forward_with_release`.
     target_url = f"http://127.0.0.1:{worker_port}/{full_path}"
     t0 = time.monotonic()
-    response = await _forward_with_release(
-        request, target_url, timeout,
-        director=state.director, model_id=model_id,
-        extra_release=_release_slot,
-    )
+    try:
+        response = await _forward_with_release(
+            request, target_url, timeout,
+            director=state.director, model_id=model_id,
+            extra_release=_release_slot,
+        )
+    except asyncio.CancelledError:
+        stop_event = getattr(state, "stop_event", None)
+        is_set = getattr(stop_event, "is_set", None)
+        if callable(is_set) and is_set() is True:
+            return _openai_error(
+                503, "server_shutting_down",
+                "request cancelled because the server is shutting down",
+                error_type="server_error",
+            )
+        raise
+    except httpx.TimeoutException:
+        return _openai_error(
+            504, "worker_timeout",
+            f"worker for model {model_id!r} timed out",
+            error_type="server_error",
+        )
+    except httpx.TransportError:
+        return _openai_error(
+            502, "worker_unavailable",
+            f"worker for model {model_id!r} is unavailable",
+            error_type="server_error",
+        )
     latency_ms = (time.monotonic() - t0) * 1000.0
     stream = isinstance(response, StreamingResponse)
     # Fire-and-forget: telemetry must NEVER break request forwarding, even
@@ -1060,21 +1583,20 @@ async def _forward_with_release(
     and never stranded. Its own exceptions are logged and swallowed so a gate
     hiccup can never break the refcount release or the response.
 
-    Buffered (non-stream) response: release runs after `aread()` and
-    before the Response is returned. The TestClient consumes the buffer
-    before its `client.post` call returns, so the release fires inside
-    the request lifecycle.
+    Small non-stream response: release runs after bounded raw prefetch and
+    before the Response is returned. Large non-stream responses transition
+    to the same relay lifecycle as SSE after a bounded in-memory prefix.
 
-    Streaming (SSE) response: release runs inside the relay generator's
-    `finally` clause. The clause executes only after the FastAPI runtime
-    finishes iterating (full body sent) or the iteration raises (worker
-    died, client disconnected). This matches the spec's "release on
-    stream-close" requirement: a release on first-chunk dispatch would
-    decrement refcount before the request actually finished, opening a
-    window where the model could be evicted mid-response.
+    Streaming response: release runs from one idempotent callback owned by
+    both the relay generator and the outer ASGI response lifecycle. It runs
+    after full iteration, iteration failure, or a downstream send failure
+    before iteration starts. This matches the spec's "release on stream-close"
+    requirement: a release on first-chunk dispatch would decrement refcount
+    before the request actually finished, opening a window where the model
+    could be evicted mid-response.
 
     Both paths also call director.release on the early-failure branches
-    (request-body read, stream-open raise, body-aread raise), so refcount
+    (request-body read, stream-open raise, response-prefetch raise), so refcount
     is never stranded.
     """
     def _fire_extra_release() -> None:
@@ -1108,18 +1630,21 @@ async def _forward_with_release(
             )
         _fire_extra_release()
         raise
-    excluded = {"host", "content-length", "transfer-encoding", "connection"}
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded}
-
-    client = httpx.AsyncClient(timeout=timeout)
-    stream_ctx = client.stream(
-        method=request.method,
-        url=target_url,
-        headers=fwd_headers,
-        content=body,
-        params=dict(request.query_params),
-    )
+    client = None
+    stream_ctx = None
     try:
+        fwd_headers = _proxy_headers(
+            request.headers,
+            exclude=frozenset({"host", "content-length"}),
+        )
+        client = httpx.AsyncClient(timeout=timeout)
+        stream_ctx = client.stream(
+            method=request.method,
+            url=target_url,
+            headers=fwd_headers,
+            content=body,
+            params=dict(request.query_params),
+        )
         response = await stream_ctx.__aenter__()
     except BaseException:
         # BaseException, not just Exception: a CancelledError here (the client
@@ -1148,22 +1673,54 @@ async def _forward_with_release(
                 model_id, exc_info=True,
             )
         _fire_extra_release()
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "AsyncClient.aclose() raised during stream-open cleanup",
+                    exc_info=True,
+                )
+        raise
+
+    content_type = str(response.headers.get("content-type", "") or "")
+    is_stream = "text/event-stream" in content_type.lower()
+
+    resp_headers = _proxy_headers(
+        response.headers,
+        exclude=frozenset({"content-length"}),
+    )
+
+    stream_cleanup_started = False
+
+    async def _cleanup_owned_stream() -> None:
+        """Release director/gate/HTTP ownership exactly once."""
+        nonlocal stream_cleanup_started
+        if stream_cleanup_started:
+            return
+        stream_cleanup_started = True
+        try:
+            director.release(model_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "director.release(%r) raised at stream-close",
+                model_id, exc_info=True,
+            )
+        _fire_extra_release()
+        try:
+            await stream_ctx.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "stream_ctx.__aexit__ raised at stream-close",
+                exc_info=True,
+            )
         try:
             await client.aclose()
         except Exception:  # noqa: BLE001
             logger.warning(
-                "AsyncClient.aclose() raised during stream-open cleanup",
+                "AsyncClient.aclose() raised at stream-close",
                 exc_info=True,
             )
-        raise
-
-    content_type = response.headers.get("content-type", "")
-    is_stream = "text/event-stream" in content_type
-
-    resp_headers = {
-        k: v for k, v in response.headers.items()
-        if k.lower() not in excluded
-    }
 
     if is_stream:
         async def relay():
@@ -1180,50 +1737,30 @@ async def _forward_with_release(
                 async for chunk in response.aiter_raw():
                     yield chunk
             finally:
-                try:
-                    director.release(model_id)
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "director.release(%r) raised at stream-close",
-                        model_id, exc_info=True,
-                    )
-                _fire_extra_release()
-                try:
-                    await stream_ctx.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "stream_ctx.__aexit__ raised at stream-close",
-                        exc_info=True,
-                    )
-                try:
-                    await client.aclose()
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "AsyncClient.aclose() raised at stream-close",
-                        exc_info=True,
-                    )
+                await _cleanup_owned_stream()
 
-        return StreamingResponse(
-            relay(),
-            status_code=response.status_code,
-            headers=resp_headers,
-            media_type=content_type,
+        return _install_response_headers(
+            _OwnedStreamingResponse(
+                relay(),
+                cleanup=_cleanup_owned_stream,
+                status_code=response.status_code,
+                media_type=content_type,
+            ),
+            resp_headers,
         )
 
-    # Non-streaming: read the buffered body, then release the director
-    # slot FIRST, then aexit the stream and aclose the client. The
-    # release-first order matches the stream-open-failure branch and
-    # the relay generator: no cleanup-cascading failure can strand the
-    # refcount. A failure in aread propagates after release runs in the
-    # finally chain.
+    # Preserve the buffered path for small bodies, but never let a worker
+    # response grow gateway memory without bound.  Once the bounded prefix
+    # crosses the cap, ownership of the open iterator/stream/client moves to
+    # the relay generator and release fires when downstream consumption ends.
     try:
-        content = await response.aread()
-    finally:
+        content, prefix, iterator = await _prefetch_worker_response(response)
+    except BaseException:
         try:
             director.release(model_id)
         except Exception:  # noqa: BLE001
             logger.warning(
-                "director.release(%r) raised during buffered-response cleanup",
+                "director.release(%r) raised during response-prefetch cleanup",
                 model_id, exc_info=True,
             )
         _fire_extra_release()
@@ -1231,30 +1768,78 @@ async def _forward_with_release(
             await stream_ctx.__aexit__(None, None, None)
         except Exception:  # noqa: BLE001
             logger.warning(
-                "stream_ctx.__aexit__ raised during buffered-response cleanup",
+                "stream_ctx.__aexit__ raised during response-prefetch cleanup",
                 exc_info=True,
             )
         try:
             await client.aclose()
         except Exception:  # noqa: BLE001
             logger.warning(
-                "AsyncClient.aclose() raised during buffered-response cleanup",
+                "AsyncClient.aclose() raised during response-prefetch cleanup",
                 exc_info=True,
             )
+        raise
 
-    return Response(
-        content=content,
-        status_code=response.status_code,
-        headers=resp_headers,
+    if content is None:
+        async def relay_large_response():
+            try:
+                for chunk in prefix:
+                    yield chunk
+                async for chunk in iterator:
+                    yield chunk
+            finally:
+                await _cleanup_owned_stream()
+
+        return _install_response_headers(
+            _OwnedStreamingResponse(
+                relay_large_response(),
+                cleanup=_cleanup_owned_stream,
+                status_code=response.status_code,
+                media_type=content_type,
+            ),
+            resp_headers,
+        )
+
+    # Small buffered response: release before fallible HTTP cleanup so a
+    # cleanup error can never strand the director refcount.
+    try:
+        director.release(model_id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "director.release(%r) raised during buffered-response cleanup",
+            model_id, exc_info=True,
+        )
+    _fire_extra_release()
+    try:
+        await stream_ctx.__aexit__(None, None, None)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "stream_ctx.__aexit__ raised during buffered-response cleanup",
+            exc_info=True,
+        )
+    try:
+        await client.aclose()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "AsyncClient.aclose() raised during buffered-response cleanup",
+            exc_info=True,
+        )
+
+    return _install_response_headers(
+        Response(
+            content=content,
+            status_code=response.status_code,
+        ),
+        resp_headers,
     )
 
 
 async def _forward(request: Request, target_url: str, timeout: float) -> Response:
     """Forward a request to target_url.
 
-    Detects streaming content-types (text/event-stream) and relays chunks
-    via StreamingResponse. Non-streaming responses are read fully and
-    returned in one go.
+    Relays SSE immediately. Other response bodies are prefetched only up to a
+    fixed memory ceiling: small bodies preserve the buffered Response shape,
+    while larger bodies continue through StreamingResponse.
 
     The httpx client and stream context are held open for the duration of
     a streaming response so chunks dispatch as they arrive from the worker
@@ -1262,33 +1847,64 @@ async def _forward(request: Request, target_url: str, timeout: float) -> Respons
     the audio/speech router's internal streaming.
     """
     body = await request.body()
-    excluded = {"host", "content-length", "transfer-encoding", "connection"}
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded}
+    fwd_headers = _proxy_headers(
+        request.headers,
+        exclude=frozenset({"host", "content-length"}),
+    )
 
     client = httpx.AsyncClient(timeout=timeout)
-    stream_ctx = client.stream(
-        method=request.method,
-        url=target_url,
-        headers=fwd_headers,
-        content=body,
-        params=dict(request.query_params),
-    )
+    stream_ctx = None
     try:
+        stream_ctx = client.stream(
+            method=request.method,
+            url=target_url,
+            headers=fwd_headers,
+            content=body,
+            params=dict(request.query_params),
+        )
         response = await stream_ctx.__aenter__()
-    except Exception:
+    except BaseException:
         # __aenter__ raised: stream_ctx is not entered, so __aexit__
         # is not appropriate. Close the client to release the
-        # underlying connection pool slot, then re-raise.
-        await client.aclose()
+        # underlying connection pool slot without masking the original.
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "AsyncClient.aclose() raised during direct stream-open cleanup",
+                exc_info=True,
+            )
         raise
 
-    content_type = response.headers.get("content-type", "")
-    is_stream = "text/event-stream" in content_type
+    content_type = str(response.headers.get("content-type", "") or "")
+    is_stream = "text/event-stream" in content_type.lower()
 
-    resp_headers = {
-        k: v for k, v in response.headers.items()
-        if k.lower() not in excluded
-    }
+    resp_headers = _proxy_headers(
+        response.headers,
+        exclude=frozenset({"content-length"}),
+    )
+
+    stream_cleanup_started = False
+
+    async def _cleanup_direct_stream() -> None:
+        nonlocal stream_cleanup_started
+        if stream_cleanup_started:
+            return
+        stream_cleanup_started = True
+        try:
+            await stream_ctx.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "stream_ctx.__aexit__ raised during direct stream cleanup",
+                exc_info=True,
+            )
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "AsyncClient.aclose() raised during direct stream cleanup",
+                exc_info=True,
+            )
 
     if is_stream:
         async def relay():
@@ -1296,25 +1912,78 @@ async def _forward(request: Request, target_url: str, timeout: float) -> Respons
                 async for chunk in response.aiter_raw():
                     yield chunk
             finally:
-                await stream_ctx.__aexit__(None, None, None)
-                await client.aclose()
+                await _cleanup_direct_stream()
 
-        return StreamingResponse(
-            relay(),
-            status_code=response.status_code,
-            headers=resp_headers,
-            media_type=content_type,
+        return _install_response_headers(
+            _OwnedStreamingResponse(
+                relay(),
+                cleanup=_cleanup_direct_stream,
+                status_code=response.status_code,
+                media_type=content_type,
+            ),
+            resp_headers,
         )
 
-    # Non-streaming: read once, close stream + client, return buffered.
+    # Buffer only a bounded prefix.  Large binary/non-SSE responses relay
+    # without forcing the gateway to hold the complete body in RAM.
     try:
-        content = await response.aread()
-    finally:
-        await stream_ctx.__aexit__(None, None, None)
-        await client.aclose()
+        content, prefix, iterator = await _prefetch_worker_response(response)
+    except BaseException:
+        try:
+            await stream_ctx.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "stream_ctx.__aexit__ raised during direct prefetch cleanup",
+                exc_info=True,
+            )
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "AsyncClient.aclose() raised during direct prefetch cleanup",
+                exc_info=True,
+            )
+        raise
 
-    return Response(
-        content=content,
-        status_code=response.status_code,
-        headers=resp_headers,
+    if content is None:
+        async def relay_large_response():
+            try:
+                for chunk in prefix:
+                    yield chunk
+                async for chunk in iterator:
+                    yield chunk
+            finally:
+                await _cleanup_direct_stream()
+
+        return _install_response_headers(
+            _OwnedStreamingResponse(
+                relay_large_response(),
+                cleanup=_cleanup_direct_stream,
+                status_code=response.status_code,
+                media_type=content_type,
+            ),
+            resp_headers,
+        )
+
+    try:
+        await stream_ctx.__aexit__(None, None, None)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "stream_ctx.__aexit__ raised during direct buffered cleanup",
+            exc_info=True,
+        )
+    try:
+        await client.aclose()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "AsyncClient.aclose() raised during direct buffered cleanup",
+            exc_info=True,
+        )
+
+    return _install_response_headers(
+        Response(
+            content=content,
+            status_code=response.status_code,
+        ),
+        resp_headers,
     )

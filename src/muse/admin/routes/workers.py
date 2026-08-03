@@ -12,11 +12,15 @@ yet (rare; the restart path may briefly pass through a process=None state).
 """
 from __future__ import annotations
 
+import signal
 import time
 
 from fastapi import APIRouter
 
-from muse.cli_impl.supervisor import get_supervisor_state
+from muse.cli_impl.supervisor import (
+    _signal_worker_process,
+    get_supervisor_state,
+)
 from muse.core.errors import error_response
 
 
@@ -30,7 +34,9 @@ def build_workers_router() -> APIRouter:
             now = time.monotonic()
             workers = []
             for spec in state.workers:
-                pid = getattr(spec.process, "pid", None) if spec.process else None
+                with spec.process_lock:
+                    process = spec.process
+                    pid = getattr(process, "pid", None) if process else None
                 uptime = (
                     max(0.0, now - spec.last_spawn_at)
                     if spec.last_spawn_at else None
@@ -54,26 +60,30 @@ def build_workers_router() -> APIRouter:
                 return error_response(
                     404, "worker_not_found", f"no worker on port {port}",
                 )
-            proc = spec.process
-            if proc is None:
-                return error_response(
-                    409, "worker_not_running",
-                    f"worker on port {port} is not currently running",
-                )
-            # Reset the restart budget. An operator's explicit restart
-            # is the documented escape hatch for a worker stuck at
-            # _MAX_RESTARTS=10; without this reset the auto-restart
-            # monitor would mark the worker dead on the very next
-            # failure even though the operator just re-armed it.
-            spec.restart_count = 0
-            spec.failure_count = 0
-            try:
-                proc.terminate()
-            except Exception as e:  # noqa: BLE001
-                return error_response(
-                    500, "terminate_failed",
-                    f"failed to SIGTERM worker on port {port}: {e}",
-                )
+            with spec.process_lock:
+                proc = spec.process
+                if proc is None:
+                    return error_response(
+                        409, "worker_not_running",
+                        f"worker on port {port} is not currently running",
+                    )
+                try:
+                    signalled = _signal_worker_process(proc, signal.SIGTERM)
+                except Exception as e:  # noqa: BLE001
+                    return error_response(
+                        500, "terminate_failed",
+                        f"failed to SIGTERM worker on port {port}: {e}",
+                    )
+                if not signalled:
+                    return error_response(
+                        409, "worker_not_running",
+                        f"worker on port {port} is not currently running",
+                    )
+                # Reset the restart budget only after the exact live process
+                # generation was signalled. This is the operator escape hatch
+                # for a worker that exhausted the automatic restart budget.
+                spec.restart_count = 0
+                spec.failure_count = 0
         return {
             "port": port,
             "signal": "SIGTERM",

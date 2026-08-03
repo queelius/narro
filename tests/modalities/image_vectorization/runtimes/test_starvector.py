@@ -87,7 +87,7 @@ def test_constructor_uses_local_data_without_remote_code():
     assert "trust_remote_code" not in tokenizer_kwargs
     model_kwargs = model_factory.from_pretrained.call_args.kwargs
     assert model_kwargs["local_files_only"] is True
-    assert model_kwargs["low_cpu_mem_usage"] is True
+    assert model_kwargs["low_cpu_mem_usage"] is False
     assert "trust_remote_code" not in model_kwargs
     model.to.assert_called_once_with("cpu")
 

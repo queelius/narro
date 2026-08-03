@@ -24,6 +24,7 @@ MANIFEST = {
     "model_id": "soprano-80m",
     "modality": "audio/speech",
     "hf_repo": "ekwek/Soprano-1.1-80M",
+    "revision": "27b5a5f5f541a1db3a51d6fd1b0fc7147b92cd01",
     "description": "Qwen3 LLM backbone + Vocos decoder, 32kHz, 80M params",
     "license": "Apache 2.0",
     # Soprano delegates to muse.modalities.audio_speech.tts.Narro which

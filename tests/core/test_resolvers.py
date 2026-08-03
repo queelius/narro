@@ -170,3 +170,26 @@ def test_resolve_base_override_none_is_harmless_for_plain_resolver():
     register_resolver(_FakeResolver())
     rm = resolve("fake://a/b")
     assert rm.manifest["model_id"] == "fake-model"
+
+
+def test_resolve_rejects_reviewed_revision_when_resolver_cannot_accept_it():
+    register_resolver(_FakeResolver())
+
+    with pytest.raises(ResolverError, match="does not accept.*revision"):
+        resolve("fake://a/b", revision="1" * 40)
+
+
+def test_resolve_forwards_reviewed_revision_to_opted_in_resolver():
+    class _RevisionAwareResolver(_FakeResolver):
+        scheme = "revisioned"
+
+        def resolve(self, uri, *, revision=None):
+            result = super().resolve(uri)
+            result.manifest["revision"] = revision
+            return result
+
+    register_resolver(_RevisionAwareResolver())
+
+    result = resolve("revisioned://a/b", revision="1" * 40)
+
+    assert result.manifest["revision"] == "1" * 40

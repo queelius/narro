@@ -22,12 +22,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from muse.cli_impl.idle_sweeper import IdleSweeper
-from muse.cli_impl.load_director import LoadDirector
+from muse.cli_impl.load_director import LoadDirector, LoadEntry
 from muse.cli_impl.supervisor import (
     SupervisorState,
+    WorkerSpec,
     clear_supervisor_state,
     get_supervisor_state,
     set_supervisor_state,
+    spawn_worker,
     validate_catalog_at_boot,
 )
 
@@ -37,6 +39,19 @@ def _reset_supervisor_state():
     clear_supervisor_state()
     yield
     clear_supervisor_state()
+
+
+@pytest.fixture(autouse=True)
+def _mock_resource_registry(monkeypatch):
+    """Keep supervisor unit tests off the host process registry."""
+    monkeypatch.setattr(
+        "muse.cli_impl.supervisor.register_process",
+        lambda **kwargs: f"test-resource-{kwargs['pid']}",
+    )
+    monkeypatch.setattr(
+        "muse.cli_impl.supervisor.unregister_process",
+        lambda resource_id: bool(resource_id),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -71,11 +86,112 @@ def tmp_catalog(tmp_path, monkeypatch):
 
 
 def _seed_catalog(data: dict) -> None:
-    from muse.core.catalog import _catalog_path, _reset_known_models_cache
-    p = _catalog_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data))
+    from muse.core.catalog import _reset_known_models_cache, _write_catalog
+    normalized: dict = {}
+    for model_id, raw_entry in data.items():
+        entry = dict(raw_entry)
+        raw_manifest = entry.get("manifest")
+        if isinstance(raw_manifest, dict):
+            manifest = dict(raw_manifest)
+            manifest.setdefault("model_id", model_id)
+            manifest.setdefault("modality", "embedding/text")
+            manifest.setdefault("hf_repo", entry.get("hf_repo", "test/model"))
+            manifest.setdefault("backend_path", "muse.core.runtime:TestBackend")
+            entry["manifest"] = manifest
+        normalized[model_id] = entry
+    _write_catalog(normalized)
     _reset_known_models_cache()
+
+
+class TestWorkerResourceRegistration:
+    def test_replacement_registers_new_identity_before_retiring_old(self):
+        spec = WorkerSpec(
+            models=["demo"], python_path="/mock/python", port=9001,
+            resource_id="old-resource",
+        )
+        process = MagicMock(pid=4242)
+        events: list[tuple] = []
+
+        with patch(
+            "muse.cli_impl.supervisor.subprocess.Popen", return_value=process,
+        ), patch(
+            "muse.cli_impl.supervisor.os.getpid", return_value=31337,
+        ), patch(
+            "muse.cli_impl.supervisor.register_process",
+            side_effect=lambda **kwargs: events.append(("register", kwargs)) or "new-resource",
+        ), patch(
+            "muse.cli_impl.supervisor.unregister_process",
+            side_effect=lambda resource_id: events.append(("unregister", resource_id)),
+        ):
+            spawn_worker(spec, device="cpu")
+
+        assert spec.process is process
+        assert spec.resource_id == "new-resource"
+        assert [event[0] for event in events] == ["register", "unregister"]
+        assert events[1] == ("unregister", "old-resource")
+
+    def test_registration_failure_rolls_back_and_keeps_superseded_record(self):
+        from muse.core.resource_registry import ResourceRegistryError
+
+        spec = WorkerSpec(
+            models=["demo"], python_path="/mock/python", port=9001,
+            resource_id="old-resource",
+        )
+        process = MagicMock(pid=4242)
+
+        def rollback(specs):
+            assert specs == [spec]
+            spec.process = None
+
+        with patch(
+            "muse.cli_impl.supervisor.subprocess.Popen", return_value=process,
+        ), patch(
+            "muse.cli_impl.supervisor.os.getpid", return_value=31337,
+        ), patch(
+            "muse.cli_impl.supervisor.register_process",
+            side_effect=ResourceRegistryError("disk unavailable"),
+        ), patch(
+            "muse.cli_impl.supervisor.unregister_process",
+        ) as unregister, patch(
+            "muse.cli_impl.supervisor._shutdown_workers",
+            side_effect=rollback,
+        ) as shutdown:
+            with pytest.raises(ResourceRegistryError, match="rolled back"):
+                spawn_worker(spec, device="cpu")
+
+        shutdown.assert_called_once_with([spec])
+        assert spec.process is None
+        assert spec.resource_id == "old-resource"
+        unregister.assert_not_called()
+
+    def test_shutdown_fails_closed_if_process_identity_changes(self):
+        from muse.cli_impl.supervisor import _shutdown_workers
+
+        spec = WorkerSpec(
+            models=["demo"], python_path="/mock/python", port=9001,
+            resource_id="old-resource",
+        )
+        old_process = MagicMock(pid=4242)
+        replacement = MagicMock(pid=4343)
+        spec.process = old_process
+
+        def replace_during_observation(*_args):
+            spec.process = replacement
+            spec.resource_id = "new-resource"
+            return None
+
+        with patch(
+            "muse.cli_impl.supervisor._worker_process_state_locked",
+            side_effect=replace_during_observation,
+        ), patch(
+            "muse.cli_impl.supervisor.unregister_process",
+        ) as unregister:
+            result = _shutdown_workers([spec], grace=0.0)
+
+        unregister.assert_not_called()
+        assert spec.process is replacement
+        assert spec.resource_id == "new-resource"
+        assert result.retained == (spec,)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +231,21 @@ class TestSupervisorStateLazyFields:
 
 
 class TestValidateCatalogAtBoot:
+    def test_available_pools_preserves_pair_contract_with_budgets(self):
+        from muse.cli_impl.supervisor import _available_pools
+
+        probe = MagicMock()
+        probe.cpu_free_gb.return_value = 16.0
+        probe.gpu_free_gb.return_value = None
+
+        assert _available_pools(
+            probe,
+            gpu_budget_gb=8.0,
+            cpu_budget_gb=12.0,
+            gpu_headroom_gb=1.0,
+            cpu_headroom_gb=2.0,
+        ) == (10.0, 7.0)
+
     def test_flags_model_with_no_memory_data(self, tmp_catalog):
         """Enabled model with no memory_gb annotation and no measurements
         is flagged as unservable with the probe-prompt message.
@@ -365,6 +496,140 @@ class TestValidateCatalogAtBoot:
         validate_catalog_at_boot(state, memory_probe=probe)
         assert "gpu-model" in state.unservable_reasons
 
+    def test_gpu_budget_is_fallback_when_pynvml_unavailable(self, tmp_catalog):
+        _seed_catalog({
+            "gpu-model": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {
+                    "capabilities": {"memory_gb": 6.0, "device": "cuda"},
+                },
+            },
+        })
+        state = SupervisorState()
+        probe = MagicMock()
+        probe.gpu_free_gb.return_value = None
+        probe.cpu_free_gb.return_value = 32.0
+
+        validate_catalog_at_boot(
+            state,
+            memory_probe=probe,
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+        )
+
+        assert "gpu-model" not in state.unservable_reasons
+
+    def test_rocm_like_auto_model_uses_gpu_budget(self, tmp_catalog):
+        _seed_catalog({
+            "rocm-model": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {
+                    "capabilities": {"memory_gb": 6.0, "device": "auto"},
+                },
+            },
+        })
+
+        class RocmProbe:
+            def gpu_free_gb(self):
+                return None
+
+            def cpu_free_gb(self):
+                return 2.0
+
+            def cuda_available(self):
+                return True
+
+        state = SupervisorState()
+        validate_catalog_at_boot(
+            state,
+            memory_probe=RocmProbe(),
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+            cpu_headroom_gb=0.0,
+        )
+
+        # It fits the static GPU pool but not the deliberately tiny CPU pool.
+        assert "rocm-model" not in state.unservable_reasons
+
+    def test_transient_nvidia_pressure_does_not_create_hard_stamp(self, tmp_catalog):
+        _seed_catalog({
+            "nvidia-model": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {
+                    "capabilities": {"memory_gb": 5.5, "device": "auto"},
+                },
+            },
+        })
+        state = SupervisorState()
+
+        class NvidiaProbe:
+            def gpu_free_gb(self):
+                return 2.0
+
+            def gpu_total_gb(self):
+                return 12.0
+
+            def cpu_free_gb(self):
+                return 64.0
+
+            def cpu_total_gb(self):
+                return 64.0
+
+            def cuda_available(self):
+                return True
+
+        validate_catalog_at_boot(
+            state,
+            memory_probe=NvidiaProbe(),
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+        )
+
+        # Hard capacity is min(12 GiB physical, 8 GiB budget) - 1 GiB
+        # headroom = 7 GiB. The current 2 GiB free is a director concern:
+        # Muse can evict its own workers before loading this 5.5 GiB model.
+        assert "nvidia-model" not in state.unservable_reasons
+
+    def test_physical_gpu_ceiling_still_hard_stamps_oversized_model(
+        self, tmp_catalog,
+    ):
+        _seed_catalog({
+            "too-large": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {
+                    "capabilities": {"memory_gb": 12.0, "device": "cuda"},
+                },
+            },
+        })
+
+        class NvidiaProbe:
+            def gpu_free_gb(self):
+                return 7.0
+
+            def gpu_total_gb(self):
+                return 8.0
+
+            def cpu_free_gb(self):
+                return 64.0
+
+            def cpu_total_gb(self):
+                return 64.0
+
+            def cuda_available(self):
+                return True
+
+        state = SupervisorState()
+        validate_catalog_at_boot(
+            state, memory_probe=NvidiaProbe(), gpu_headroom_gb=1.0,
+        )
+
+        reason = state.unservable_reasons["too-large"]
+        assert "12.0 GB > 7.0 GB capacity on cuda" in reason
+
 
 # ---------------------------------------------------------------------------
 # Regression: a corrupt catalog.json (no last-known-good cache) must not
@@ -440,6 +705,186 @@ class TestValidateCatalogAtBootCorruptCatalog:
 
 
 class TestRunSupervisorLazyBoot:
+    def test_strict_config_validation_precedes_every_owner_creation(self):
+        import muse.cli_impl.supervisor as supervisor
+        from muse.core.config import ConfigError
+
+        with patch.object(
+            supervisor.config,
+            "validated_config",
+            side_effect=ConfigError("invalid supervisor config"),
+        ) as validate, patch.object(
+            supervisor, "SupervisorState",
+        ) as state_cls, patch.object(
+            supervisor, "set_supervisor_state",
+        ) as set_state, patch(
+            "muse.admin.jobs.reset_default_store",
+        ) as reset_store, patch(
+            "muse.admin.jobs.get_default_store",
+        ) as get_store, patch.object(
+            supervisor.threading, "Thread",
+        ) as thread_cls, patch.object(
+            supervisor, "IdleSweeper",
+        ) as sweeper_cls, patch.object(
+            supervisor, "register_process",
+        ) as register:
+            with pytest.raises(ConfigError, match="invalid supervisor config"):
+                supervisor.run_supervisor(
+                    host="127.0.0.1", port=8000, device="cpu",
+                )
+
+        validate.assert_called_once_with()
+        state_cls.assert_not_called()
+        set_state.assert_not_called()
+        reset_store.assert_not_called()
+        get_store.assert_not_called()
+        thread_cls.assert_not_called()
+        sweeper_cls.assert_not_called()
+        register.assert_not_called()
+
+    def test_incomplete_worker_cleanup_returns_one_and_retains_ownership(self):
+        import muse.cli_impl.supervisor as supervisor
+        from muse.cli_impl.supervisor import WorkerShutdownResult
+
+        retained_worker = WorkerSpec(
+            models=["x"], python_path="/p", port=9001, status="running",
+        )
+        director = MagicMock(
+            gpu_budget_gb=None,
+            cpu_budget_gb=8.0,
+            gpu_headroom_gb=0.0,
+            cpu_headroom_gb=0.0,
+        )
+        monitor_thread = MagicMock(name="monitor_thread")
+        monitor_thread.is_alive.return_value = False
+        sweeper_thread = MagicMock(name="sweeper_thread")
+        sweeper_thread.is_alive.return_value = False
+        sweeper = MagicMock(name="sweeper")
+        sweeper.start.return_value = sweeper_thread
+        job_store = MagicMock(name="job_store")
+        job_store.shutdown.return_value = True
+        captured_state = None
+
+        def interrupt_gateway(*_args, **_kwargs):
+            nonlocal captured_state
+            captured_state = supervisor.get_supervisor_state()
+            captured_state.workers.append(retained_worker)
+            raise KeyboardInterrupt()
+
+        with patch.object(
+            supervisor.config, "validated_config",
+        ), patch.object(
+            supervisor.config,
+            "get",
+            side_effect=lambda key: False if key == "telemetry.enabled" else None,
+        ), patch(
+            "muse.admin.jobs.reset_default_store",
+        ), patch(
+            "muse.admin.jobs.get_default_store", return_value=job_store,
+        ), patch(
+            "muse.cli_impl.gateway.build_gateway", return_value=MagicMock(),
+        ), patch.object(
+            supervisor, "_build_load_director", return_value=director,
+        ), patch.object(
+            supervisor, "validate_catalog_at_boot",
+        ), patch.object(
+            supervisor.threading, "Thread", return_value=monitor_thread,
+        ), patch.object(
+            supervisor, "IdleSweeper", return_value=sweeper,
+        ), patch.object(
+            supervisor, "register_process", return_value="supervisor-resource",
+        ), patch.object(
+            supervisor.os, "getpid", return_value=4242,
+        ), patch.object(
+            supervisor.os, "getppid", return_value=31337,
+        ), patch.object(
+            supervisor, "unregister_process",
+        ) as unregister, patch.object(
+            supervisor, "run_uvicorn", side_effect=interrupt_gateway,
+        ), patch.object(
+            supervisor, "_shutdown_telemetry", return_value=True,
+        ), patch.object(
+            supervisor,
+            "_shutdown_workers",
+            return_value=WorkerShutdownResult((), (retained_worker,)),
+        ) as shutdown_workers, patch.object(
+            supervisor, "clear_supervisor_state",
+            wraps=supervisor.clear_supervisor_state,
+        ) as clear_state:
+            result = supervisor.run_supervisor(
+                host="127.0.0.1", port=8000, device="cpu",
+            )
+
+        assert result == 1
+        assert captured_state is not None
+        assert supervisor.get_supervisor_state() is captured_state
+        assert captured_state.supervisor_resource_id == "supervisor-resource"
+        shutdown_workers.assert_called_once_with(captured_state.workers)
+        unregister.assert_not_called()
+        clear_state.assert_not_called()
+
+    def test_supervisor_record_tracks_foreground_parent_and_is_unregistered(
+        self, tmp_catalog,
+    ):
+        _seed_catalog({})
+        from muse.cli_impl.supervisor import run_supervisor
+
+        with patch(
+            "muse.cli_impl.supervisor.register_process",
+            return_value="supervisor-resource",
+        ) as register, patch(
+            "muse.cli_impl.supervisor.unregister_process",
+        ) as unregister, patch(
+            "muse.cli_impl.supervisor.os.getpid", return_value=4242,
+        ), patch(
+            "muse.cli_impl.supervisor.os.getppid", return_value=31337,
+        ), patch(
+            "muse.cli_impl.supervisor.threading.Thread",
+        ), patch(
+            "muse.cli_impl.supervisor.run_uvicorn",
+            side_effect=KeyboardInterrupt(),
+        ), patch(
+            "muse.cli_impl.supervisor._shutdown_workers",
+        ):
+            assert run_supervisor(
+                host="127.0.0.1", port=8000, device="cpu",
+            ) == 0
+
+        register.assert_called_once_with(
+            kind="supervisor",
+            pid=4242,
+            owner_pid=31337,
+            port=8000,
+        )
+        unregister.assert_called_once_with("supervisor-resource")
+
+    def test_supervisor_registration_failure_prevents_gateway_start(
+        self, tmp_catalog,
+    ):
+        from muse.core.resource_registry import ResourceRegistryError
+        from muse.cli_impl.supervisor import run_supervisor
+
+        _seed_catalog({})
+        with patch(
+            "muse.cli_impl.supervisor.register_process",
+            side_effect=ResourceRegistryError("registry unavailable"),
+        ), patch(
+            "muse.cli_impl.supervisor.threading.Thread",
+        ), patch(
+            "muse.cli_impl.supervisor.run_uvicorn",
+        ) as run_uvicorn, patch(
+            "muse.cli_impl.supervisor._shutdown_workers",
+        ):
+            with pytest.raises(
+                ResourceRegistryError, match="cannot start an untracked",
+            ):
+                run_supervisor(
+                    host="127.0.0.1", port=8000, device="cpu",
+                )
+
+        run_uvicorn.assert_not_called()
+        assert get_supervisor_state().director is None
+
     def test_run_supervisor_does_not_spawn_workers_eagerly(self, tmp_catalog):
         """The lazy supervisor must NOT call spawn_worker at boot time,
         even with one or more enabled models in the catalog.
@@ -688,7 +1133,9 @@ class TestMonitorSkipsInFlightSpecs:
             other = WorkerSpec(
                 models=["y"], python_path="/p2", port=9002, device="cpu",
             )
-            other.process = MagicMock(poll=MagicMock(return_value=None))
+            other.process = MagicMock(
+                pid=12345, poll=MagicMock(return_value=None),
+            )
             other.status = "running"
             _monitor_workers(
                 [spec, other], stop_event,
@@ -1285,6 +1732,39 @@ class TestHasMemoryData:
         assert gb == 14.0
         assert device == "cuda"  # NOT overwritten to 'cpu' by the recovery loop
 
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"manifest": {"capabilities": {"memory_gb": -1}}},
+            {"manifest": {"capabilities": {"memory_gb": "bad"}}},
+            {"manifest": {"capabilities": {"memory_gb": float("nan")}}},
+            {"manifest": {"capabilities": []}},
+            {"manifest": [], "measurements": []},
+            {"measurements": {"auto": []}},
+        ],
+    )
+    def test_malformed_capacity_data_is_unsizable_not_an_exception(self, entry):
+        from muse.cli_impl.supervisor import _has_memory_data
+
+        has, gb, device = _has_memory_data(entry)
+
+        assert has is False
+        assert gb == 0.0
+        assert device == "auto"
+
+    def test_invalid_declared_memory_has_actionable_reason(self):
+        from muse.cli_impl.supervisor import _servability_reason
+
+        reason = _servability_reason(
+            {"manifest": {"capabilities": {"memory_gb": float("inf")}}},
+            cpu_available_gb=64.0,
+            gpu_available_gb=None,
+        )
+
+        assert reason is not None
+        assert "invalid memory estimate" in reason
+        assert "finite non-negative" in reason
+
 
 class TestServabilityAutoDevice:
     """v0.48.0: a resolver-pulled model declaring device='auto' must be
@@ -1324,6 +1804,50 @@ class TestServabilityAutoDevice:
             entry, cpu_available_gb=500.0, gpu_available_gb=None
         )
         assert reason is None
+
+    def test_explicit_supervisor_cpu_overrides_manifest_auto(self):
+        from muse.cli_impl.supervisor import _servability_reason
+
+        entry = {
+            "manifest": {"capabilities": {"device": "auto", "memory_gb": 6.0}},
+        }
+        reason = _servability_reason(
+            entry,
+            cpu_available_gb=4.0,
+            gpu_available_gb=100.0,
+            supervisor_device="cpu",
+        )
+        assert reason is not None
+        assert "6.0 GB > 4.0 GB capacity on cpu" in reason
+
+    def test_manifest_pin_beats_explicit_supervisor_device(self):
+        from muse.cli_impl.supervisor import _servability_reason
+
+        entry = {
+            "manifest": {"capabilities": {"device": "cuda", "memory_gb": 6.0}},
+        }
+        assert _servability_reason(
+            entry,
+            cpu_available_gb=1.0,
+            gpu_available_gb=8.0,
+            supervisor_device="cpu",
+        ) is None
+
+    def test_catalog_override_beats_manifest_and_supervisor(self):
+        from muse.cli_impl.supervisor import _servability_reason
+
+        entry = {
+            "device_override": "cpu",
+            "manifest": {"capabilities": {"device": "cuda", "memory_gb": 6.0}},
+        }
+        reason = _servability_reason(
+            entry,
+            cpu_available_gb=4.0,
+            gpu_available_gb=100.0,
+            supervisor_device="cuda",
+        )
+        assert reason is not None
+        assert "capacity on cpu" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -1507,6 +2031,42 @@ class TestRevalidateServability:
         assert "exceeds device capacity" in reason
         assert "gpu-model" in state.unservable_reasons
 
+    def test_uses_director_gpu_budget_when_pynvml_is_unavailable(self, tmp_catalog):
+        """Gateway revalidation passes headroom but historically omitted
+        budgets; recover the budget from state.director so its gate and the
+        following admission decision agree.
+        """
+        from muse.cli_impl.supervisor import revalidate_servability
+
+        _seed_catalog({
+            "gpu-model": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {
+                    "capabilities": {"device": "cuda", "memory_gb": 8.0},
+                },
+            },
+        })
+        probe = self._capacity_probe(gpu_free=None)
+        state = SupervisorState()
+        state.director = LoadDirector(
+            enable_fn=MagicMock(),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+            gpu_budget_gb=10.0,
+            gpu_headroom_gb=1.0,
+        )
+        state.unservable_reasons["gpu-model"] = (
+            "exceeds device capacity (no GPU info available; ...)"
+        )
+
+        reason = revalidate_servability(
+            state, "gpu-model", memory_probe=probe,
+        )
+
+        assert reason is None
+        assert "gpu-model" not in state.unservable_reasons
+
     def test_clears_capacity_stamp_when_memory_now_available(self, tmp_catalog):
         """The live re-check uses LIVE free memory, not the stale boot
         snapshot: a model stamped at boot (when free was low) is cleared once
@@ -1537,6 +2097,58 @@ class TestRevalidateServability:
 
         assert reason is None
         assert "fits-now" not in state.unservable_reasons
+
+    def test_clears_hard_stamp_while_reclaimable_worker_uses_free_memory(
+        self, tmp_catalog,
+    ):
+        """Low current free RAM is transient when the model fits the host.
+
+        The gateway must let the director evict or wait for a Muse-owned
+        worker instead of retaining a permanent ``model_unservable`` stamp.
+        """
+        from muse.cli_impl.supervisor import revalidate_servability
+
+        _seed_catalog({
+            "fits-empty-pool": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {
+                    "capabilities": {"device": "cpu", "memory_gb": 6.0},
+                },
+            },
+        })
+
+        class BusyHostProbe:
+            def cpu_free_gb(self):
+                return 2.0
+
+            def cpu_total_gb(self):
+                return 16.0
+
+            def gpu_free_gb(self):
+                return None
+
+        probe = BusyHostProbe()
+        state = SupervisorState()
+        state.director = LoadDirector(
+            enable_fn=MagicMock(), disable_fn=MagicMock(),
+            memory_probe=probe, cpu_headroom_gb=2.0,
+        )
+        now = 1.0
+        state.director.loaded["resident"] = LoadEntry(
+            model_id="resident", worker_port=9001, memory_gb=8.0,
+            refcount=0, last_touched_at=now, loaded_at=now, pool="cpu",
+        )
+        state.unservable_reasons["fits-empty-pool"] = (
+            "exceeds device capacity (stale transient-free stamp)"
+        )
+
+        reason = revalidate_servability(
+            state, "fits-empty-pool", memory_probe=probe,
+        )
+
+        assert reason is None
+        assert "fits-empty-pool" not in state.unservable_reasons
 
 
 # ---------------------------------------------------------------------------
@@ -1694,6 +2306,49 @@ class TestBackfillManifestMemory:
 
         assert out["capabilities"]["device"] == "cuda"
 
+    def test_supervisor_device_replaces_manifest_auto(self, tmp_catalog):
+        from muse.cli_impl.supervisor import backfill_manifest_memory
+
+        _seed_catalog({
+            "auto-model": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {"capabilities": {"device": "auto"}},
+            },
+        })
+        manifest = {
+            "model_id": "auto-model",
+            "capabilities": {"device": "auto", "memory_gb": 2.0},
+        }
+
+        out = backfill_manifest_memory(
+            manifest, "auto-model", supervisor_device="cpu",
+        )
+
+        assert out["capabilities"]["device"] == "cpu"
+        assert manifest["capabilities"]["device"] == "auto"
+
+    def test_manifest_pin_beats_supervisor_device_during_backfill(self, tmp_catalog):
+        from muse.cli_impl.supervisor import backfill_manifest_memory
+
+        _seed_catalog({
+            "pinned-manifest": {
+                "python_path": "/v/bin/python",
+                "enabled": True,
+                "manifest": {"capabilities": {"device": "cuda"}},
+            },
+        })
+        manifest = {
+            "model_id": "pinned-manifest",
+            "capabilities": {"device": "cuda", "memory_gb": 2.0},
+        }
+
+        out = backfill_manifest_memory(
+            manifest, "pinned-manifest", supervisor_device="cpu",
+        )
+
+        assert out["capabilities"]["device"] == "cuda"
+
 
 # ---------------------------------------------------------------------------
 # Task 7 (LoRA adapter support): backfill_manifest_memory chases the base
@@ -1707,8 +2362,8 @@ class TestBackfillManifestMemory:
 
 class TestBackfillLoraChase:
     def _write(self, tmp_path, entries):
-        import json
-        (tmp_path / "catalog.json").write_text(json.dumps(entries))
+        from muse.core.catalog import _write_catalog
+        _write_catalog(entries)
 
     def _lora_manifest(self, base="sdxl-turbo"):
         return {

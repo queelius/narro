@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,9 +29,26 @@ from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
+_HF_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+
 
 class ResolverError(Exception):
     """Raised when resolution or dispatch fails."""
+
+
+def hf_commit_revision(info: Any) -> str | None:
+    """Return an immutable Hugging Face commit from repo metadata.
+
+    Modality plugins are also exercised directly by their unit tests and by
+    third-party discovery tooling, where synthetic metadata may omit ``sha``.
+    The central :class:`HFResolver` rejects that case for real resolutions;
+    plugins use this helper to propagate a valid commit without treating an
+    absent synthetic field as a mutable revision.
+    """
+    revision = getattr(info, "sha", None)
+    if not isinstance(revision, str) or _HF_COMMIT_RE.fullmatch(revision) is None:
+        return None
+    return revision
 
 
 @dataclass
@@ -48,10 +66,14 @@ class ResolvedModel:
         path to the downloaded weights. Called during `pull`. Allows
         each resolver to control download semantics (snapshot_download,
         single-file download, etc.).
+      - artifact_provenance: complete immutable repository receipt for every
+        artifact consumed by the download callable. HFResolver validates and
+        fills the primary artifact centrally.
     """
     manifest: dict
     backend_path: str
     download: Callable[[Path], Path]
+    artifact_provenance: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -151,11 +173,30 @@ def _accepts_kwarg(method: Callable, name: str) -> bool:
     return False
 
 
+def _forward_reviewed_revision(
+    method: Callable,
+    revision: str | None,
+    kwargs: dict[str, Any],
+    *,
+    uri: str,
+) -> None:
+    """Forward a reviewed pin or fail before a resolver can ignore it."""
+    if revision is None:
+        return
+    if not _accepts_kwarg(method, "revision"):
+        raise ResolverError(
+            f"resolver for {uri!r} does not accept the reviewed immutable "
+            "revision; refusing a mutable resolution"
+        )
+    kwargs["revision"] = revision
+
+
 def resolve(
     uri: str,
     *,
     modality: str | None = None,
     base_override: str | None = None,
+    revision: str | None = None,
 ) -> ResolvedModel:
     """Resolve a URI through the matching resolver.
 
@@ -179,15 +220,21 @@ def resolve(
     defaults (e.g. turbo step/guidance counts) for the LoRA plugin
     without touching any of the other resolvers.
 
+    `revision` is an immutable repository commit selected by a curated
+    entry. It must be accepted by the selected resolver; silently dropping a
+    reviewed pin would turn a curated pull back into a mutable download.
+
     Raises ResolverError if no resolver matches the scheme, or if
     `modality` is set and no plugin claims that modality.
     """
     resolver = get_resolver(uri)
     if modality is None:
         method = resolver.resolve
+        kwargs: dict[str, Any] = {}
         if base_override is not None and _accepts_kwarg(method, "base_override"):
-            return method(uri, base_override=base_override)
-        return method(uri)
+            kwargs["base_override"] = base_override
+        _forward_reviewed_revision(method, revision, kwargs, uri=uri)
+        return method(uri, **kwargs)
     method = getattr(resolver, "resolve_via_modality", None)
     if not callable(method):
         # Resolver doesn't support modality override; warn and fall
@@ -198,12 +245,16 @@ def resolve(
             "falling back to sniff dispatch", uri,
         )
         plain = resolver.resolve
+        kwargs = {}
         if base_override is not None and _accepts_kwarg(plain, "base_override"):
-            return plain(uri, base_override=base_override)
-        return plain(uri)
+            kwargs["base_override"] = base_override
+        _forward_reviewed_revision(plain, revision, kwargs, uri=uri)
+        return plain(uri, **kwargs)
+    kwargs = {}
     if base_override is not None and _accepts_kwarg(method, "base_override"):
-        return method(uri, modality, base_override=base_override)
-    return method(uri, modality)
+        kwargs["base_override"] = base_override
+    _forward_reviewed_revision(method, revision, kwargs, uri=uri)
+    return method(uri, modality, **kwargs)
 
 
 def search(query: str, *, backend: str | None = None, **filters: Any) -> Iterable[SearchResult]:

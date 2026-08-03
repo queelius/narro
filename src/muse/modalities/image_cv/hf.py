@@ -34,7 +34,7 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _DEPTH_RUNTIME = (
@@ -108,6 +108,7 @@ def _sniff(info) -> bool:
 
 
 def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
+    revision = hf_commit_revision(info)
     # Per-primitive dispatch. _is_depth / _is_keypoint /
     # _is_object_detection each OR a canonical tag check with a
     # repo-name-hint fallback: a matching tag short-circuits to True;
@@ -156,6 +157,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         siblings = [s.rfilename for s in getattr(info, "siblings", [])]
@@ -175,6 +178,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             repo_id=repo_id,
             allow_patterns=allow_patterns,
             cache_dir=str(cache_root) if cache_root else None,
+            revision=revision,
         ))
 
     return ResolvedModel(

@@ -57,6 +57,7 @@ MANIFEST = {
     "model_id": "stable-diffusion-x4-upscaler",
     "modality": "image/upscale",
     "hf_repo": "stabilityai/stable-diffusion-x4-upscaler",
+    "revision": "572c99286543a273bfd17fac263db5a77be12c4c",
     "description": (
         "SD x4 upscaler: 4x super-resolution via latent diffusion, Apache 2.0"
     ),

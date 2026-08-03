@@ -63,6 +63,88 @@ def test_bad_env_warns_and_defaults(tmp_path, monkeypatch, caplog):
     assert any("MUSE_RERANK_MAX_DOCUMENTS" in r.message for r in caplog.records)
 
 
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+def test_non_finite_env_warns_and_defaults(
+    tmp_path, monkeypatch, caplog, raw,
+):
+    monkeypatch.setenv("MUSE_FEDERATION_REFRESH_INTERVAL_SECONDS", raw)
+    c = _cfg(tmp_path)
+    with caplog.at_level("WARNING"):
+        assert c.get("federation.refresh_interval_seconds") == 3.0
+    assert any("must be finite" in r.message for r in caplog.records)
+
+
+def test_out_of_domain_env_warns_and_defaults(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("MUSE_FEDERATION_REFRESH_INTERVAL_SECONDS", "0")
+    c = _cfg(tmp_path)
+    with caplog.at_level("WARNING"):
+        assert c.get("federation.refresh_interval_seconds") == 3.0
+    assert any("must be > 0" in r.message for r in caplog.records)
+
+
+def test_max_request_body_env_is_validated(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("MUSE_MAX_REQUEST_BODY_MB", "32")
+    c = _cfg(tmp_path)
+    assert c.get("server.max_request_body_mb") == 32
+
+    monkeypatch.setenv("MUSE_MAX_REQUEST_BODY_MB", "0")
+    with caplog.at_level("WARNING"):
+        assert c.get("server.max_request_body_mb") == 64
+    assert any("MUSE_MAX_REQUEST_BODY_MB" in r.message for r in caplog.records)
+
+
+def test_out_of_domain_file_warns_and_defaults(tmp_path, caplog):
+    c = _cfg(tmp_path, "telemetry:\n  sample_interval_seconds: -1\n")
+    with caplog.at_level("WARNING"):
+        assert c.get("telemetry.sample_interval_seconds") == 10.0
+    assert any("must be > 0" in r.message for r in caplog.records)
+
+
+def test_invalid_programmatic_override_warns_and_defaults(tmp_path, caplog):
+    c = _cfg(tmp_path)
+    with caplog.at_level("WARNING"):
+        assert c.get("server.max_queue_depth", override=-1) == 256
+    assert any("must be >= 0" in r.message for r in caplog.records)
+
+
+def test_enum_env_is_canonicalized_and_invalid_value_defaults(
+    tmp_path, monkeypatch, caplog,
+):
+    monkeypatch.setenv("MUSE_DEVICE", " CUDA ")
+    c = _cfg(tmp_path)
+    assert c.get("server.device") == "cuda"
+
+    monkeypatch.setenv("MUSE_DEVICE", "tpu")
+    with caplog.at_level("WARNING"):
+        assert c.get("server.device") == "auto"
+    assert any("must be one of" in r.message for r in caplog.records)
+
+
+def test_legacy_video_offload_false_alias_still_forces_off(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("MUSE_VIDEO_CPU_OFFLOAD", "0")
+    c = _cfg(tmp_path)
+    assert c.get("server.video_cpu_offload") == "0"
+
+    cfg.reset_config()
+    from muse.modalities.video_generation.runtimes._offload import (
+        resolve_offload_mode,
+    )
+
+    assert resolve_offload_mode("sequential") is None
+
+
+def test_documented_zero_and_negative_disable_values_are_preserved(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("MUSE_QUEUE_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("MUSE_DEFAULT_IDLE_TIMEOUT_SECONDS", "-1")
+    c = _cfg(tmp_path)
+    assert c.get("server.queue_timeout_seconds") == 0.0
+    assert c.get("server.idle_timeout_seconds") == -1.0
+
+
 def test_opt_float_empty_is_none(tmp_path, monkeypatch):
     monkeypatch.setenv("MUSE_SHUTDOWN_GRACE_SECONDS", "")
     c = _cfg(tmp_path)
@@ -110,10 +192,81 @@ def test_yaml_null_non_opt_setting_warns_and_defaults(tmp_path, caplog):
     assert any("gpu_headroom_gb" in r.message for r in caplog.records)
 
 
+def test_strict_config_rejects_malformed_yaml(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("server: [\n")
+
+    with pytest.raises(cfg.ConfigError, match="cannot parse"):
+        cfg.Config(path=path, strict=True).validate()
+
+
+def test_strict_config_rejects_unknown_key(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("server:\n  typo_headroom_gb: 1\n")
+
+    with pytest.raises(cfg.ConfigError, match="unknown config key"):
+        cfg.Config(path=path, strict=True).validate()
+
+
+def test_strict_config_validates_every_file_value(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("telemetry:\n  sample_interval_seconds: -1\n")
+
+    with pytest.raises(cfg.ConfigError, match="must be > 0"):
+        cfg.Config(path=path, strict=True).validate()
+
+
+def test_strict_config_rejects_invalid_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("MUSE_MAX_REQUEST_BODY_MB", "not-an-int")
+
+    with pytest.raises(cfg.ConfigError, match="MUSE_MAX_REQUEST_BODY_MB"):
+        cfg.Config(
+            path=tmp_path / "missing.yaml", strict=True,
+        ).validate()
+
+
 def test_config_path_is_directory_degrades_to_empty(tmp_path):
     c = cfg.Config(path=tmp_path)
     assert c.file_values() == {}
     assert c.get("limits.rerank_max_documents") == 1000
+
+
+def test_owned_config_read_hardens_legacy_permissions(tmp_path):
+    import stat
+
+    path = tmp_path / "config.yaml"
+    path.write_text("limits:\n  rerank_max_documents: 7\n")
+    path.chmod(0o644)
+
+    c = cfg.Config(path=path)
+
+    assert c.get("limits.rerank_max_documents") == 7
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_owned_group_writable_config_is_hardened_before_use(tmp_path):
+    import stat
+
+    path = tmp_path / "config.yaml"
+    path.write_text("limits:\n  rerank_max_documents: 7\n")
+    path.chmod(0o660)
+
+    c = cfg.Config(path=path)
+
+    assert c.get("limits.rerank_max_documents") == 7
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_symlink_config_read_degrades_to_defaults_without_following(tmp_path):
+    external = tmp_path / "external.yaml"
+    external.write_text("limits:\n  rerank_max_documents: 7\n")
+    path = tmp_path / "config.yaml"
+    path.symlink_to(external)
+
+    c = cfg.Config(path=path)
+
+    assert c.get("limits.rerank_max_documents") == 1000
+    assert path.is_symlink()
 
 
 # --- bootstrap-key invariant: paths.catalog_dir / paths.config_file are

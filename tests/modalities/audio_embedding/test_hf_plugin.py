@@ -5,12 +5,16 @@ from unittest.mock import MagicMock
 from muse.modalities.audio_embedding.hf import HF_PLUGIN
 
 
-def _fake_info(repo_id, tags=(), siblings=(), card=None):
+_FAKE_REVISION = "1" * 40
+
+
+def _fake_info(repo_id, tags=(), siblings=(), card=None, sha=_FAKE_REVISION):
     return SimpleNamespace(
         id=repo_id,
         tags=list(tags),
         siblings=[SimpleNamespace(rfilename=s) for s in siblings],
         card_data=card,
+        sha=sha,
     )
 
 
@@ -223,6 +227,39 @@ def test_resolve_mert_repo_sets_trust_remote_code_true():
     resolved = HF_PLUGIN["resolve"]("m-a-p/MERT-v1-95M", None, info)
     caps = resolved.manifest["capabilities"]
     assert caps["trust_remote_code"] is True
+    assert resolved.manifest["revision"] == _FAKE_REVISION
+
+
+def test_resolve_mert_refuses_nonhex_remote_code_revision():
+    import pytest
+
+    from muse.core.resolvers import ResolverError
+
+    info = _fake_info(
+        "m-a-p/MERT-v1-95M",
+        tags=["feature-extraction"],
+        sha="z" * 40,
+    )
+    with pytest.raises(ResolverError, match="immutable Hugging Face commit"):
+        HF_PLUGIN["resolve"]("m-a-p/MERT-v1-95M", None, info)
+
+
+def test_mert_download_uses_resolved_commit(tmp_path, monkeypatch):
+    import muse.modalities.audio_embedding.hf as plugin_module
+
+    calls = {}
+    monkeypatch.setattr(
+        plugin_module,
+        "snapshot_download",
+        lambda **kwargs: calls.update(kwargs) or str(tmp_path / "snapshot"),
+    )
+    resolved = HF_PLUGIN["resolve"](
+        "m-a-p/MERT-v1-95M",
+        None,
+        _fake_info("m-a-p/MERT-v1-95M", tags=["feature-extraction"]),
+    )
+    resolved.download(tmp_path)
+    assert calls["revision"] == _FAKE_REVISION
 
 
 def test_resolve_wav2vec_repo_does_not_set_trust_remote_code():

@@ -19,6 +19,7 @@ MANIFEST = {
     "model_id": "m2m100-418m",
     "modality": "text/translation",
     "hf_repo": "facebook/m2m100_418M",
+    "revision": "55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636",
     "description": (
         "M2M-100 418M: many-to-many translation across 100 languages, "
         "~2GB, MIT. Backs the LibreTranslate-compatible /v1/translate route."

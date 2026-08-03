@@ -1,4 +1,4 @@
-"""Fresh-venv smoke-test for a bundled muse model (#124, v0.32.0).
+"""Fresh-venv smoke-test for a Muse model (#124, v0.32.0).
 
 Catches the production failure mode where a bundled script's
 `pip_extras` declares the deps the runtime source-imports but misses
@@ -37,7 +37,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import venv
 from pathlib import Path
 
 logger = logging.getLogger("muse.smoke")
@@ -45,7 +44,7 @@ logger = logging.getLogger("muse.smoke")
 
 @dataclasses.dataclass
 class SmokeResult:
-    """Outcome of a smoke test for one bundled model.
+    """Outcome of a smoke test for one model.
 
     `label` is the one-line summary CI surfaces in the job log (e.g.,
     "kokoro-82m: OK (12.3s)" or "kokoro-82m: FAIL (missing dep: librosa)").
@@ -71,47 +70,6 @@ def _repo_root() -> Path:
     return here.parents[1]
 
 
-def _venv_python(venv_dir: Path) -> Path:
-    """Return the Python interpreter inside a venv (POSIX layout)."""
-    return venv_dir / "bin" / "python"
-
-
-def _create_venv(target: Path) -> None:
-    """Create a fresh venv at `target`. Uses stdlib venv module.
-
-    Mirrors muse.core.venv.create_venv (subprocess `python -m venv`),
-    but uses the venv module directly because we already know the
-    Python interpreter we're running on is what muse pull would use.
-    """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("creating venv at %s", target)
-    venv.create(str(target), with_pip=True, clear=True)
-
-
-def _install_muse(venv_python: Path, repo_root: Path) -> tuple[int, str]:
-    """Install museq[server] (editable) into the venv. Returns (rc, captured)."""
-    cmd = [
-        str(venv_python), "-m", "pip", "install",
-        "-e", f"{repo_root}[server]",
-    ]
-    logger.info("installing museq[server]: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    return proc.returncode, proc.stdout + proc.stderr
-
-
-def _install_pip_extras(
-    venv_python: Path,
-    packages: tuple[str, ...],
-) -> tuple[int, str]:
-    """Install the model's pip_extras into the venv. Returns (rc, captured)."""
-    if not packages:
-        return 0, ""
-    cmd = [str(venv_python), "-m", "pip", "install", *packages]
-    logger.info("installing pip_extras: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    return proc.returncode, proc.stdout + proc.stderr
-
-
 def _run_load_only(
     venv_python: Path,
     model_id: str,
@@ -126,11 +84,8 @@ def _run_load_only(
     record on stdout, and exits 0 on success. The smoke test only cares
     that it loads without ImportError, so we run it on the CPU device.
 
-    `env` overrides the subprocess environment (e.g. `MUSE_CATALOG_DIR`
-    for a curated resolver-based model whose manifest was persisted to
-    an isolated catalog by `_smoke_curated_resolver`). Defaults to the
-    current process environment when omitted, matching bundled-script
-    smoke runs which have no catalog dependency.
+    `env` overrides the subprocess environment. The smoke pipeline always
+    supplies the same isolated `MUSE_CATALOG_DIR` populated by its pull.
     """
     cmd = [
         str(venv_python), "-m", "muse.cli", "_probe_worker",
@@ -209,30 +164,18 @@ def _extract_failure_reason(captured: str) -> str:
     return "unknown failure"
 
 
-def _smoke_curated_resolver(model_id: str, uri: str, venv_root: Path) -> SmokeResult:
-    """Smoke-test a curated resolver-based (non-bundled) model id.
+def _smoke_pulled_model(model_id: str, venv_root: Path) -> SmokeResult:
+    """Pull and probe any model inside a fresh isolated Muse catalog.
 
-    Bundled scripts (the common matrix case) are discoverable via
-    `known_models()` with no prior pull, so `smoke_one` can create a
-    plain venv, install the declared `pip_extras`, and run the load-only
-    probe directly. Curated resolver entries (e.g. `opus-mt-en-es`, a
-    `hf://Helsinki-NLP/opus-mt-en-es` URI with no bundled script) have no
-    discovered script: `known_models()` only sees them once a real
-    `muse pull` synthesizes and PERSISTS a manifest into catalog.json.
-
-    Rather than re-implement resolve + venv-create + pip-install +
-    weight-download, this shells out to `muse pull <id> --no-probe`
-    scoped to an isolated `MUSE_CATALOG_DIR` under `venv_root` -- the
-    exact path a user runs, exercising `catalog._pull_via_resolver`'s
-    real venv/pip_extras/weight-download machinery instead of a smoke-
-    script-only reimplementation. `--no-probe` skips pull's memory probe;
-    the isolated worker check below is the smoke assertion. Audio-quality
-    and audio-alignment models run representative inference to cover their
-    real decoder path.
+    A probe worker always requires a pulled catalog record. Using the real
+    pull path for bundled and resolver-based models exercises venv creation,
+    exact dependencies, reviewed sources, weight download, and persisted
+    manifest state together instead of constructing an unregistered venv that
+    can only fail ``load_backend``'s pulled-model guard.
     """
     t0 = time.monotonic()
-    catalog_dir = venv_root / "catalog"
-    catalog_dir.mkdir(parents=True, exist_ok=True)
+    venv_root.mkdir(parents=True, exist_ok=True)
+    catalog_dir = Path(tempfile.mkdtemp(prefix="muse-catalog-", dir=venv_root))
     env = os.environ.copy()
     env["MUSE_CATALOG_DIR"] = str(catalog_dir)
 
@@ -240,7 +183,7 @@ def _smoke_curated_resolver(model_id: str, uri: str, venv_root: Path) -> SmokeRe
     cmd = [
         sys.executable, "-m", "muse.cli", "pull", model_id, "--no-probe",
     ]
-    logger.info("pulling curated resolver model: %s", " ".join(cmd))
+    logger.info("pulling model in isolated catalog: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd, capture_output=True, text=True, env=env, cwd=str(repo_root),
     )
@@ -306,22 +249,21 @@ def _smoke_curated_resolver(model_id: str, uri: str, venv_root: Path) -> SmokeRe
     )
 
 
+def _smoke_curated_resolver(
+    model_id: str,
+    uri: str,
+    venv_root: Path,
+) -> SmokeResult:
+    """Compatibility wrapper for curated-resolver smoke callers."""
+    del uri  # Resolution uses the reviewed curated id through `muse pull`.
+    return _smoke_pulled_model(model_id, venv_root)
+
+
 def smoke_one(
     model_id: str,
     venv_root: Path,
 ) -> SmokeResult:
-    """Run the full smoke-test pipeline for one bundled model.
-
-    Stages (each can fail):
-      1. Look up MANIFEST + pip_extras from muse.core.catalog.known_models().
-      2. Create venv.
-      3. pip install -e <repo>[server].
-      4. pip install <pip_extras>.
-      5. python -m muse.cli _probe_worker --model <id> --device cpu --no-inference
-
-    A failure at any stage becomes SmokeResult(ok=False) with a label
-    naming the stage and the probable cause.
-    """
+    """Run the isolated real-pull smoke pipeline for one known model."""
     from muse.core.catalog import known_models
     from muse.core.curated import find_curated
 
@@ -344,59 +286,7 @@ def smoke_one(
             duration_s=duration,
             label=f"{model_id}: FAIL (unknown model)",
         )
-    entry = catalog_known[model_id]
-    pip_extras = entry.pip_extras
-
-    venv_dir = venv_root / ".venv"
-    repo_root = _repo_root()
-
-    _create_venv(venv_dir)
-    py = _venv_python(venv_dir)
-
-    rc, captured = _install_muse(py, repo_root)
-    if rc != 0:
-        duration = time.monotonic() - t0
-        reason = _extract_failure_reason(captured)
-        return SmokeResult(
-            model_id=model_id,
-            ok=False,
-            error=f"pip install museq[server] failed: {reason}",
-            duration_s=duration,
-            label=f"{model_id}: FAIL (pip museq[server]: {reason})",
-        )
-
-    rc, captured = _install_pip_extras(py, pip_extras)
-    if rc != 0:
-        duration = time.monotonic() - t0
-        reason = _extract_failure_reason(captured)
-        return SmokeResult(
-            model_id=model_id,
-            ok=False,
-            error=f"pip install pip_extras failed: {reason}",
-            duration_s=duration,
-            label=f"{model_id}: FAIL (pip extras: {reason})",
-        )
-
-    rc, captured = _run_load_only(py, model_id)
-    if rc != 0:
-        duration = time.monotonic() - t0
-        reason = _extract_failure_reason(captured)
-        return SmokeResult(
-            model_id=model_id,
-            ok=False,
-            error=f"load failed: {reason}",
-            duration_s=duration,
-            label=f"{model_id}: FAIL ({reason})",
-        )
-
-    duration = time.monotonic() - t0
-    return SmokeResult(
-        model_id=model_id,
-        ok=True,
-        error=None,
-        duration_s=duration,
-        label=f"{model_id}: OK ({duration:.1f}s)",
-    )
+    return _smoke_pulled_model(model_id, venv_root)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -404,11 +294,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="smoke_fresh_venv",
         description=(
-            "Smoke-test a bundled muse model in a fresh per-model venv, "
+            "Smoke-test a Muse model in a fresh per-model venv, "
             "verifying that pip_extras covers the runtime's load-time deps."
         ),
     )
-    parser.add_argument("--model_id", required=True, help="bundled model id (e.g., kokoro-82m)")
+    parser.add_argument("--model_id", required=True, help="model id (e.g., kokoro-82m)")
     parser.add_argument(
         "--venv_root",
         default=None,

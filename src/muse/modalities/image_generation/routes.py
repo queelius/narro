@@ -25,10 +25,13 @@ from pydantic import BaseModel, Field, field_validator
 
 from muse.core.errors import ModelNotFoundError, error_response
 from muse.core.registry import ModalityRegistry
+from muse.modalities._native_offload import run_native_offload
 from muse.modalities.image_generation.codec import to_bytes, to_data_url
 from muse.modalities.image_generation.image_input import (
+    close_decoded_images,
     decode_image_file,
     decode_image_input,
+    validate_total_image_pixels,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,19 +128,50 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
             with model._inference_lock:
                 return model.generate(req.prompt, **kwargs)
 
+        input_images = [init_image] if init_image is not None else []
         results = []
-        for i in range(req.n):
-            result = await asyncio.to_thread(_call_one, i)
-            results.append(result)
+
+        def _cleanup_abandoned(current_result) -> None:
+            close_decoded_images(
+                input_images
+                + [getattr(result, "image", None) for result in results]
+                + [getattr(current_result, "image", None)]
+            )
+
+        try:
+            for i in range(req.n):
+                result = await run_native_offload(
+                    lambda i=i: _call_one(i),
+                    cleanup_abandoned=_cleanup_abandoned,
+                )
+                results.append(result)
+        except asyncio.CancelledError:
+            # The native ownership helper releases request inputs and any
+            # eventual result only after the running backend call settles.
+            raise
+        except BaseException:
+            close_decoded_images(
+                input_images
+                + [getattr(result, "image", None) for result in results]
+            )
+            raise
 
         data = []
-        for r in results:
-            entry = {"revised_prompt": r.metadata.get("prompt", req.prompt)}
-            if req.response_format == "url":
-                entry["url"] = to_data_url(r.image, fmt="png")
-            else:
-                entry["b64_json"] = base64.b64encode(to_bytes(r.image, fmt="png")).decode()
-            data.append(entry)
+        try:
+            for r in results:
+                entry = {"revised_prompt": r.metadata.get("prompt", req.prompt)}
+                if req.response_format == "url":
+                    entry["url"] = to_data_url(r.image, fmt="png")
+                else:
+                    entry["b64_json"] = base64.b64encode(
+                        to_bytes(r.image, fmt="png"),
+                    ).decode()
+                data.append(entry)
+        finally:
+            close_decoded_images(
+                input_images
+                + [getattr(r, "image", None) for r in results]
+            )
 
         return {"created": int(time.time()), "data": data}
 
@@ -196,13 +230,21 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 f"model {effective_id!r} does not support inpainting",
             )
 
+        decoded_images = []
         try:
             init_image = await decode_image_file(image)
+            decoded_images.append(init_image)
             mask_image = await decode_image_file(mask)
+            decoded_images.append(mask_image)
+            validate_total_image_pixels(decoded_images)
         except ValueError as e:
+            close_decoded_images(decoded_images)
             return error_response(
                 400, "invalid_parameter", f"image decode failed: {e}",
             )
+        except BaseException:
+            close_decoded_images(decoded_images)
+            raise
 
         def _call_one():
             kwargs: dict = {
@@ -215,18 +257,46 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 return backend.inpaint(prompt, **kwargs)
 
         results = []
-        for _ in range(n):
-            result = await asyncio.to_thread(_call_one)
-            results.append(result)
+
+        def _cleanup_abandoned(current_result) -> None:
+            close_decoded_images(
+                decoded_images
+                + [getattr(result, "image", None) for result in results]
+                + [getattr(current_result, "image", None)]
+            )
+
+        try:
+            for _ in range(n):
+                result = await run_native_offload(
+                    _call_one,
+                    cleanup_abandoned=_cleanup_abandoned,
+                )
+                results.append(result)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            close_decoded_images(
+                decoded_images
+                + [getattr(result, "image", None) for result in results]
+            )
+            raise
 
         data = []
-        for r in results:
-            entry = {"revised_prompt": r.metadata.get("prompt", prompt)}
-            if response_format == "url":
-                entry["url"] = to_data_url(r.image, fmt="png")
-            else:
-                entry["b64_json"] = base64.b64encode(to_bytes(r.image, fmt="png")).decode()
-            data.append(entry)
+        try:
+            for r in results:
+                entry = {"revised_prompt": r.metadata.get("prompt", prompt)}
+                if response_format == "url":
+                    entry["url"] = to_data_url(r.image, fmt="png")
+                else:
+                    entry["b64_json"] = base64.b64encode(
+                        to_bytes(r.image, fmt="png"),
+                    ).decode()
+                data.append(entry)
+        finally:
+            close_decoded_images(
+                decoded_images
+                + [getattr(r, "image", None) for r in results]
+            )
 
         return {"created": int(time.time()), "data": data}
 
@@ -292,19 +362,47 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 return backend.vary(**kwargs)
 
         results = []
-        for _ in range(n):
-            result = await asyncio.to_thread(_call_one)
-            results.append(result)
+
+        def _cleanup_abandoned(current_result) -> None:
+            close_decoded_images(
+                [init_image]
+                + [getattr(result, "image", None) for result in results]
+                + [getattr(current_result, "image", None)]
+            )
+
+        try:
+            for _ in range(n):
+                result = await run_native_offload(
+                    _call_one,
+                    cleanup_abandoned=_cleanup_abandoned,
+                )
+                results.append(result)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            close_decoded_images(
+                [init_image]
+                + [getattr(result, "image", None) for result in results]
+            )
+            raise
 
         # Variations envelope: no revised_prompt (no prompt).
         data = []
-        for r in results:
-            entry: dict = {}
-            if response_format == "url":
-                entry["url"] = to_data_url(r.image, fmt="png")
-            else:
-                entry["b64_json"] = base64.b64encode(to_bytes(r.image, fmt="png")).decode()
-            data.append(entry)
+        try:
+            for r in results:
+                entry: dict = {}
+                if response_format == "url":
+                    entry["url"] = to_data_url(r.image, fmt="png")
+                else:
+                    entry["b64_json"] = base64.b64encode(
+                        to_bytes(r.image, fmt="png"),
+                    ).decode()
+                data.append(entry)
+        finally:
+            close_decoded_images(
+                [init_image]
+                + [getattr(r, "image", None) for r in results]
+            )
 
         return {"created": int(time.time()), "data": data}
 

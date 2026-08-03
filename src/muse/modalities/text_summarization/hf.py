@@ -20,7 +20,7 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _RUNTIME_PATH = (
@@ -58,6 +58,7 @@ def _supports_dialog(repo_id: str) -> bool:
 
 
 def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "text/summarization",
@@ -75,6 +76,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             "max_input_tokens": 1024,
         },
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         # Keep weights light: prefer safetensors, drop tf/flax/onnx.
@@ -96,6 +99,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             repo_id=repo_id,
             allow_patterns=allow_patterns,
             cache_dir=str(cache_root) if cache_root else None,
+            revision=revision,
         ))
 
     return ResolvedModel(

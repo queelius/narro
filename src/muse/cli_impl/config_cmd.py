@@ -36,14 +36,15 @@ def run_path() -> int:
 def run_generate(force: bool) -> int:
     cfg.reset_config()
     target = cfg.config_path()
-    if target.exists() and not force:
+    template = cfg.render_template()
+    if force:
+        cfg.write_config_text(template, path=target)
+    elif not cfg.create_config_text(template, path=target):
         typer.echo(
             f"error: {target} already exists; pass --force to overwrite",
             err=True,
         )
         return 1
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(cfg.render_template())
     typer.echo(f"wrote {target}")
     return 0
 

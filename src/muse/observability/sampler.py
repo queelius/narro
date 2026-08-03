@@ -20,6 +20,7 @@ names so patched globals are actually observed at call time.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from typing import Any, Callable
 
@@ -27,6 +28,8 @@ from muse.core.memory_probe import gpu_free_gb, cpu_free_gb
 from muse.observability.recorder import record
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_STOP_TIMEOUT = 5.0
 
 
 class Sampler:
@@ -48,13 +51,31 @@ class Sampler:
         inflight_fn: Callable[[], int],
         record_fn: Callable[..., None] = record,
         stop_event: threading.Event | None = None,
+        stop_timeout: float = _DEFAULT_STOP_TIMEOUT,
     ) -> None:
-        self.interval = interval
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not math.isfinite(interval)
+            or interval <= 0
+        ):
+            raise ValueError("interval must be a positive finite number")
+        if (
+            isinstance(stop_timeout, bool)
+            or not isinstance(stop_timeout, (int, float))
+            or not math.isfinite(stop_timeout)
+            or stop_timeout <= 0
+        ):
+            raise ValueError("stop_timeout must be a positive finite number")
+        self.interval = float(interval)
         self.loaded_fn = loaded_fn
         self.inflight_fn = inflight_fn
         self.record_fn = record_fn
+        self._owns_stop = stop_event is None
         self._stop = stop_event if stop_event is not None else threading.Event()
+        self._stop_timeout = float(stop_timeout)
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
 
     def sample_once(self) -> None:
         free_vram_gb = gpu_free_gb()
@@ -69,20 +90,59 @@ class Sampler:
             in_flight_count=in_flight_count,
         )
 
-    def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, name="telemetry-sampler", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.interval * 10 + 1)
+    def start(self) -> bool:
+        """Start sampling unless an externally-owned stop is already set."""
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive() is True:
+                # A thread still unwinding after a timed-out stop is not a
+                # successful restart: it will exit as soon as its current
+                # sample settles because the stop Event remains set.
+                return not self._stop.is_set()
             self._thread = None
+            if self._owns_stop:
+                self._stop.clear()
+            elif self._stop.is_set():
+                # Clearing a supervisor-owned Event here could resurrect its
+                # monitor/sweeper after SIGINT raced telemetry initialization.
+                return False
+            thread = threading.Thread(
+                target=self._run, name="telemetry-sampler", daemon=True
+            )
+            self._thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._thread = None
+                raise
+            return True
+
+    def stop(self) -> bool:
+        """Stop within a fixed bound, retaining a live handle on timeout."""
+        with self._lifecycle_lock:
+            self._stop.set()
+            thread = self._thread
+            if thread is threading.current_thread():
+                logger.warning("telemetry sampler cannot join its own thread")
+                return False
+            if thread is not None:
+                try:
+                    thread.join(timeout=self._stop_timeout)
+                except RuntimeError:
+                    if thread.is_alive() is True:
+                        logger.warning(
+                            "could not join telemetry sampler thread",
+                            exc_info=True,
+                        )
+                        return False
+                if thread.is_alive() is True:
+                    logger.warning(
+                        "telemetry sampler thread did not stop within %.1fs",
+                        self._stop_timeout,
+                    )
+                    return False
+                if self._thread is thread:
+                    self._thread = None
+            return True
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):

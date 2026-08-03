@@ -62,6 +62,23 @@ def test_sd_turbo_model_id_and_default_size():
         assert m.default_size == (512, 512)
 
 
+def test_sd_turbo_retains_pipeline_when_device_move_returns_other_object():
+    with patch("muse.models.sd_turbo.AutoPipelineForText2Image") as mock_cls:
+        mock_pipe = MagicMock()
+        mock_pipe.to.return_value = MagicMock(name="unrelated-fluent-result")
+        mock_cls.from_pretrained.return_value = mock_pipe
+        from muse.models.sd_turbo import Model as SDTurboModel
+
+        m = SDTurboModel(
+            hf_repo="stabilityai/sd-turbo",
+            local_dir="/fake",
+            device="cuda",
+        )
+
+        assert m._pipe is mock_pipe
+        mock_pipe.to.assert_called_once_with("cuda")
+
+
 def test_sd_turbo_generate_returns_imageresult():
     with patch("muse.models.sd_turbo.AutoPipelineForText2Image") as mock_cls:
         mock_pipe = MagicMock(return_value=_mock_pipe_return())

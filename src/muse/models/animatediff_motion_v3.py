@@ -1,14 +1,4 @@
-"""AnimateDiff motion v3 + SD 1.5 base.
-
-Two-component model. `muse pull animatediff-motion-v3` fetches the
-motion adapter (~50MB). On first construction, the SD 1.5 base
-(emilianJR/epiCRealism, ~3GB) is fetched if not already in the
-HuggingFace cache. Subsequent constructions are warm.
-
-Trade-off: muse pull is fast and small, but first-request cold start
-may take 30-60s on a fresh machine while the base downloads. After
-that, both components are cached locally.
-"""
+"""AnimateDiff motion v3 + SD 1.5 base, pulled as one pinned bundle."""
 from __future__ import annotations
 
 import logging
@@ -19,6 +9,37 @@ from muse.modalities.image_animation.protocol import AnimationResult
 
 
 logger = logging.getLogger(__name__)
+
+_ADAPTER_REPO = "guoyww/animatediff-motion-adapter-v1-5-3"
+_ADAPTER_REVISION = "2e8139b1d1269fd8a21deb96ad19455e187692eb"
+_BASE_REPO = "emilianJR/epiCRealism"
+_BASE_REVISION = "6522cf856b8c8e14638a0aaa7bd89b1b098aed17"
+_ADAPTER_SUBDIR = "motion_adapter"
+_BASE_SUBDIR = "base_model"
+_ADAPTER_ALLOW_PATTERNS = ["*.safetensors", "*.json", "*.txt", "*.md"]
+_ADAPTER_REQUIRED_PATTERNS = ["config.json", "*.safetensors"]
+_BASE_ALLOW_PATTERNS = [
+    "*.safetensors", "*.json", "*.txt", "*.model", "*.md",
+    "feature_extractor/*", "scheduler/*",
+    "safety_checker/*.safetensors", "safety_checker/*.json",
+    "text_encoder/*.safetensors", "text_encoder/*.json",
+    "tokenizer/*", "unet/*.safetensors", "unet/*.json",
+    "vae/*.safetensors", "vae/*.json",
+]
+_BASE_REQUIRED_PATTERNS = [
+    "model_index.json",
+    "feature_extractor/preprocessor_config.json",
+    "safety_checker/config.json",
+    "safety_checker/*.safetensors",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/*.safetensors",
+    "tokenizer/tokenizer_config.json",
+    "unet/config.json",
+    "unet/*.safetensors",
+    "vae/config.json",
+    "vae/*.safetensors",
+]
 
 
 # Sentinels (lazy-import pattern matches sd_turbo).
@@ -52,7 +73,8 @@ def _ensure_deps() -> None:
 MANIFEST = {
     "model_id": "animatediff-motion-v3",
     "modality": "image/animation",
-    "hf_repo": "guoyww/animatediff-motion-adapter-v1-5-3",
+    "hf_repo": _ADAPTER_REPO,
+    "revision": _ADAPTER_REVISION,
     "description": "AnimateDiff motion v3 + SD 1.5 base, 16 frames @ 8fps, 512x512",
     "license": "Apache 2.0",
     "pip_extras": (
@@ -75,11 +97,30 @@ MANIFEST = {
         "default_steps": 25,
         "default_guidance": 7.5,
         "device": "cuda",
-        "base_model": "emilianJR/epiCRealism",
+        "base_model": _BASE_REPO,
+        "base_model_revision": _BASE_REVISION,
+        "adapter_model_subdir": _ADAPTER_SUBDIR,
+        "base_model_subdir": _BASE_SUBDIR,
         # SD 1.5 base + motion adapter at fp16, plus per-frame activations
         # for 16 frames at 512x512. Conservative peak estimate.
         "memory_gb": 10.0,
     },
+    "hf_artifacts": [
+        {
+            "repo_id": _ADAPTER_REPO,
+            "revision": _ADAPTER_REVISION,
+            "subdir": _ADAPTER_SUBDIR,
+            "allow_patterns": _ADAPTER_ALLOW_PATTERNS,
+            "required_patterns": _ADAPTER_REQUIRED_PATTERNS,
+        },
+        {
+            "repo_id": _BASE_REPO,
+            "revision": _BASE_REVISION,
+            "subdir": _BASE_SUBDIR,
+            "allow_patterns": _BASE_ALLOW_PATTERNS,
+            "required_patterns": _BASE_REQUIRED_PATTERNS,
+        },
+    ],
 }
 
 
@@ -91,10 +132,9 @@ def _select_device(device: str) -> str:
 class Model:
     """AnimateDiff motion v3 backend.
 
-    The catalog passes hf_repo (motion adapter) + local_dir (cached
-    adapter weights) + device (resolved per capability). The base SD 1.5
-    is read from MANIFEST capabilities[base_model]; diffusers fetches
-    it on first construction if not in cache.
+    Muse passes ``local_dir`` as the complete pinned motion-adapter + base
+    bundle. Repository identifiers are used only for explicit direct
+    construction without that bundle.
     """
 
     model_id = MANIFEST["model_id"]
@@ -106,6 +146,9 @@ class Model:
         local_dir: str | None = None,
         device: str = "auto",
         dtype: str = "float16",
+        base_model: str = _BASE_REPO,
+        adapter_model_subdir: str | None = None,
+        base_model_subdir: str | None = None,
         **_: Any,
     ) -> None:
         _ensure_deps()
@@ -126,23 +169,49 @@ class Model:
         _torch = _mod.torch
         torch_dtype = dtype_for_name(dtype, _torch)
 
-        adapter_src = local_dir or hf_repo
+        if local_dir is None:
+            adapter_src = hf_repo
+            base_src = base_model
+        else:
+            if adapter_model_subdir is None or base_model_subdir is None:
+                raise RuntimeError(
+                    "AnimateDiff local weights predate the complete artifact "
+                    f"bundle; re-pull {self.model_id!r}"
+                )
+            from muse.core.artifacts import (
+                ArtifactBundleError,
+                local_artifact_directory,
+            )
+            try:
+                adapter_src = local_artifact_directory(
+                    local_dir,
+                    adapter_model_subdir,
+                    label="AnimateDiff motion adapter",
+                )
+                base_src = local_artifact_directory(
+                    local_dir,
+                    base_model_subdir,
+                    label="AnimateDiff base model",
+                )
+            except ArtifactBundleError as exc:
+                raise RuntimeError(
+                    f"AnimateDiff artifact bundle is invalid; re-pull "
+                    f"{self.model_id!r}: {exc}"
+                ) from exc
         logger.info("loading MotionAdapter from %s", adapter_src)
         adapter = MotionAdapter.from_pretrained(adapter_src, torch_dtype=torch_dtype)
 
-        base = caps["base_model"]
         logger.info(
-            "loading AnimateDiffPipeline base=%s + adapter (device=%s, dtype=%s) "
-            "(first run downloads base if not cached)",
-            base, self._device, dtype,
+            "loading AnimateDiffPipeline base=%s + adapter (device=%s, dtype=%s)",
+            base_src, self._device, dtype,
         )
         self._pipe = AnimateDiffPipeline.from_pretrained(
-            base,
+            base_src,
             motion_adapter=adapter,
             torch_dtype=torch_dtype,
         )
         if self._device != "cpu":
-            self._pipe = self._pipe.to(self._device)
+            self._pipe.to(self._device)
 
     def generate(
         self,

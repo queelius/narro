@@ -1,10 +1,15 @@
 """Tests for /v1/images/generations router."""
+import asyncio
+import threading
+from unittest.mock import AsyncMock
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from muse.core.registry import ModalityRegistry
 from muse.core.server import create_app
+from muse.modalities.image_generation import routes as routes_mod
 from muse.modalities.image_generation.protocol import ImageResult
 from muse.modalities.image_generation.routes import build_router
 
@@ -408,6 +413,99 @@ def test_post_strength_out_of_range_returns_400(client_with_capable_model):
     assert r.status_code in (400, 422)
 
 
+@pytest.mark.asyncio
+async def test_cancelled_generation_defers_input_and_eventual_output_cleanup(
+    monkeypatch,
+):
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    input_cleaned = asyncio.Event()
+    output_cleaned = asyncio.Event()
+    release = threading.Event()
+    backend_exited = threading.Event()
+
+    class _Resource:
+        size = (64, 64)
+
+        def __init__(self, cleaned):
+            self.closed = False
+            self.close_calls = 0
+            self._cleaned = cleaned
+
+        def close(self):
+            assert backend_exited.is_set()
+            self.close_calls += 1
+            self.closed = True
+            loop.call_soon_threadsafe(self._cleaned.set)
+
+    init_image = _Resource(input_cleaned)
+    output_image = _Resource(output_cleaned)
+
+    class _BlockingImageModel:
+        model_id = "blocking-image-model"
+        default_size = (64, 64)
+
+        def __init__(self):
+            self._inference_lock = threading.Lock()
+            self.calls = 0
+
+        def generate(self, prompt, **kwargs):
+            self.calls += 1
+            assert kwargs["init_image"] is init_image
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=5)
+            assert not init_image.closed
+            backend_exited.set()
+            return ImageResult(
+                image=output_image,
+                width=64,
+                height=64,
+                seed=0,
+                metadata={"prompt": prompt},
+            )
+
+    model = _BlockingImageModel()
+    registry = ModalityRegistry()
+    registry.register(
+        "image/generation",
+        model,
+        manifest={
+            "model_id": model.model_id,
+            "capabilities": {"supports_img2img": True},
+        },
+    )
+    endpoint = next(
+        route.endpoint
+        for route in build_router(registry).routes
+        if route.path == "/v1/images/generations"
+    )
+    monkeypatch.setattr(
+        routes_mod,
+        "decode_image_input",
+        AsyncMock(return_value=init_image),
+    )
+
+    pending = asyncio.create_task(endpoint(routes_mod.GenerationRequest(
+        prompt="draw",
+        model=model.model_id,
+        image="data:image/png;base64,unused",
+        n=3,
+    )))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert not init_image.closed
+    assert not output_image.closed
+    release.set()
+    await asyncio.wait_for(input_cleaned.wait(), timeout=1)
+    await asyncio.wait_for(output_cleaned.wait(), timeout=1)
+    assert init_image.close_calls == 1
+    assert output_image.close_calls == 1
+    assert model.calls == 1
+
+
 # ---------------- /v1/images/edits (inpainting, multipart) ----------------
 
 
@@ -506,6 +604,37 @@ def test_post_edits_malformed_image_returns_400(client_with_edits_model):
     assert r.status_code == 400
     err = r.json()["error"]
     assert err["code"] == "invalid_parameter"
+
+
+def test_post_edits_rejects_aggregate_decoded_pixels_and_closes_inputs(
+    client_with_edits_model, edits_model,
+):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    decoded_image = MagicMock(size=(20_000_000, 1))
+    decoded_mask = MagicMock(size=(20_000_000, 1))
+    with patch(
+        "muse.modalities.image_generation.routes.decode_image_file",
+        new=AsyncMock(side_effect=[decoded_image, decoded_mask]),
+    ):
+        response = client_with_edits_model.post(
+            "/v1/images/edits",
+            files={
+                "image": ("s.png", b"placeholder", "image/png"),
+                "mask": ("m.png", b"placeholder", "image/png"),
+            },
+            data={
+                "prompt": "x",
+                "model": "fake-edits-model",
+                "size": "64x64",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "aggregate limit" in response.json()["error"]["message"]
+    assert edits_model.inpaint_calls == []
+    decoded_image.close.assert_called_once_with()
+    decoded_mask.close.assert_called_once_with()
 
 
 def test_post_edits_n_creates_multiple_images(

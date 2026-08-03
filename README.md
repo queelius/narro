@@ -420,9 +420,10 @@ for catalog-enabled-but-unloaded, plus the existing `disabled`,
 `recommended`, and `available` states. `/v1/models` gains `loaded`,
 `last_loaded_at`, and `unservable_reason` per entry. Headroom margins
 are tunable via `MUSE_GPU_HEADROOM_GB` (default 1.0) and
-`MUSE_CPU_HEADROOM_GB` (default 2.0); declared caps via
-`MUSE_GPU_BUDGET_GB` and `MUSE_CPU_BUDGET_GB` are optional and
-combined with live measurements as `min(declared, live)`.
+`MUSE_CPU_HEADROOM_GB` (default 2.0). Optional `MUSE_GPU_BUDGET_GB` and
+`MUSE_CPU_BUDGET_GB` values cap Muse's total resident working set;
+physical capacity remains the hard ceiling, while current free memory
+governs each load's admission and any same-pool eviction.
 
 ## CLI (admin-only)
 
@@ -439,9 +440,17 @@ combined with live measurements as `min(declared, live)`.
 | `muse models warmup <model-id>` | pre-load a model into a worker without serving traffic; first real request is hot |
 | `muse models refresh <id> \| --all \| --enabled` | re-install museq[server,extras] into per-model venv(s) (after `pip install -U museq`) |
 | `muse config generate \| show \| path \| get \| set \| unset` | manage `~/.muse/config.yaml` (see Configuration below) |
+| `muse doctor resources [--repair]` | inspect Muse's owned-resource registry; optionally clean verified stale/orphan records after an unclean exit |
 | `muse mcp [--http]` | run an MCP server bridging muse to LLM clients (31 tools) |
 
 No per-modality subcommands (`muse speak`, `muse audio ...`). Those would be hardcoded modality-to-verb mappings that grow with every new modality. Keeping the CLI modality-agnostic means embeddings, transcriptions, and video land without CLI churn.
+
+`muse doctor resources` is read-only by default and does not scan unrelated
+host processes. Use `--repair` after a crash or forced shutdown to remove stale
+records and terminate only orphan Muse process leaders whose recorded identity
+can still be verified; unverifiable or changed identities are refused and
+reported for manual investigation. Normal `Ctrl+C` shutdown should release the
+same resources without needing repair.
 
 ## Configuration
 

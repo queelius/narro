@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 # CLI binary, GitHub repo, and project identity stay `muse`; only the
 # PyPI label is `museq`. See docs/superpowers/specs/ for context.
 name = "museq"
-version = "0.59.1"
+version = "0.60.0"
 authors = [
   { name="Alex Towell", email="lex@metafunctor.com" },
 ]
@@ -28,7 +28,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -66,7 +67,7 @@ Issues = "https://github.com/queelius/muse/issues"
 # missing). Without this entry, per-model venvs that install
 # muse[server] would crash when discover_modalities mounts the
 # audio_transcription router.
-server = ["fastapi", "uvicorn", "sse-starlette", "httpx", "python-multipart", "psutil>=5.9", "nvidia-ml-py>=12.0", "mcp>=1.0.0"]
+server = ["fastapi", "uvicorn", "sse-starlette>=3.0.0,<3.1.0", "httpx", "python-multipart", "psutil>=5.9", "nvidia-ml-py>=12.0", "mcp>=1.8.0,<2"]
 
 # Audio modality (TTS)
 audio = [
@@ -76,7 +77,7 @@ audio = [
   "inflect",
   "unidecode",
 ]
-audio-kokoro = ["museq[audio]", "kokoro", "soundfile", "misaki[en]"]
+audio-kokoro = ["museq[audio]", "kokoro==0.9.4", "soundfile"]
 
 # Images modality (diffusion)
 images = [
@@ -98,7 +99,7 @@ embeddings = [
 ]
 
 # Development
-dev = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-timeout", "tomli; python_version < \"3.11\""]
+dev = ["pytest", "pytest-cov", "pytest-asyncio", "pytest-timeout", "packaging>=23.0", "tomli; python_version < \"3.11\""]
 
 [project.scripts]
 muse = "muse.cli:main"

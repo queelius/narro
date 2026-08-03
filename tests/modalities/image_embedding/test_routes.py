@@ -156,6 +156,32 @@ def test_embeddings_400_on_unsupported_input_format():
     assert r.json()["error"]["code"] == "invalid_parameter"
 
 
+def test_batch_decode_closes_prior_images_on_unexpected_error(monkeypatch):
+    from muse.modalities.image_embedding import routes
+
+    decoded = MagicMock()
+    decoded.size = (32, 32)
+    calls = 0
+
+    async def fail_second(_value):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return decoded
+        raise RuntimeError("decode interrupted")
+
+    monkeypatch.setattr(routes, "decode_image_input", fail_second)
+    backend = _fake_backend(_fake_result(n_images=2))
+    client = _make_client(backend)
+
+    with pytest.raises(RuntimeError, match="decode interrupted"):
+        client.post("/v1/images/embeddings", json={
+            "input": ["data:first", "data:second"],
+        })
+
+    decoded.close.assert_called_once_with()
+
+
 def test_embeddings_404_on_unknown_model():
     backend = _fake_backend(_fake_result())
     client = _make_client(backend)
@@ -337,6 +363,41 @@ def test_embeddings_passes_decoded_pil_images_to_backend():
     for img in images:
         assert hasattr(img, "size")
         assert img.size == (32, 32)
+
+
+def test_embeddings_rejects_aggregate_decoded_pixel_budget(monkeypatch):
+    from muse.core import config as cfg
+
+    backend = _fake_backend(_fake_result(n_images=2))
+    monkeypatch.setenv("MUSE_IMAGE_INPUT_MAX_TOTAL_PIXELS", "100")
+    cfg.reset_config()
+    try:
+        client = _make_client(backend)
+        response = client.post("/v1/images/embeddings", json={
+            "input": [_png_data_url(8, 8), _png_data_url(8, 8)],
+        })
+        assert response.status_code == 400
+        assert "aggregate limit 100" in response.json()["error"]["message"]
+        backend.embed.assert_not_called()
+    finally:
+        cfg.reset_config()
+
+
+def test_embeddings_closes_decoded_inputs_after_backend_call():
+    from unittest.mock import AsyncMock, patch
+
+    backend = _fake_backend(_fake_result())
+    decoded = MagicMock()
+    decoded.size = (8, 8)
+    with patch(
+        "muse.modalities.image_embedding.routes.decode_image_input",
+        new=AsyncMock(return_value=decoded),
+    ):
+        response = _make_client(backend).post(
+            "/v1/images/embeddings", json={"input": _png_data_url()},
+        )
+    assert response.status_code == 200
+    decoded.close.assert_called_once_with()
 
 
 def test_embeddings_data_object_marker():

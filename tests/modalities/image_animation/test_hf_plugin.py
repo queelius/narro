@@ -1,4 +1,5 @@
 """Tests for the image_animation HF plugin (fused-checkpoint AnimateDiff variants)."""
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from muse.modalities.image_animation.hf import HF_PLUGIN
@@ -6,12 +7,13 @@ from muse.core.discovery import REQUIRED_HF_PLUGIN_KEYS
 from muse.core.resolvers import ResolvedModel
 
 
-def _fake_info(repo_id="org/repo", siblings=None, tags=None):
+def _fake_info(repo_id="org/repo", siblings=None, tags=None, sha="a" * 40):
     info = MagicMock()
     info.id = repo_id
     info.siblings = [MagicMock(rfilename=f) for f in (siblings or [])]
     info.tags = tags or []
     info.card_data = MagicMock(license=None)
+    info.sha = sha
     return info
 
 
@@ -83,6 +85,68 @@ def test_resolve_animatelcm_uses_lcm_defaults():
     assert caps["default_guidance"] == 1.0
     assert "base_model" in caps
     assert caps["supports_text_to_animation"] is True
+    assert caps["adapter_model_subdir"] == "motion_adapter"
+    assert caps["base_model_subdir"] == "base_model"
+
+
+def test_download_materializes_pinned_adapter_and_base(monkeypatch, tmp_path):
+    from muse.modalities.image_animation import hf as module
+
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        target = Path(kwargs["local_dir"])
+        target.mkdir(parents=True)
+        if target.name == "motion_adapter":
+            files = ("model_index.json", "model.safetensors")
+        else:
+            files = (
+                "model_index.json",
+                "feature_extractor/preprocessor_config.json",
+                "safety_checker/config.json",
+                "safety_checker/model.safetensors",
+                "scheduler/scheduler_config.json",
+                "text_encoder/config.json",
+                "text_encoder/model.safetensors",
+                "tokenizer/tokenizer_config.json",
+                "unet/config.json",
+                "unet/diffusion_pytorch_model.safetensors",
+                "vae/config.json",
+                "vae/diffusion_pytorch_model.safetensors",
+            )
+        for relative in files:
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"payload")
+        return str(target)
+
+    monkeypatch.setattr(module, "snapshot_download", fake_download)
+    resolved = module.HF_PLUGIN["resolve"](
+        "wangfuyun/AnimateLCM",
+        None,
+        _fake_info(repo_id="wangfuyun/AnimateLCM", sha="c" * 40),
+    )
+
+    bundle = resolved.download(tmp_path)
+
+    assert (bundle / "motion_adapter" / "model.safetensors").is_file()
+    assert (bundle / "base_model" / "unet" / "config.json").is_file()
+    assert [(call["repo_id"], call["revision"]) for call in calls] == [
+        ("wangfuyun/AnimateLCM", "c" * 40),
+        (
+            "emilianJR/epiCRealism",
+            "6522cf856b8c8e14638a0aaa7bd89b1b098aed17",
+        ),
+    ]
+    assert "*.ckpt" not in calls[0]["allow_patterns"]
+    assert "*.safetensors" in calls[0]["allow_patterns"]
+    assert resolved.artifact_provenance[1]["revision"] == (
+        "6522cf856b8c8e14638a0aaa7bd89b1b098aed17"
+    )
+    assert "unet/*.safetensors" in (
+        resolved.artifact_provenance[1]["required_patterns"]
+    )
 
 
 def test_search_yields_results_with_modality_tag():

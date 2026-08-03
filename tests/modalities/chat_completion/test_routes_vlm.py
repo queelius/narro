@@ -4,9 +4,11 @@ Exercises the new pre-dispatch step: capability gating, image decoding,
 content-shape validation. Text-only requests must remain byte-identical
 to v0.41.x behavior (regression watchdog).
 """
+import asyncio
 import base64
+import threading
 from io import BytesIO
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from muse.core.registry import ModalityRegistry
+from muse.modalities.chat_completion import routes as routes_mod
 from muse.modalities.chat_completion.routes import build_router
 
 
@@ -215,6 +218,57 @@ def test_invalid_content_part_missing_url_returns_400():
     assert r.json()["error"]["code"] == "invalid_content_part"
 
 
+@pytest.mark.parametrize(
+    "image_url",
+    ["not-an-object", ["not", "an", "object"], 7, {"url": 7}],
+)
+def test_invalid_nested_image_url_shape_returns_structured_400(image_url):
+    model = _FakeChatModel("vlm", supports_vision=True, supports_multi_image=True)
+    response = _client_with_model(model).post(
+        "/v1/chat/completions",
+        json={
+            "model": "vlm",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": image_url}],
+            }],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_content_part"
+
+
+def test_invalid_later_image_url_closes_an_earlier_decoded_image():
+    model = _FakeChatModel("vlm", supports_vision=True, supports_multi_image=True)
+    decoded = MagicMock(size=(8, 8))
+    with patch(
+        "muse.modalities.chat_completion.routes.decode_image_input",
+        new=AsyncMock(return_value=decoded),
+    ) as decode:
+        response = _client_with_model(model).post(
+            "/v1/chat/completions",
+            json={
+                "model": "vlm",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,unused"},
+                        },
+                        {"type": "image_url", "image_url": "invalid"},
+                    ],
+                }],
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_content_part"
+    assert decode.await_count == 1
+    decoded.close.assert_called_once_with()
+
+
 def test_unsupported_content_type_returns_400():
     model = _FakeChatModel("vlm", supports_vision=True, supports_multi_image=True)
     client = _client_with_model(model)
@@ -289,6 +343,140 @@ def test_multi_image_supported_when_capability_true():
     assert r.status_code == 200
     images = [p for p in model.received_messages[0]["content"] if p["type"] == "image"]
     assert len(images) == 2
+
+
+def test_multi_image_rejects_aggregate_decoded_pixel_budget(monkeypatch):
+    from muse.core import config as cfg
+
+    model = _FakeChatModel(
+        "multi-vlm", supports_vision=True, supports_multi_image=True,
+    )
+    monkeypatch.setenv("MUSE_IMAGE_INPUT_MAX_TOTAL_PIXELS", "100")
+    cfg.reset_config()
+    try:
+        data_url = _make_data_url((8, 8))
+        response = _client_with_model(model).post(
+            "/v1/chat/completions",
+            json={
+                "model": "multi-vlm",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }],
+            },
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "image_budget_exceeded"
+        assert model.received_messages is None
+    finally:
+        cfg.reset_config()
+
+
+def test_non_streaming_chat_closes_decoded_inputs():
+    model = _FakeChatModel("vlm", supports_vision=True)
+    decoded = MagicMock()
+    decoded.size = (8, 8)
+    with patch(
+        "muse.modalities.chat_completion.routes.decode_image_input",
+        new=AsyncMock(return_value=decoded),
+    ):
+        response = _client_with_model(model).post(
+            "/v1/chat/completions",
+            json={
+                "model": "vlm",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,unused"},
+                    }],
+                }],
+            },
+        )
+    assert response.status_code == 200
+    decoded.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_non_stream_chat_keeps_decoded_image_until_backend_exits(
+    monkeypatch,
+):
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+    release = threading.Event()
+    backend_exited = threading.Event()
+
+    class _DecodedImage:
+        size = (8, 8)
+
+        def __init__(self):
+            self.closed = False
+            self.close_calls = 0
+
+        def close(self):
+            assert backend_exited.is_set()
+            self.close_calls += 1
+            self.closed = True
+            loop.call_soon_threadsafe(cleaned.set)
+
+    decoded = _DecodedImage()
+
+    class _BlockingChatModel(_FakeChatModel):
+        def __init__(self):
+            super().__init__("blocking-vlm", supports_vision=True)
+            self._inference_lock = threading.Lock()
+
+        def chat(self, messages, **kwargs):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=5)
+            assert not decoded.closed
+            backend_exited.set()
+            return super().chat(messages, **kwargs)
+
+    model = _BlockingChatModel()
+    registry = ModalityRegistry()
+    registry.register(
+        "chat/completion",
+        model,
+        manifest={
+            "model_id": model.model_id,
+            "capabilities": {"supports_vision": True},
+        },
+    )
+    endpoint = next(
+        route.endpoint
+        for route in build_router(registry).routes
+        if route.path == "/v1/chat/completions"
+    )
+    monkeypatch.setattr(
+        routes_mod,
+        "decode_image_input",
+        AsyncMock(return_value=decoded),
+    )
+
+    pending = asyncio.create_task(endpoint(routes_mod.ChatCompletionRequest(
+        model=model.model_id,
+        messages=[{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,unused"},
+            }],
+        }],
+    )))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert not decoded.closed
+    release.set()
+    await asyncio.wait_for(cleaned.wait(), timeout=1)
+    assert decoded.close_calls == 1
 
 
 def test_legacy_string_content_unaffected():

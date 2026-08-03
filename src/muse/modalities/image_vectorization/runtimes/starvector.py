@@ -141,7 +141,13 @@ class StarVectorRuntime:
                 source,
                 config=config_obj,
                 torch_dtype=self._dtype,
-                low_cpu_mem_usage=True,
+                # This audited composite wraps a Transformers LM inside a
+                # custom vision model.  Transformers 4.49 constructs every
+                # parameter on ``meta`` when low-memory loading is enabled;
+                # aliases omitted from the checkpoint can then survive the
+                # load and make the explicit device move fail.  Constructing
+                # real tensors is less memory-efficient, but deterministic.
+                low_cpu_mem_usage=False,
                 **load_kwargs,
             )
             self._model = self._model.to(self._device)

@@ -14,6 +14,17 @@ from muse.admin.errors import install_admin_error_handler
 from muse.core import config
 
 
+@pytest.fixture(autouse=True)
+def isolated_config(tmp_path, monkeypatch):
+    """Never let auth tests read the operator's real Muse configuration."""
+    monkeypatch.setenv("MUSE_CONFIG", str(tmp_path / "absent-config.yaml"))
+    config.reset_config()
+    try:
+        yield
+    finally:
+        config.reset_config()
+
+
 @pytest.fixture
 def app():
     """A trivial FastAPI app whose only route requires the admin token.

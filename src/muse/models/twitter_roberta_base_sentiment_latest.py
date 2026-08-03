@@ -18,6 +18,7 @@ MANIFEST = {
     "model_id": "twitter-roberta-base-sentiment-latest",
     "modality": "text/classification",
     "hf_repo": "cardiffnlp/twitter-roberta-base-sentiment-latest",
+    "revision": "3216a57f2a0d9c45a2e6c20157c20c49fb4bf9c7",
     "description": (
         "3-label English sentiment classifier (125M, MIT). "
         "Returns positive/neutral/negative with softmax probabilities. "

@@ -50,19 +50,22 @@ def fake_known_models():
 
 
 def test_smoke_one_success_path(tmp_path, fake_known_models):
-    """All four shell-outs succeed; SmokeResult.ok is True; label is OK."""
-    with patch.object(smoke, "_create_venv") as mock_create, \
-         patch.object(smoke, "_install_muse", return_value=(0, "")), \
-         patch.object(smoke, "_install_pip_extras", return_value=(0, "")), \
-         patch.object(smoke, "_run_load_only", return_value=(0, '{"ok": 1}')), \
+    """A bundled model routes through the isolated real-pull pipeline."""
+    expected = smoke.SmokeResult(
+        model_id="fake-model",
+        ok=True,
+        error=None,
+        duration_s=1.0,
+        label="fake-model: OK (1.0s)",
+    )
+    with patch.object(
+             smoke, "_smoke_pulled_model", return_value=expected,
+         ) as pulled, \
          patch("muse.core.catalog.known_models", return_value=fake_known_models):
         result = smoke.smoke_one("fake-model", tmp_path)
 
-    assert result.ok is True
-    assert result.error is None
-    assert result.model_id == "fake-model"
-    assert "OK" in result.label
-    mock_create.assert_called_once()
+    assert result is expected
+    pulled.assert_called_once_with("fake-model", tmp_path)
 
 
 def test_smoke_one_unknown_model(tmp_path, fake_known_models):
@@ -73,70 +76,6 @@ def test_smoke_one_unknown_model(tmp_path, fake_known_models):
     assert result.ok is False
     assert "unknown" in result.error
     assert "unknown model" in result.label
-
-
-def test_smoke_one_pip_install_muse_fails(tmp_path, fake_known_models):
-    """museq[server] install fails; result is FAIL with pip mention."""
-    with patch.object(smoke, "_create_venv"), \
-         patch.object(smoke, "_install_muse",
-                      return_value=(1, "ERROR: no matching distribution\n")), \
-         patch.object(smoke, "_install_pip_extras", return_value=(0, "")), \
-         patch.object(smoke, "_run_load_only", return_value=(0, "")), \
-         patch("muse.core.catalog.known_models", return_value=fake_known_models):
-        result = smoke.smoke_one("fake-model", tmp_path)
-
-    assert result.ok is False
-    assert "museq[server]" in result.error
-    assert "FAIL" in result.label
-
-
-def test_smoke_one_pip_extras_fails(tmp_path, fake_known_models):
-    """pip_extras install fails; result is FAIL with pip extras mention."""
-    with patch.object(smoke, "_create_venv"), \
-         patch.object(smoke, "_install_muse", return_value=(0, "")), \
-         patch.object(smoke, "_install_pip_extras",
-                      return_value=(1, "ERROR: no matching distribution\n")), \
-         patch.object(smoke, "_run_load_only", return_value=(0, "")), \
-         patch("muse.core.catalog.known_models", return_value=fake_known_models):
-        result = smoke.smoke_one("fake-model", tmp_path)
-
-    assert result.ok is False
-    assert "pip_extras" in result.error
-    assert "pip extras" in result.label
-
-
-def test_smoke_one_load_fails_with_missing_dep(tmp_path, fake_known_models):
-    """Worker stderr has ModuleNotFoundError; label mentions the missing dep."""
-    captured = (
-        "Traceback (most recent call last):\n"
-        "  File \".../catalog.py\", line 565, in load_backend\n"
-        "    return cls(hf_repo=...)\n"
-        "ModuleNotFoundError: No module named 'librosa'\n"
-    )
-    with patch.object(smoke, "_create_venv"), \
-         patch.object(smoke, "_install_muse", return_value=(0, "")), \
-         patch.object(smoke, "_install_pip_extras", return_value=(0, "")), \
-         patch.object(smoke, "_run_load_only", return_value=(1, captured)), \
-         patch("muse.core.catalog.known_models", return_value=fake_known_models):
-        result = smoke.smoke_one("fake-model", tmp_path)
-
-    assert result.ok is False
-    assert "missing dep: librosa" in result.label
-    assert result.error is not None
-
-
-def test_smoke_one_load_fails_with_generic_error(tmp_path, fake_known_models):
-    """Worker fails without a recognized signature; label uses fallback."""
-    captured = "load failed: model file not found\n"
-    with patch.object(smoke, "_create_venv"), \
-         patch.object(smoke, "_install_muse", return_value=(0, "")), \
-         patch.object(smoke, "_install_pip_extras", return_value=(0, "")), \
-         patch.object(smoke, "_run_load_only", return_value=(1, captured)), \
-         patch("muse.core.catalog.known_models", return_value=fake_known_models):
-        result = smoke.smoke_one("fake-model", tmp_path)
-
-    assert result.ok is False
-    assert "load failed" in result.label
 
 
 def test_extract_failure_reason_modulenotfound():
@@ -197,10 +136,10 @@ def test_run_inference_probe_accepts_completed_inference(tmp_path):
 
 def test_main_human_output(tmp_path, fake_known_models, capsys):
     """main() without --json prints the SmokeResult.label to stdout."""
-    with patch.object(smoke, "_create_venv"), \
-         patch.object(smoke, "_install_muse", return_value=(0, "")), \
-         patch.object(smoke, "_install_pip_extras", return_value=(0, "")), \
-         patch.object(smoke, "_run_load_only", return_value=(0, "")), \
+    result = smoke.SmokeResult(
+        "fake-model", True, None, 1.0, "fake-model: OK (1.0s)",
+    )
+    with patch.object(smoke, "_smoke_pulled_model", return_value=result), \
          patch("muse.core.catalog.known_models", return_value=fake_known_models):
         rc = smoke.main([
             "--model_id", "fake-model",
@@ -215,10 +154,10 @@ def test_main_human_output(tmp_path, fake_known_models, capsys):
 
 def test_main_json_output(tmp_path, fake_known_models, capsys):
     """main() with --json prints a parseable JSON record."""
-    with patch.object(smoke, "_create_venv"), \
-         patch.object(smoke, "_install_muse", return_value=(0, "")), \
-         patch.object(smoke, "_install_pip_extras", return_value=(0, "")), \
-         patch.object(smoke, "_run_load_only", return_value=(0, "")), \
+    result = smoke.SmokeResult(
+        "fake-model", True, None, 1.0, "fake-model: OK (1.0s)",
+    )
+    with patch.object(smoke, "_smoke_pulled_model", return_value=result), \
          patch("muse.core.catalog.known_models", return_value=fake_known_models):
         rc = smoke.main([
             "--model_id", "fake-model",
@@ -238,13 +177,14 @@ def test_main_json_output(tmp_path, fake_known_models, capsys):
 
 def test_main_failure_returns_non_zero(tmp_path, fake_known_models, capsys):
     """main() returns 1 when the smoke test fails."""
-    with patch.object(smoke, "_create_venv"), \
-         patch.object(smoke, "_install_muse", return_value=(0, "")), \
-         patch.object(smoke, "_install_pip_extras", return_value=(0, "")), \
-         patch.object(
-             smoke, "_run_load_only",
-             return_value=(1, "ModuleNotFoundError: No module named 'librosa'\n"),
-         ), \
+    result = smoke.SmokeResult(
+        "fake-model",
+        False,
+        "load failed: missing dep: librosa",
+        1.0,
+        "fake-model: FAIL (missing dep: librosa)",
+    )
+    with patch.object(smoke, "_smoke_pulled_model", return_value=result), \
          patch("muse.core.catalog.known_models", return_value=fake_known_models):
         rc = smoke.main([
             "--model_id", "fake-model",
@@ -312,8 +252,11 @@ def test_smoke_curated_resolver_success(tmp_path):
         }))
         return MagicMock(returncode=0, stdout="pulled opus-mt-en-es\n", stderr="")
 
-    with patch.object(smoke.subprocess, "run", side_effect=_fake_pull), \
-         patch.object(smoke, "_run_load_only", return_value=(0, '{"ok": 1}')):
+    with patch.object(
+        smoke.subprocess, "run", side_effect=_fake_pull,
+    ) as pull_run, patch.object(
+        smoke, "_run_load_only", return_value=(0, '{"ok": 1}'),
+    ) as probe:
         result = smoke._smoke_curated_resolver(
             "opus-mt-en-es", "hf://Helsinki-NLP/opus-mt-en-es", tmp_path,
         )
@@ -321,6 +264,12 @@ def test_smoke_curated_resolver_success(tmp_path):
     assert result.ok is True
     assert result.model_id == "opus-mt-en-es"
     assert "OK" in result.label
+    pull_cmd = pull_run.call_args.args[0]
+    assert pull_cmd[-3:] == ["pull", "opus-mt-en-es", "--no-probe"]
+    probe_env = probe.call_args.kwargs["env"]
+    catalog_dir = Path(probe_env["MUSE_CATALOG_DIR"])
+    assert catalog_dir.parent == tmp_path
+    assert catalog_dir.name.startswith("muse-catalog-")
 
 
 def test_smoke_curated_resolver_pull_fails(tmp_path):
@@ -425,9 +374,3 @@ def test_repo_root_finds_pyproject():
     root = smoke._repo_root()
     assert (root / "pyproject.toml").exists()
     assert (root / "src" / "muse").exists()
-
-
-def test_venv_python_path_layout():
-    """_venv_python returns the POSIX layout path."""
-    p = Path("/tmp/some-venv")
-    assert smoke._venv_python(p) == p / "bin" / "python"

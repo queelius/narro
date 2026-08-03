@@ -14,6 +14,7 @@ health_payload, summary_payload)`, each `None` on any per-call failure.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -32,16 +33,39 @@ logger = logging.getLogger(__name__)
 # a CPU box) is NOT falsely marked unreachable and dropped from routing. The
 # coordinator overrides this from federation.poll_timeout_seconds.
 _FETCH_TIMEOUT_SECONDS = 10.0
+_MAX_FETCH_BODY_BYTES = 4 * 1024 * 1024
+
+
+def _consume_task_result(task: asyncio.Task) -> None:
+    """Retrieve a detached lifecycle task result to avoid loop warnings."""
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
 
 
 async def _get_json(client: httpx.AsyncClient, url: str, **kwargs) -> dict | None:
     """GET `url` and return parsed JSON, or None on any error (connect,
-    timeout, non-200 status, or a body that is not valid JSON)."""
+    timeout, non-200 status, oversized body, or invalid JSON)."""
     try:
-        response = await client.get(url, **kwargs)
-        response.raise_for_status()
-        return response.json()
-    except (httpx.HTTPError, ValueError):
+        async with client.stream("GET", url, **kwargs) as response:
+            response.raise_for_status()
+            raw_length = response.headers.get("content-length")
+            if raw_length is not None:
+                try:
+                    declared_length = int(raw_length)
+                except ValueError:
+                    return None
+                if declared_length < 0 or declared_length > _MAX_FETCH_BODY_BYTES:
+                    return None
+
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > _MAX_FETCH_BODY_BYTES:
+                    return None
+                body.extend(chunk)
+        return json.loads(body)
+    except (httpx.HTTPError, ValueError, UnicodeError):
         return None
 
 
@@ -90,6 +114,8 @@ class NodeRegistry:
         self._lock = threading.Lock()
         self._states: list[NodeState] = []
         self._task: asyncio.Task | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closing = False
 
     async def _fetch_one(self, spec: NodeSpec) -> NodeState:
         models_payload, health_payload, summary_payload = await self._fetch(
@@ -171,10 +197,18 @@ class NodeRegistry:
                 return spec
         return None
 
-    def start(self) -> None:
-        """Launch the background refresh loop as an asyncio task. One
+    def start(self) -> bool:
+        """Launch the background refresh loop once. One
         failed refresh is logged-and-swallowed (via try/except) rather
-        than killing the loop."""
+        than killing the loop. Repeated calls are idempotent.
+
+        Returns false only while an overlapping ``aclose`` owns teardown.
+        """
+
+        if self._closing:
+            return False
+        if self._task is not None and not self._task.done():
+            return True
 
         async def _loop() -> None:
             while True:
@@ -184,16 +218,59 @@ class NodeRegistry:
                     pass
                 await asyncio.sleep(self._refresh_interval)
 
-        self._task = asyncio.ensure_future(_loop())
+        self._task = asyncio.create_task(_loop())
+        return True
+
+    async def _close_background_task(self, task: asyncio.Task) -> None:
+        """Own cancellation of one refresh task until it actually settles."""
+        try:
+            task.cancel()
+            try:
+                # Caller cancellation must not cancel the shared refresh-task
+                # teardown. It can be retried only when this dedicated owner
+                # itself is cancelled (for example during loop shutdown).
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                if not task.done():
+                    raise
+        except Exception:
+            logger.warning("federation registry close failed", exc_info=True)
+            raise
+        finally:
+            if task.done() and self._task is task:
+                self._task = None
+            current = asyncio.current_task()
+            if self._close_task is current:
+                self._close_task = None
+            self._closing = False
 
     async def aclose(self) -> None:
-        """Cancel the background refresh task and await its cancellation
-        cleanly."""
-        if self._task is None:
-            return
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-        self._task = None
+        """Cancel the refresh loop, sharing one teardown across all callers.
+
+        Every overlapping caller awaits the same shielded lifecycle task. A
+        cancelled waiter therefore cannot strand the registry half-closed or
+        make another waiter return before the refresh task has settled.
+        """
+        close_task = self._close_task
+        if close_task is None:
+            task = self._task
+            if task is None:
+                return
+            self._closing = True
+            try:
+                close_task = asyncio.create_task(
+                    self._close_background_task(task),
+                )
+            except BaseException:
+                self._closing = False
+                raise
+            self._close_task = close_task
+            close_task.add_done_callback(_consume_task_result)
+            # Be correct under an eager task factory: teardown may have
+            # completed synchronously before `_close_task` was assigned.
+            if close_task.done() and self._close_task is close_task:
+                self._close_task = None
+        await asyncio.shield(close_task)

@@ -19,6 +19,7 @@ MANIFEST = {
     "model_id": "ast-audioset",
     "modality": "audio/classification",
     "hf_repo": "MIT/ast-finetuned-audioset-10-10-0.4593",
+    "revision": "f826b80d28226b62986cc218e5cec390b1096902",
     "description": (
         "AST AudioSet: 527 classes (speech, music, animals, vehicles, "
         "alarms, household, etc.), multi-label, BSD-3-Clause."

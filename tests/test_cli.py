@@ -6,8 +6,23 @@ The CLI surface is deliberately modality-agnostic:
 No per-modality subcommands — those would be hardcoded modality→verb
 mappings (the anti-pattern this CLI design rejects).
 """
+import os
 import subprocess
 import sys
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_muse_state(tmp_path, monkeypatch):
+    """Keep CLI subprocesses away from the developer's Muse state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MUSE_CATALOG_DIR", str(tmp_path / "catalog"))
+    monkeypatch.setenv("MUSE_CONFIG", str(tmp_path / "config.yaml"))
+    monkeypatch.delenv("MUSE_MODELS_DIR", raising=False)
+    monkeypatch.delenv("MUSE_ADMIN_TOKEN", raising=False)
 
 
 def _run(*args, timeout=30):
@@ -58,6 +73,18 @@ def test_models_help_lists_subcommands():
     combined = r.stdout + r.stderr
     for cmd in ("list", "info", "remove"):
         assert cmd in combined, f"models {cmd!r} missing from help"
+
+
+def test_doctor_resources_command_parses_without_inspecting_processes():
+    import typer
+
+    from muse.cli import app
+
+    doctor = typer.main.get_command(app).commands["doctor"]
+    resources = doctor.commands["resources"]
+    opts = [opt for param in resources.params for opt in param.opts]
+    assert "--repair" in opts
+    assert "--grace" in opts
 
 
 def test_models_list_shows_entries_across_all_modalities():

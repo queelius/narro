@@ -1,5 +1,7 @@
+import pytest
+
 from muse.federation.nodes import NodeSpec
-from muse.federation.state import build_node_state
+from muse.federation.state import _MAX_NODE_MODELS, build_node_state
 
 SPEC = NodeSpec(url="http://a:8000", name="a")
 
@@ -35,3 +37,78 @@ def test_entry_missing_id_is_skipped_not_raised():
     assert st.reachable is True
     assert "m1" in st.models and st.models["m1"].loaded is True
     assert len(st.models) == 1  # the id-less entry is absent, not raised
+
+
+def test_malformed_remote_entries_are_skipped_without_truth_coercion():
+    st = build_node_state(
+        SPEC,
+        models_payload={
+            "data": [
+                "not-a-mapping",
+                {"id": "string-false", "loaded": "false"},
+                {"id": "real-true", "loaded": True},
+            ]
+        },
+        health_payload={"status": "ok"},
+        summary_payload=None,
+        now=8.0,
+    )
+
+    assert st.reachable is True
+    assert set(st.models) == {"string-false", "real-true"}
+    assert st.models["string-false"].loaded is False
+    assert st.models["real-true"].loaded is True
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"in_flight": "0"},
+        {"in_flight": True},
+        {"in_flight": -1},
+        {"in_flight": 1.5},
+        ["not", "a", "mapping"],
+    ],
+)
+def test_malformed_in_flight_degrades_to_unknown(summary):
+    st = build_node_state(
+        SPEC,
+        models_payload={"data": [{"id": "m", "loaded": False}]},
+        health_payload={"status": "ok"},
+        summary_payload=summary,
+        now=9.0,
+    )
+
+    assert st.in_flight is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], {"data": {}}, {"data": "not-a-list"}],
+)
+def test_malformed_models_payload_is_unreachable(payload):
+    st = build_node_state(
+        SPEC,
+        models_payload=payload,
+        health_payload={"status": "ok"},
+        summary_payload={"in_flight": 0},
+        now=10.0,
+    )
+
+    assert st.reachable is False
+    assert st.models == {}
+
+
+def test_oversized_model_list_is_unreachable_and_not_cached():
+    st = build_node_state(
+        SPEC,
+        models_payload={
+            "data": [{"id": f"model-{index}"} for index in range(_MAX_NODE_MODELS + 1)]
+        },
+        health_payload={"status": "ok"},
+        summary_payload=None,
+        now=11.0,
+    )
+
+    assert st.reachable is False
+    assert st.models == {}

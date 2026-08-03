@@ -187,6 +187,7 @@ def test_load_curated_parses_capabilities_overlay():
     yaml_text = """
 - id: q3e
   uri: hf://Qwen/Qwen3-Embedding-0.6B
+  revision: "1111111111111111111111111111111111111111"
   modality: embedding/text
   size_gb: 0.6
   description: Qwen3-Embedding 0.6B
@@ -200,6 +201,33 @@ def test_load_curated_parses_capabilities_overlay():
     e = entries[0]
     assert e.id == "q3e"
     assert e.capabilities == {"trust_remote_code": True, "matryoshka": True}
+    assert e.revision == "1" * 40
+
+
+def test_load_curated_rejects_remote_code_without_concrete_revision():
+    yaml_text = """
+- id: unsafe
+  uri: hf://org/unsafe
+  modality: embedding/text
+  capabilities:
+    trust_remote_code: true
+"""
+    with _patch_yaml(yaml_text):
+        assert load_curated() == []
+
+
+def test_load_curated_rejects_non_commit_code_revision():
+    yaml_text = """
+- id: unsafe-code
+  uri: hf://org/unsafe
+  revision: "1111111111111111111111111111111111111111"
+  code_revision: main
+  modality: embedding/text
+  capabilities:
+    trust_remote_code: true
+"""
+    with _patch_yaml(yaml_text):
+        assert load_curated() == []
 
 
 def test_load_curated_capabilities_defaults_to_empty_dict():

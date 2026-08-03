@@ -24,6 +24,7 @@ updating; the test structure stays.
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -151,6 +152,20 @@ def test_image_to_3d_returns_glb_in_result():
     fake_mesh.export.assert_called_once_with(file_type="glb")
 
 
+def test_in_place_device_move_returning_none_keeps_shape_pipeline():
+    pipeline, _, _, _ = _wire_runtime()
+    pipeline.to.return_value = None
+
+    runtime = mod.Hunyuan3DRuntime(
+        model_id="hunyuan3d-2",
+        hf_repo="tencent/Hunyuan3D-2",
+        device="cpu",
+    )
+
+    assert runtime._pipeline is pipeline
+    pipeline.to.assert_called_once()
+
+
 def test_image_to_3d_calls_pipeline_with_image_kwarg():
     """Regression guard: image is passed as image= kwarg to pipeline(), not positional."""
     pipeline, _, _, _ = _wire_runtime()
@@ -223,6 +238,42 @@ def test_text_to_3d_passes_t2i_output_image_to_shape_pipeline():
     assert shape_call_kwargs.get("image") is fake_pil_image
 
 
+def test_text_to_3d_closes_t2i_image_after_shape_inference():
+    """The request-local stage-one image closes after shape inference."""
+    _, t2i_factory, _, _ = _wire_runtime()
+    runtime = mod.Hunyuan3DRuntime(model_id="m", hf_repo="x", device="cpu")
+
+    runtime.text_to_3d("test prompt")
+
+    t2i_factory.return_value.return_value.close.assert_called_once_with()
+
+
+def test_text_to_3d_closes_t2i_image_when_shape_pipeline_raises():
+    pipeline, t2i_factory, _, _ = _wire_runtime()
+    failure = RuntimeError("shape inference failed")
+    pipeline.side_effect = failure
+    runtime = mod.Hunyuan3DRuntime(model_id="m", hf_repo="x", device="cpu")
+
+    with pytest.raises(RuntimeError) as caught:
+        runtime.text_to_3d("test prompt")
+
+    assert caught.value is failure
+    t2i_factory.return_value.return_value.close.assert_called_once_with()
+
+
+def test_text_to_3d_closes_t2i_image_when_shape_pipeline_is_cancelled():
+    pipeline, t2i_factory, _, _ = _wire_runtime()
+    cancellation = asyncio.CancelledError("request cancelled")
+    pipeline.side_effect = cancellation
+    runtime = mod.Hunyuan3DRuntime(model_id="m", hf_repo="x", device="cpu")
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        runtime.text_to_3d("test prompt")
+
+    assert caught.value is cancellation
+    t2i_factory.return_value.return_value.close.assert_called_once_with()
+
+
 def test_text_to_3d_forwards_num_inference_steps():
     """num_inference_steps is forwarded to the shape pipeline in text_to_3d."""
     pipeline, _, _, _ = _wire_runtime()
@@ -277,6 +328,73 @@ def test_local_dir_preferred_over_hf_repo():
     )
     src_arg = mod._HUNYUAN3D_PIPELINE.from_pretrained.call_args.args[0]
     assert src_arg == "/tmp/local-hunyuan"
+
+
+def test_managed_bundle_routes_both_pipelines_to_local_members(tmp_path):
+    _wire_runtime()
+    shape_dir = tmp_path / "shape"
+    t2i_dir = tmp_path / "text_to_image"
+    shape_dir.mkdir()
+    t2i_dir.mkdir()
+    runtime = mod.Hunyuan3DRuntime(
+        model_id="m",
+        hf_repo="tencent/Hunyuan3D-2",
+        local_dir=str(tmp_path),
+        shape_model_subdir="shape",
+        t2i_model_subdir="text_to_image",
+        device="cpu",
+    )
+
+    assert mod._HUNYUAN3D_PIPELINE.from_pretrained.call_args.args[0] == str(shape_dir)
+    runtime.text_to_3d("a chair")
+    assert mod._HUNYUAN3D_T2I_PIPELINE.call_args.args[0] == str(t2i_dir)
+
+
+def test_legacy_local_entry_never_falls_back_to_hidden_t2i_download():
+    _wire_runtime()
+    runtime = mod.Hunyuan3DRuntime(
+        model_id="m",
+        hf_repo="tencent/Hunyuan3D-2",
+        local_dir="/tmp/legacy-local-hunyuan",
+        device="cpu",
+    )
+
+    with pytest.raises(RuntimeError, match="re-pull"):
+        runtime.text_to_3d("a chair")
+
+    mod._HUNYUAN3D_T2I_PIPELINE.assert_not_called()
+
+
+@pytest.mark.parametrize("subdir", ("../escape", "/absolute", ".", ""))
+def test_managed_bundle_rejects_unsafe_subdirectory(tmp_path, subdir):
+    _wire_runtime()
+    with pytest.raises(RuntimeError, match="Hunyuan3D invalid"):
+        mod.Hunyuan3DRuntime(
+            model_id="m",
+            hf_repo="tencent/Hunyuan3D-2",
+            local_dir=str(tmp_path),
+            shape_model_subdir=subdir,
+            t2i_model_subdir="text_to_image",
+            device="cpu",
+        )
+
+
+def test_managed_bundle_rejects_symlink_member(tmp_path):
+    _wire_runtime()
+    outside = tmp_path.parent / "outside-shape"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "shape").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "text_to_image").mkdir()
+
+    with pytest.raises(RuntimeError, match="re-pull"):
+        mod.Hunyuan3DRuntime(
+            model_id="m",
+            hf_repo="tencent/Hunyuan3D-2",
+            local_dir=str(tmp_path),
+            shape_model_subdir="shape",
+            t2i_model_subdir="text_to_image",
+            device="cpu",
+        )
 
 
 def test_constructor_does_not_pass_trust_remote_code_to_from_pretrained():

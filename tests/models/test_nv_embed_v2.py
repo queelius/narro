@@ -42,6 +42,15 @@ def test_nv_embed_model_id_and_dimensions():
         assert m.dimensions == 4096
 
 
+def test_manifest_declares_and_pins_remote_code():
+    from muse.models.nv_embed_v2 import MANIFEST
+
+    assert MANIFEST["capabilities"]["trust_remote_code"] is True
+    revision = MANIFEST["revision"]
+    assert len(revision) == 40
+    assert all(c in "0123456789abcdef" for c in revision)
+
+
 def test_nv_embed_passes_trust_remote_code():
     """NV-Embed ships a custom Mistral-based architecture in its HF repo."""
     with patch("muse.models.nv_embed_v2.AutoModel") as mock_cls:
@@ -50,6 +59,16 @@ def test_nv_embed_passes_trust_remote_code():
         NVEmbedV2Backend(hf_repo="nvidia/NV-Embed-v2", local_dir="/fake")
         kwargs = mock_cls.from_pretrained.call_args.kwargs
         assert kwargs.get("trust_remote_code") is True
+
+
+def test_nv_embed_remote_fallback_passes_reviewed_revision():
+    with patch("muse.models.nv_embed_v2.AutoModel") as mock_cls:
+        mock_cls.from_pretrained.return_value = _mock_model()
+        from muse.models.nv_embed_v2 import MANIFEST, Model
+
+        Model(hf_repo="nvidia/NV-Embed-v2", local_dir=None, device="cpu")
+
+    assert mock_cls.from_pretrained.call_args.kwargs["revision"] == MANIFEST["revision"]
 
 
 def test_nv_embed_embed_single_string():

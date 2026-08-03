@@ -23,7 +23,7 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _CLASSIFIER_RUNTIME = (
@@ -75,6 +75,7 @@ def _is_zero_shot(info) -> bool:
 
 
 def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
+    revision = hf_commit_revision(info)
     is_zs = _is_zero_shot(info)
     runtime_path = _ZERO_SHOT_RUNTIME if is_zs else _CLASSIFIER_RUNTIME
     capabilities: dict = {
@@ -95,6 +96,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         # text-classification repos commonly ship pytorch_model.bin +
@@ -113,6 +116,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             repo_id=repo_id,
             allow_patterns=allow_patterns,
             cache_dir=str(cache_root) if cache_root else None,
+            revision=revision,
         ))
 
     return ResolvedModel(

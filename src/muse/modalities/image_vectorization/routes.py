@@ -10,7 +10,11 @@ from fastapi.responses import JSONResponse, Response
 from muse.core import config
 from muse.core.errors import ModelNotFoundError, error_response
 from muse.core.registry import ModalityRegistry
-from muse.modalities.image_generation.image_input import decode_image_file
+from muse.modalities._native_offload import run_native_offload
+from muse.modalities.image_generation.image_input import (
+    close_decoded_images,
+    decode_image_file,
+)
 from muse.modalities.image_vectorization.codec import encode_vectorization
 from muse.modalities.image_vectorization.protocol import (
     VectorizationOutputError,
@@ -118,8 +122,17 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
             result.source_height = height
             return result
 
+        abandoned = False
         try:
-            result = await asyncio.to_thread(_call)
+            result = await run_native_offload(
+                _call,
+                cleanup_abandoned=(
+                    lambda _result: close_decoded_images([source])
+                ),
+            )
+        except asyncio.CancelledError:
+            abandoned = True
+            raise
         except VectorizationOutputError as exc:
             logger.warning("vectorization produced invalid SVG: %s", exc)
             return error_response(
@@ -132,6 +145,9 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 500, "internal_error",
                 "vectorization backend failed; see server logs",
             )
+        finally:
+            if not abandoned:
+                close_decoded_images([source])
 
         # Registry identity is authoritative if a backend accidentally
         # reports an upstream repo id instead of Muse's catalog id.

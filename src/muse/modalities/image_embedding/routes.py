@@ -32,8 +32,13 @@ from pydantic import BaseModel, Field, field_validator
 from muse.core import config
 from muse.core.errors import ModelNotFoundError, error_response
 from muse.core.registry import ModalityRegistry
+from muse.modalities._native_offload import run_native_offload
 from muse.modalities.image_embedding.codec import embedding_to_base64
-from muse.modalities.image_generation.image_input import decode_image_input
+from muse.modalities.image_generation.image_input import (
+    close_decoded_images,
+    decode_image_input,
+    validate_total_image_pixels,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -104,13 +109,24 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
         # Decode each input entry into a PIL.Image. Failures surface as
         # 400s with the OpenAI-shape error envelope; one bad input
         # nukes the whole batch (consistent with /v1/embeddings).
+        images = []
         try:
-            images = [await decode_image_input(item) for item in items]
+            for item in items:
+                images.append(await decode_image_input(item))
+                validate_total_image_pixels(images)
         except ValueError as e:
+            close_decoded_images(images)
             return error_response(
                 400, "invalid_parameter",
                 f"image decode failed: {e}",
             )
+        except BaseException:
+            # A later URL decode may be cancelled or fail unexpectedly after
+            # earlier entries have already produced request-owned PIL images.
+            # Preserve the original control flow, but do not strand those
+            # decoded rasters until cyclic GC runs.
+            close_decoded_images(images)
+            raise
 
         # backend.embed is sync (transformers forward); offload so a slow
         # inference doesn't block sibling /health, /v1/models, or other
@@ -119,7 +135,20 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
             with backend._inference_lock:
                 return backend.embed(images, dimensions=req.dimensions)
 
-        result = await asyncio.to_thread(_call)
+        abandoned = False
+        try:
+            result = await run_native_offload(
+                _call,
+                cleanup_abandoned=(
+                    lambda _result: close_decoded_images(images)
+                ),
+            )
+        except asyncio.CancelledError:
+            abandoned = True
+            raise
+        finally:
+            if not abandoned:
+                close_decoded_images(images)
 
         data = []
         for i, vec in enumerate(result.embeddings):

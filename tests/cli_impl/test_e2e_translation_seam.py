@@ -70,7 +70,13 @@ def _wire_forward(mock_client_cls: MagicMock, body: bytes) -> MagicMock:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.headers = {"content-type": "application/json"}
-    mock_response.aread = AsyncMock(return_value=body)
+
+    def _aiter_raw(*, chunk_size=None):
+        async def _chunks():
+            yield body
+        return _chunks()
+
+    mock_response.aiter_raw = _aiter_raw
 
     stream_ctx = MagicMock()
     stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)

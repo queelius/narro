@@ -21,6 +21,10 @@ pull time. See `catalog._pull_via_resolver` for merge semantics (overlay
 wins on key collision). Only applied to resolver entries; ignored for
 bundled entries since those carry their own MANIFEST.
 
+Resolver entries that enable `trust_remote_code` must also declare a full
+immutable `revision`; `code_revision` pins an external repository referenced
+by Transformers `auto_map`.
+
 The list is loaded once at import and cached. Restart muse to pick up
 edits to the YAML (matches the rest of muse's "static at startup"
 discovery model).
@@ -28,6 +32,7 @@ discovery model).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from importlib.resources import files
 from typing import Any
@@ -52,9 +57,15 @@ class CuratedEntry:
     # manifest at pull time (shallow merge; overlay wins on collision).
     # See catalog._pull_via_resolver.
     capabilities: dict = field(default_factory=dict)
+    # Immutable Hugging Face commits selected during curation.  `revision`
+    # pins model artifacts; `code_revision` separately pins an external
+    # repository named by a Transformers auto_map (for example Nomic BERT).
+    revision: str | None = None
+    code_revision: str | None = None
 
 
 _CURATED_CACHE: list[CuratedEntry] | None = None
+_CONCRETE_HF_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _curated_yaml_path():
@@ -123,6 +134,30 @@ def _entry_from_dict(d: dict) -> CuratedEntry:
         raise ValueError(
             f"entry {d['id']!r}: 'capabilities' must be a mapping, got {type(caps).__name__}"
         )
+    revision = d.get("revision")
+    code_revision = d.get("code_revision")
+    for field_name, value in (
+        ("revision", revision),
+        ("code_revision", code_revision),
+    ):
+        if value is not None and (
+            not isinstance(value, str)
+            or not _CONCRETE_HF_REVISION_RE.fullmatch(value)
+        ):
+            raise ValueError(
+                f"entry {d['id']!r}: '{field_name}' must be a full "
+                "40-character lowercase commit SHA"
+            )
+    if caps.get("trust_remote_code") and uri and revision is None:
+        raise ValueError(
+            f"entry {d['id']!r}: trust_remote_code requires a concrete "
+            "reviewed 'revision'"
+        )
+    if code_revision is not None and not caps.get("trust_remote_code"):
+        raise ValueError(
+            f"entry {d['id']!r}: 'code_revision' requires "
+            "capabilities.trust_remote_code: true"
+        )
     return CuratedEntry(
         id=d["id"],
         bundled=bundled,
@@ -132,6 +167,8 @@ def _entry_from_dict(d: dict) -> CuratedEntry:
         description=d.get("description"),
         tags=tuple(d.get("tags", ())),
         capabilities=dict(caps),
+        revision=revision,
+        code_revision=code_revision,
     )
 
 

@@ -37,7 +37,10 @@ def test_runtime_path_for_triposr():
     "repo_id,required_substrings",
     [
         ("openai/shap-e", ("torch", "diffusers", "trimesh")),
-        ("JeffreyXiang/TRELLIS-image-large", ("torch", "transformers", "trimesh", "trellis")),
+        (
+            "JeffreyXiang/TRELLIS-image-large",
+            ("torch", "transformers", "trimesh", "rembg", "easydict", "utils3d"),
+        ),
         ("tencent/Hunyuan3D-2", ("torch", "trimesh", "hy3dgen")),
     ],
 )
@@ -63,7 +66,7 @@ def test_family_for_shap_e_returns_shape_e_family():
     assert family.runtime_path == _SHAPE_E_RUNTIME_PATH
     assert family.capability_overrides.get("supports_text_to_3d") is True
     assert family.capability_overrides.get("supports_image_to_3d") is False
-    assert family.trust_remote_code is False
+    assert not hasattr(family, "trust_remote_code")
 
 
 def test_family_for_unknown_returns_default_triposr_family():
@@ -71,7 +74,7 @@ def test_family_for_unknown_returns_default_triposr_family():
     family = _family_for("some/unknown-repo")
     assert family.runtime_path == _TRIPOSR_RUNTIME_PATH
     assert family.capability_overrides == {}
-    assert family.trust_remote_code is False
+    assert not hasattr(family, "trust_remote_code")
 
 
 def test_family_for_rejects_false_positive_substring():
@@ -104,10 +107,36 @@ def test_shape_e_family_has_empty_system_packages():
     assert family.system_packages == ()
 
 
-def test_family_for_trellis_has_trust_remote_code_true():
+def test_family_for_trellis_uses_installed_sdk_not_transformers_remote_code():
     from muse.modalities.model_3d_generation.hf import _family_for
     family = _family_for("JeffreyXiang/TRELLIS-image-large")
-    assert family.trust_remote_code is True
+    assert not hasattr(family, "trust_remote_code")
+
+
+def test_family_for_trellis_declares_exact_reviewed_source_and_submodule():
+    from muse.modalities.model_3d_generation.hf import _family_for
+
+    family = _family_for("JeffreyXiang/TRELLIS-image-large")
+    assert family.system_packages == ("git", "nvcc")
+    assert family.python_sources == ({
+        "type": "git",
+        "name": "trellis",
+        "url": "https://github.com/microsoft/TRELLIS.git",
+        "revision": "442aa1e1afb9014e80681d3bf604e8d728a86ee7",
+        "sparse_paths": ("trellis",),
+        "required_paths": (
+            "trellis/__init__.py",
+            "trellis/pipelines/trellis_image_to_3d.py",
+            "trellis/representations/mesh/flexicubes/flexicubes.py",
+        ),
+        "pth_path": ".",
+        "submodules": ({
+            "path": "trellis/representations/mesh/flexicubes",
+            "url": "https://github.com/MaxtirError/FlexiCubes.git",
+            "revision": "815e075a2a400d06c48d94c347674344ed6ae5c5",
+        },),
+    },)
+    assert not any("microsoft/TRELLIS.git" in extra for extra in family.pip_extras)
 
 
 def test_family_for_trellis_has_correct_capability_overrides():
@@ -119,18 +148,20 @@ def test_family_for_trellis_has_correct_capability_overrides():
     assert family.capability_overrides.get("supports_text_to_3d") is False
 
 
-def test_resolve_trellis_manifest_includes_trust_remote_code_capability():
-    """Integration: the synthesized manifest carries trust_remote_code=True
-    in capabilities so the runtime constructor receives it via the kwargs splat."""
+def test_resolve_trellis_manifest_omits_transformers_remote_code_capability():
+    """The installed TRELLIS SDK is not Transformers dynamic remote code."""
     from unittest.mock import MagicMock
-    from muse.modalities.model_3d_generation.hf import _resolve
+    from muse.modalities.model_3d_generation.hf import _family_for, _resolve
     info = MagicMock()
     info.card_data = None
     resolved = _resolve("JeffreyXiang/TRELLIS-image-large", None, info)
     caps = resolved.manifest["capabilities"]
-    assert caps.get("trust_remote_code") is True
+    assert "trust_remote_code" not in caps
     assert caps.get("supports_image_to_3d") is True
     assert caps.get("supports_text_to_3d") is False
+    family_sources = _family_for("JeffreyXiang/TRELLIS-image-large").python_sources
+    assert resolved.manifest["python_sources"] == list(family_sources)
+    assert resolved.manifest["python_sources"][0] is not family_sources[0]
 
 
 def test_runtime_path_for_hunyuan3d_now_dispatches_to_Hunyuan3DRuntime():
@@ -139,10 +170,10 @@ def test_runtime_path_for_hunyuan3d_now_dispatches_to_Hunyuan3DRuntime():
     assert _family_for("tencent/Hunyuan3D-2").runtime_path.endswith(":Hunyuan3DRuntime")
 
 
-def test_family_for_hunyuan3d_has_trust_remote_code_true():
+def test_family_for_hunyuan3d_uses_installed_sdk_not_transformers_remote_code():
     from muse.modalities.model_3d_generation.hf import _family_for
     family = _family_for("tencent/Hunyuan3D-2")
-    assert family.trust_remote_code is True
+    assert not hasattr(family, "trust_remote_code")
 
 
 def test_family_for_hunyuan3d_has_dual_direction_capabilities():
@@ -154,13 +185,13 @@ def test_family_for_hunyuan3d_has_dual_direction_capabilities():
 
 
 def test_resolve_hunyuan3d_manifest_includes_dual_direction_capabilities():
-    """Integration: synthesized manifest carries both flags + trust_remote_code."""
+    """The installed Hunyuan SDK supplies both supported directions."""
     from unittest.mock import MagicMock
     from muse.modalities.model_3d_generation.hf import _resolve
     info = MagicMock()
     info.card_data = None
     resolved = _resolve("tencent/Hunyuan3D-2", None, info)
     caps = resolved.manifest["capabilities"]
-    assert caps.get("trust_remote_code") is True
+    assert "trust_remote_code" not in caps
     assert caps.get("supports_image_to_3d") is True
     assert caps.get("supports_text_to_3d") is True

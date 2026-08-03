@@ -6,10 +6,148 @@ import pytest
 from fastapi.testclient import TestClient
 
 from muse.cli_impl.gateway import (
+    RequestBodyLimitMiddleware,
+    RequestBodyTooLarge,
+    _prefetch_worker_response,
+    _proxy_headers,
+    cache_bounded_request_body,
     extract_model_from_request,
     build_gateway,
     WorkerRoute,
 )
+
+
+class _RawResponse:
+    """Minimal httpx response stream double for bounded relay tests."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.chunk_size = None
+
+    def aiter_raw(self, *, chunk_size=None):
+        self.chunk_size = chunk_size
+
+        async def _chunks():
+            for chunk in self.chunks:
+                yield chunk
+
+        return _chunks()
+
+
+def test_proxy_headers_strip_standard_and_connection_named_hops():
+    headers = {
+        "Host": "worker.invalid",
+        "Connection": "keep-alive, x-private-hop",
+        "Keep-Alive": "timeout=5",
+        "X-Private-Hop": "do-not-forward",
+        "X-End-To-End": "preserve",
+    }
+
+    assert _proxy_headers(
+        headers, exclude=frozenset({"host"}),
+    ) == [(b"X-End-To-End", b"preserve")]
+
+
+@pytest.mark.asyncio
+async def test_worker_response_prefetch_buffers_only_under_limit():
+    response = _RawResponse([b"ab", b"cd"])
+    content, prefix, iterator = await _prefetch_worker_response(
+        response, limit=4,
+    )
+
+    assert content == b"abcd"
+    assert prefix == []
+    assert iterator is None
+    assert response.chunk_size == 64 * 1024
+
+
+@pytest.mark.asyncio
+async def test_worker_response_prefetch_hands_off_oversized_body():
+    response = _RawResponse([b"abc", b"def", b"ghi"])
+    content, prefix, iterator = await _prefetch_worker_response(
+        response, limit=4,
+    )
+
+    assert content is None
+    assert prefix == [b"abc", b"def"]
+    assert b"".join([chunk async for chunk in iterator]) == b"ghi"
+
+
+@pytest.mark.asyncio
+async def test_large_non_sse_response_streams_and_releases_after_consumption():
+    from fastapi.responses import StreamingResponse
+    from muse.cli_impl.gateway import _forward_with_release
+
+    chunks = [b"a" * 600_000, b"b" * 600_000, b"tail"]
+    upstream = _RawResponse(chunks)
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "application/octet-stream"}
+    mock_response.aiter_raw = upstream.aiter_raw
+
+    stream_ctx = MagicMock()
+    stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+    stream_ctx.__aexit__ = AsyncMock(return_value=None)
+    mock_client = MagicMock()
+    mock_client.stream.return_value = stream_ctx
+    mock_client.aclose = AsyncMock()
+    request = MagicMock()
+    request.body = AsyncMock(return_value=b"")
+    request.headers = {}
+    request.method = "GET"
+    request.query_params = {}
+    director = MagicMock()
+
+    with patch(
+        "muse.cli_impl.gateway.httpx.AsyncClient",
+        return_value=mock_client,
+    ):
+        response = await _forward_with_release(
+            request,
+            "http://127.0.0.1:9001/artifact",
+            1.0,
+            director=director,
+            model_id="artifact-model",
+        )
+
+    assert isinstance(response, StreamingResponse)
+    director.release.assert_not_called()
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    assert body == b"".join(chunks)
+    director.release.assert_called_once_with("artifact-model")
+    stream_ctx.__aexit__.assert_awaited_once()
+    mock_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_director_release_when_stream_context_creation_fails():
+    from muse.cli_impl.gateway import _forward_with_release
+
+    request = MagicMock()
+    request.body = AsyncMock(return_value=b"")
+    request.headers = {}
+    request.method = "GET"
+    request.query_params = {}
+    director = MagicMock()
+    mock_client = MagicMock()
+    mock_client.stream.side_effect = ValueError("invalid worker URL")
+    mock_client.aclose = AsyncMock()
+
+    with patch(
+        "muse.cli_impl.gateway.httpx.AsyncClient",
+        return_value=mock_client,
+    ):
+        with pytest.raises(ValueError, match="invalid worker URL"):
+            await _forward_with_release(
+                request,
+                "invalid://worker",
+                1.0,
+                director=director,
+                model_id="broken-model",
+            )
+
+    director.release.assert_called_once_with("broken-model")
+    mock_client.aclose.assert_awaited_once()
 
 
 class TestExtractModel:
@@ -109,6 +247,8 @@ class TestExtractModel:
         request = Request(scope, receive=receive)
         model = await extract_model_from_request(request)
         assert model == "whisper-tiny"
+        upload = request._form.get("file")
+        assert upload.file.closed is True
 
     @pytest.mark.asyncio
     async def test_returns_none_when_multipart_body_has_no_model_field(self):
@@ -152,6 +292,91 @@ class TestWorkerRoute:
         assert r.worker_url == "http://127.0.0.1:9001"
 
 
+class TestBoundedRequestBody:
+    @pytest.mark.asyncio
+    async def test_chunked_body_is_bounded_without_content_length(self):
+        from starlette.requests import Request
+
+        messages = iter([
+            {"type": "http.request", "body": b"1234", "more_body": True},
+            {"type": "http.request", "body": b"5678", "more_body": False},
+        ])
+
+        async def receive():
+            return next(messages)
+
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/test",
+            "headers": [],
+            "query_string": b"",
+        }, receive=receive)
+
+        with pytest.raises(RequestBodyTooLarge) as exc_info:
+            await cache_bounded_request_body(request, limit=7)
+        assert exc_info.value.observed == 8
+
+    @pytest.mark.asyncio
+    async def test_bounded_body_is_cached_for_later_forwarding(self):
+        from starlette.requests import Request
+
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            assert sent is False
+            sent = True
+            return {"type": "http.request", "body": b"payload", "more_body": False}
+
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/test",
+            "headers": [],
+            "query_string": b"",
+        }, receive=receive)
+        assert await cache_bounded_request_body(request, limit=8) == b"payload"
+        assert await request.body() == b"payload"
+        assert sent is True
+
+    @pytest.mark.asyncio
+    async def test_global_middleware_rejects_chunked_body_before_route(self):
+        called = False
+
+        async def downstream(_scope, _receive, _send):
+            nonlocal called
+            called = True
+
+        messages = iter([
+            {"type": "http.request", "body": b"1234", "more_body": True},
+            {"type": "http.request", "body": b"5678", "more_body": False},
+        ])
+        sent = []
+
+        async def receive():
+            return next(messages)
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = RequestBodyLimitMiddleware(downstream, limit=7)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/admin/example",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+
+        assert called is False
+        assert sent[0]["status"] == 413
+        assert b"request_too_large" in sent[1]["body"]
+
+
 class TestBuildGateway:
     def test_returns_fastapi_app(self):
         from fastapi import FastAPI
@@ -174,6 +399,63 @@ class TestBuildGateway:
 
 
 class TestProxy:
+    def test_proxy_rejects_oversized_body_before_outbound_http(self):
+        routes = [
+            WorkerRoute(
+                model_id="soprano-80m", worker_url="http://127.0.0.1:9001",
+            )
+        ]
+        app = build_gateway(routes, max_request_body_bytes=48)
+        client = TestClient(app)
+
+        with patch("muse.cli_impl.gateway.httpx.AsyncClient") as mock_client_cls:
+            response = client.post(
+                "/v1/audio/speech",
+                json={"model": "soprano-80m", "input": "x" * 128},
+            )
+
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "request_too_large"
+        mock_client_cls.assert_not_called()
+
+    def test_explicit_route_is_also_protected_by_global_body_limit(self):
+        app = build_gateway([], max_request_body_bytes=8)
+        client = TestClient(app)
+
+        response = client.request("GET", "/v1/models", content=b"x" * 9)
+
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "request_too_large"
+
+    @pytest.mark.parametrize("model", [[], {}, 1, True, "", " " * 3])
+    def test_non_string_or_empty_model_returns_invalid_model(self, model):
+        app = build_gateway([
+            WorkerRoute(
+                model_id="soprano-80m",
+                worker_url="http://127.0.0.1:9001",
+            ),
+        ])
+        client = TestClient(app)
+
+        with patch("muse.cli_impl.gateway.httpx.AsyncClient") as outbound:
+            response = client.post(
+                "/v1/audio/speech",
+                json={"model": model, "input": "hi"},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_model"
+        outbound.assert_not_called()
+
+    def test_overlong_model_returns_invalid_model(self):
+        app = build_gateway([])
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"model": "m" * 513, "input": "hi"},
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_model"
+
     def test_proxy_forwards_post_to_matching_worker(self):
         routes = [WorkerRoute(model_id="soprano-80m", worker_url="http://127.0.0.1:9001")]
         app = build_gateway(routes)
@@ -188,7 +470,9 @@ class TestProxy:
             mock_response = MagicMock()
             mock_response.status_code = 200
             mock_response.headers = {"content-type": "application/json"}
-            mock_response.aread = AsyncMock(return_value=b'{"ok": true}')
+            mock_response.aiter_raw = _RawResponse(
+                [b'{"ok": true}'],
+            ).aiter_raw
 
             stream_ctx = MagicMock()
             stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
@@ -202,6 +486,7 @@ class TestProxy:
             })
 
         assert r.status_code == 200
+        assert r.json() == {"ok": True}
         # The stream() call should have targeted the worker url
         call_kwargs = mock_client.stream.call_args.kwargs
         call_args = mock_client.stream.call_args.args
@@ -246,7 +531,9 @@ class TestProxy:
             mock_response = MagicMock()
             mock_response.status_code = 200
             mock_response.headers = {"content-type": "application/json"}
-            mock_response.aread = AsyncMock(return_value=b'{"text":"hello"}')
+            mock_response.aiter_raw = _RawResponse(
+                [b'{"text":"hello"}'],
+            ).aiter_raw
 
             stream_ctx = MagicMock()
             stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
@@ -269,6 +556,7 @@ class TestProxy:
         # Must not be 500 or 400 - the multipart body must have been
         # parsed for routing AND forwarded with its bytes intact.
         assert r.status_code == 200, f"got {r.status_code}: {r.text}"
+        assert r.json() == {"text": "hello"}
         assert captured_body["url"] == "http://127.0.0.1:9099/v1/audio/transcriptions"
         # The forwarded body must contain the multipart payload, not be empty
         forwarded = captured_body["body"]
@@ -583,28 +871,84 @@ class TestAsyncClientLifecycle:
                 json={"input": "hi", "model": "soprano-80m"},
             )
 
-            # The gateway re-raises; FastAPI surfaces as 500.
-            assert r.status_code == 500
+            # Transport failures are normalized instead of surfacing a bare
+            # FastAPI 500.
+            assert r.status_code == 502
+            assert r.json()["error"]["code"] == "worker_unavailable"
             # Critical: aclose must have been awaited exactly once so
             # the AsyncClient does not leak its connection pool.
             mock_client.aclose.assert_awaited_once()
+
+    def test_stream_open_timeout_maps_504(self):
+        routes = [WorkerRoute("soprano-80m", "http://127.0.0.1:9001")]
+        app = build_gateway(routes)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with patch("muse.cli_impl.gateway.httpx.AsyncClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.aclose = AsyncMock()
+            stream_ctx = MagicMock()
+            stream_ctx.__aenter__ = AsyncMock(
+                side_effect=httpx.ReadTimeout("worker stalled"),
+            )
+            mock_client.stream = MagicMock(return_value=stream_ctx)
+            mock_client_cls.return_value = mock_client
+
+            r = client.post(
+                "/v1/audio/speech",
+                json={"input": "hi", "model": "soprano-80m"},
+            )
+
+        assert r.status_code == 504
+        assert r.json()["error"]["code"] == "worker_timeout"
+        mock_client.aclose.assert_awaited_once()
+
+    def test_cleanup_failure_does_not_mask_transport_error(self):
+        routes = [WorkerRoute("soprano-80m", "http://127.0.0.1:9001")]
+        app = build_gateway(routes)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with patch("muse.cli_impl.gateway.httpx.AsyncClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.aclose = AsyncMock(side_effect=RuntimeError("close failed"))
+            stream_ctx = MagicMock()
+            stream_ctx.__aenter__ = AsyncMock(
+                side_effect=httpx.ConnectError("worker died"),
+            )
+            mock_client.stream = MagicMock(return_value=stream_ctx)
+            mock_client_cls.return_value = mock_client
+
+            r = client.post(
+                "/v1/audio/speech",
+                json={"input": "hi", "model": "soprano-80m"},
+            )
+
+        assert r.status_code == 502
+        assert r.json()["error"]["code"] == "worker_unavailable"
 
 
 class TestAdminMount:
     """Verify /v1/admin/* lands on the admin router with auth enforced."""
 
-    def test_admin_path_without_token_returns_503(self, monkeypatch):
+    def test_admin_path_without_token_returns_503(self, tmp_path, monkeypatch):
         from muse.admin.auth import ADMIN_TOKEN_ENV
+        from muse.core import config
+
         monkeypatch.delenv(ADMIN_TOKEN_ENV, raising=False)
-        app = build_gateway([])
-        client = TestClient(app, raise_server_exceptions=False)
-        r = client.get("/v1/admin/workers")
-        assert r.status_code == 503
-        # v0.47.4: bare OpenAI envelope, not the double-wrapped
-        # {"detail": {"error": ...}} the default handler would produce.
-        body = r.json()
-        assert body["error"]["code"] == "admin_disabled"
-        assert "detail" not in body
+        monkeypatch.setenv("MUSE_CONFIG", str(tmp_path / "absent-config.yaml"))
+        config.reset_config()
+        try:
+            app = build_gateway([])
+            client = TestClient(app, raise_server_exceptions=False)
+            r = client.get("/v1/admin/workers")
+            assert r.status_code == 503
+            # v0.47.4: bare OpenAI envelope, not the double-wrapped
+            # {"detail": {"error": ...}} the default handler would produce.
+            body = r.json()
+            assert body["error"]["code"] == "admin_disabled"
+            assert "detail" not in body
+        finally:
+            config.reset_config()
 
     def test_admin_path_with_token_passes_auth(self, monkeypatch):
         from muse.admin.auth import ADMIN_TOKEN_ENV

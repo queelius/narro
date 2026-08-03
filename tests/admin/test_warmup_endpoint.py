@@ -56,6 +56,9 @@ class TestWarmupOperation:
             "muse.admin.operations.is_pulled",
             return_value=True,
         ), patch(
+            "muse.admin.operations.is_enabled",
+            return_value=True,
+        ), patch(
             "muse.admin.operations.get_manifest",
             return_value={
                 "model_id": "fake-model",
@@ -127,6 +130,9 @@ class TestWarmupOperation:
             "muse.admin.operations.is_pulled",
             return_value=True,
         ), patch(
+            "muse.admin.operations.is_enabled",
+            return_value=True,
+        ), patch(
             "muse.admin.operations.get_manifest",
             return_value={
                 "model_id": "fake-model",
@@ -152,6 +158,9 @@ class TestWarmupOperation:
             return_value={"fake-model": MagicMock()},
         ), patch(
             "muse.admin.operations.is_pulled",
+            return_value=True,
+        ), patch(
+            "muse.admin.operations.is_enabled",
             return_value=True,
         ), patch(
             "muse.admin.operations.get_manifest",

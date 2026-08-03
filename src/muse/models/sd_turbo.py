@@ -78,6 +78,7 @@ MANIFEST = {
     "model_id": "sd-turbo",
     "modality": "image/generation",
     "hf_repo": "stabilityai/sd-turbo",
+    "revision": "b261bac6fd2cf515557d5d0707481eafa0485ec2",
     "description": "Stable Diffusion Turbo: 1-step distilled, 512x512",
     "license": "SAI Community License",
     "pip_extras": (
@@ -180,7 +181,11 @@ class Model:
             variant="fp16" if dtype == "float16" else None,
         )
         if self._device != "cpu":
-            self._pipe = self._pipe.to(self._device)
+            # Diffusers pipelines move in place.  Retain the exact object
+            # created above instead of making ownership depend on a fluent
+            # return value; wrappers and test doubles are not required to
+            # return ``self`` from ``to()``.
+            self._pipe.to(self._device)
 
     def generate(
         self,

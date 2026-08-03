@@ -18,7 +18,11 @@ from fastapi.responses import JSONResponse
 
 from muse.core.errors import ModelNotFoundError, error_response
 from muse.core.registry import ModalityRegistry
-from muse.modalities.image_generation.image_input import decode_image_file
+from muse.modalities._native_offload import run_native_offload
+from muse.modalities.image_generation.image_input import (
+    close_decoded_images,
+    decode_image_file,
+)
 from muse.modalities.image_ocr.codec import encode_ocr
 
 
@@ -78,8 +82,17 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                     kwargs["max_new_tokens"] = max_new_tokens
                 return backend.ocr(pil_image, **kwargs)
 
+        abandoned = False
         try:
-            result = await asyncio.to_thread(_call)
+            result = await run_native_offload(
+                _call,
+                cleanup_abandoned=(
+                    lambda _result: close_decoded_images([pil_image])
+                ),
+            )
+        except asyncio.CancelledError:
+            abandoned = True
+            raise
         except Exception:  # noqa: BLE001
             # Log the real exception server-side but never leak it to the
             # client: str(e) can carry internal filesystem paths, CUDA
@@ -89,6 +102,9 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 500, "internal_error",
                 "ocr backend failed; see server logs",
             )
+        finally:
+            if not abandoned:
+                close_decoded_images([pil_image])
 
         body = encode_ocr(result)
         # Override result.model_id with the effective registry id in

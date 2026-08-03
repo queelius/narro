@@ -12,6 +12,9 @@
 #     overrides (e.g. `trust_remote_code: true`, `chat_format`,
 #     `context_length`) that merge into the resolver-synthesized manifest
 #     at pull time. Overlay wins on collision.
+#   - Any entry enabling `trust_remote_code` must set `revision` to a full,
+#     reviewed 40-character Hugging Face commit. Set `code_revision` too when
+#     config.auto_map delegates executable code to a different repository.
 #   - Curation taste: keep the list small. New users should be able to
 #     scan it in seconds and pick something. ~10-20 entries total.
 #
@@ -146,7 +149,6 @@
   size_gb: 0.6
   description: "Qwen3-Embedding 0.6B: 1024 dims (matryoshka), 32K context, Apache 2.0"
   capabilities:
-    trust_remote_code: true
     memory_gb: 1.5
 
 # Multilingual heavyweight: dense + sparse + multi-vector retrieval,
@@ -163,6 +165,9 @@
 # trust_remote_code for its custom architecture.
 - id: nomic-embed-text-v1.5
   uri: hf://nomic-ai/nomic-embed-text-v1.5
+  revision: e9b6763023c676ca8431644204f50c2b100d9aab
+  # config.json delegates its auto_map to nomic-ai/nomic-bert-2048.
+  code_revision: 7710840340a098cfb869c4f65e87cf2b1b70caca
   modality: embedding/text
   size_gb: 0.55
   description: "Nomic Embed v1.5: 137M, 768 dims (matryoshka), 8192 ctx, Apache 2.0"
@@ -438,6 +443,7 @@
 # params, 1024 ctx, 100+ languages. Apache 2.0.
 - id: jina-reranker-v2-base-multilingual
   uri: hf://jinaai/jina-reranker-v2-base-multilingual
+  revision: 9cfeff2df7d40d1b78e75e5e9cebec92a99813c9
   modality: text/rerank
   size_gb: 0.6
   description: "Jina Reranker v2 base: 278M, 100+ langs, 1024 ctx, faster than BGE v2-m3"
@@ -851,21 +857,21 @@
 # This is a deliberate trade-off: ship the protocol + a working bundled
 # default in v0.41.0, fill in dedicated runtimes incrementally.
 
-# TRELLIS large: image-only, ~1.5GB at fp16, requires trust_remote_code.
+# TRELLIS large: image-only, ~1.5GB at fp16. Muse uses its installed SDK;
+# this is not a Transformers trust_remote_code path.
 # Microsoft Research's 2024 release. JeffreyXiang's mirror is the
 # community-maintained drop-in.
 - id: trellis-image
   uri: hf://JeffreyXiang/TRELLIS-image-large
   modality: 3d/generation
   size_gb: 1.5
-  description: "TRELLIS image-to-3D: ~1.5GB at fp16, MIT, requires trust_remote_code"
+  description: "TRELLIS image-to-3D: ~1.5GB at fp16, MIT, custom SDK runtime"
   capabilities:
     memory_gb: 6.0
     device: cuda
     supports_image_to_3d: true
     supports_text_to_3d: false
     output_format: glb
-    trust_remote_code: true
 
 # Wonder3D: multi-view diffusion. Image-only.
 - id: wonder3d-base
@@ -885,14 +891,13 @@
   uri: hf://tencent/Hunyuan3D-2
   modality: 3d/generation
   size_gb: 5.0
-  description: "Hunyuan3D-2 by Tencent: dual-direction (image and text), ~5GB at fp16, requires trust_remote_code. text_to_3d additionally downloads Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled (~2GB) on first call."
+  description: "Hunyuan3D-2 by Tencent: dual-direction (image and text), ~5GB at fp16, custom SDK runtime. text_to_3d additionally downloads Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled (~2GB) on first call."
   capabilities:
     memory_gb: 10.0
     device: cuda
     supports_image_to_3d: true
     supports_text_to_3d: true
     output_format: glb
-    trust_remote_code: true
 
 # Shap-E: OpenAI's classic text-to-3d. Quality has been surpassed but
 # the official released model is useful for rapid prototyping.

@@ -23,6 +23,8 @@ import logging
 import time
 from typing import Any
 
+from muse.core.memory_probe import cuda_runtime_available
+
 
 def select_device(
     requested: str,
@@ -47,7 +49,7 @@ def select_device(
         return requested
     if torch_module is None:
         return "cpu"
-    if torch_module.cuda.is_available():
+    if cuda_runtime_available(torch_module):
         return "cuda"
     mps = getattr(torch_module.backends, "mps", None)
     if mps is not None and mps.is_available():

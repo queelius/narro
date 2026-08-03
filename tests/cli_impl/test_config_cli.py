@@ -5,6 +5,7 @@ in-process via typer's CliRunner against the real `app`, with
 MUSE_CATALOG_DIR pointed at a tmp_path so nothing touches ~/.muse.
 """
 import json
+import stat
 
 import yaml
 from typer.testing import CliRunner
@@ -35,6 +36,20 @@ def test_config_generate_writes(monkeypatch, tmp_path):
     assert r2.exit_code != 0
     r3 = runner.invoke(app, ["config", "generate", "--force"])
     assert r3.exit_code == 0
+
+
+def test_config_generate_hardens_catalog_and_file_permissions(
+    monkeypatch, tmp_path,
+):
+    tmp_path.chmod(0o755)
+    monkeypatch.setenv("MUSE_CATALOG_DIR", str(tmp_path))
+    cfg.reset_config()
+
+    r = runner.invoke(app, ["config", "generate"])
+
+    assert r.exit_code == 0
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE((tmp_path / "config.yaml").stat().st_mode) == 0o600
 
 
 def test_config_get(monkeypatch, tmp_path):
@@ -72,6 +87,16 @@ def test_config_set_bad_value_nonzero(monkeypatch, tmp_path):
     cfg.reset_config()
     r = runner.invoke(app, ["config", "set", "limits.rerank_max_documents", "abc"])
     assert r.exit_code != 0
+
+
+def test_config_set_out_of_domain_value_nonzero(monkeypatch, tmp_path):
+    monkeypatch.setenv("MUSE_CATALOG_DIR", str(tmp_path))
+    cfg.reset_config()
+    r = runner.invoke(
+        app, ["config", "set", "federation.refresh_interval_seconds", "0"]
+    )
+    assert r.exit_code == 2
+    assert "must be > 0" in r.stderr
 
 
 def test_config_set_unknown_key_exits_2(monkeypatch, tmp_path):

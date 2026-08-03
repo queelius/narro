@@ -7,9 +7,8 @@ last hidden state. Trained on music with masked acoustic modeling
 
 License: MIT.
 
-MERT ships custom feature extractor code in the repo, so loading
-requires `trust_remote_code=True`. Mirrors Qwen3-Embedding's pattern
-(curated.yaml capability + runtime forwarding).
+MERT ships custom model code in the repo, so loading requires
+`trust_remote_code=True`; Muse pins and downloads that code with the weights.
 
 Wraps `transformers.AutoModel` + `AutoFeatureExtractor` with librosa
 audio decoding; lazy imports so muse pull + muse --help work without
@@ -65,6 +64,8 @@ MANIFEST = {
     "model_id": "mert-v1-95m",
     "modality": "audio/embedding",
     "hf_repo": "m-a-p/MERT-v1-95M",
+    # Reviewed 2026-08-02. Source: official Hugging Face model API.
+    "revision": "12af15fef9d0ac838c3f475bfbbf26d2060dd4f5",
     "description": (
         "MERT v1 95M: music understanding, 768-dim audio embeddings, MIT"
     ),
@@ -160,6 +161,7 @@ class Model:
         sample_rate: int = 24000,
         max_duration_seconds: float = 60.0,
         trust_remote_code: bool = True,
+        revision: str = MANIFEST["revision"],
         **_: Any,
     ) -> None:
         _ensure_deps()
@@ -179,15 +181,20 @@ class Model:
         self._trust_remote_code = bool(trust_remote_code)
 
         src = local_dir or hf_repo
+        revision_kwargs = {} if local_dir else {"revision": revision}
         logger.info(
             "loading mert-v1-95m from %s (device=%s, sr=%d)",
             src, self._device, self._sample_rate,
         )
         self._processor = AutoFeatureExtractor.from_pretrained(
-            src, trust_remote_code=self._trust_remote_code,
+            src,
+            trust_remote_code=self._trust_remote_code,
+            **revision_kwargs,
         )
         self._model = AutoModel.from_pretrained(
-            src, trust_remote_code=self._trust_remote_code,
+            src,
+            trust_remote_code=self._trust_remote_code,
+            **revision_kwargs,
         )
         self._model = self._model.to(self._device)
         _set_inference_mode(self._model)

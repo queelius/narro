@@ -67,6 +67,8 @@ MANIFEST = {
     "model_id": "nv-embed-v2",
     "modality": "embedding/text",
     "hf_repo": "nvidia/NV-Embed-v2",
+    # Reviewed 2026-08-02. Source: official Hugging Face model API.
+    "revision": "3fa59658547db50a1e8e3346cf057fd0c77ed6ef",
     "description": (
         "NVIDIA NV-Embed-v2: 4096 dims, 32K context, SotA MTEB "
         "(LICENSE: CC-BY-NC-4.0, non-commercial only)"
@@ -89,6 +91,7 @@ MANIFEST = {
         "device": "auto",
         "dimensions": 4096,
         "context_length": 32768,
+        "trust_remote_code": True,
         # 7B-class Mistral backbone at fp16 is ~14 GB just for weights;
         # latent-attention pooling + activation working set at default
         # context lands around 16 GB peak.
@@ -116,6 +119,7 @@ class Model:
         device: str = "auto",
         instruction: str = DEFAULT_INSTRUCTION,
         max_length: int = DEFAULT_MAX_LENGTH,
+        revision: str = MANIFEST["revision"],
         **_: Any,
     ) -> None:
         _ensure_deps()
@@ -135,7 +139,12 @@ class Model:
         # (bidirectional Mistral-7B with latent-attention pooling).
         # from_pretrained puts the module in inference mode by default
         # on recent transformers versions; we also disable grad below.
-        self._model = AutoModel.from_pretrained(src, trust_remote_code=True)
+        revision_kwargs = {} if local_dir else {"revision": revision}
+        self._model = AutoModel.from_pretrained(
+            src,
+            trust_remote_code=True,
+            **revision_kwargs,
+        )
         if self._device != "cpu":
             self._model = self._model.to(self._device)
         # Freeze gradients and set inference mode via the shared helper,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import pathlib
 import sqlite3
 import threading
@@ -95,30 +96,51 @@ class TelemetryStore:
         self._path = str(path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        with self._lock:
-            self._conn.execute(_CREATE_TABLE_SQL)
-            self._conn.execute(_CREATE_IDX_TS_SQL)
-            self._conn.execute(_CREATE_IDX_TYPE_SQL)
-            # Migrate older DBs in place: add any EVENT_COLUMNS the existing
-            # table lacks (new columns are always nullable in the sparse model,
-            # so ALTER TABLE ADD COLUMN is safe and idempotent).
-            have = {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}
-            for col in EVENT_COLUMNS:
-                if col not in have:
-                    self._conn.execute(f"ALTER TABLE events ADD COLUMN {col}")
-            self._conn.commit()
+        self._closed = False
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            with self._lock:
+                self._conn.execute(_CREATE_TABLE_SQL)
+                self._conn.execute(_CREATE_IDX_TS_SQL)
+                self._conn.execute(_CREATE_IDX_TYPE_SQL)
+                # Migrate older DBs in place: add any EVENT_COLUMNS the existing
+                # table lacks (new columns are always nullable in the sparse model,
+                # so ALTER TABLE ADD COLUMN is safe and idempotent).
+                have = {
+                    row[1]
+                    for row in self._conn.execute("PRAGMA table_info(events)")
+                }
+                for col in EVENT_COLUMNS:
+                    if col not in have:
+                        self._conn.execute(f"ALTER TABLE events ADD COLUMN {col}")
+                self._conn.commit()
+        except BaseException:
+            self._closed = True
+            self._conn.close()
+            raise
+
+    def _require_open_locked(self) -> None:
+        if self._closed:
+            raise RuntimeError("telemetry store is closed")
 
     def insert_many(self, rows: list[dict]) -> None:
         if not rows:
             return
         with self._lock:
+            self._require_open_locked()
             self._conn.executemany(_INSERT_SQL, rows)
             self._conn.commit()
 
     def prune(self, older_than_ts: float) -> int:
+        try:
+            cutoff = float(older_than_ts)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("older_than_ts must be finite") from exc
+        if not math.isfinite(cutoff):
+            raise ValueError("older_than_ts must be finite")
         with self._lock:
-            cur = self._conn.execute("DELETE FROM events WHERE ts < ?", (older_than_ts,))
+            self._require_open_locked()
+            cur = self._conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
             self._conn.commit()
             return cur.rowcount
 
@@ -126,17 +148,35 @@ class TelemetryStore:
         sql = _SERIES_SQL.get(metric)
         if sql is None:
             raise ValueError(f"unknown telemetry metric: {metric!r}")
+        try:
+            since_value = float(since_ts)
+            bucket_value = float(bucket_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("series bounds must be numeric") from exc
+        if not math.isfinite(since_value):
+            raise ValueError("since_ts must be finite")
+        if not math.isfinite(bucket_value) or bucket_value <= 0:
+            raise ValueError("bucket_seconds must be positive and finite")
         with self._lock:
-            cur = self._conn.execute(sql, {"bucket": bucket_seconds, "since": since_ts})
+            self._require_open_locked()
+            cur = self._conn.execute(
+                sql, {"bucket": bucket_value, "since": since_value},
+            )
             columns = [d[0] for d in cur.description]
             points = [dict(zip(columns, row)) for row in cur.fetchall()]
         return {"metric": metric, "points": points}
 
     def summary_counts(self) -> dict:
         with self._lock:
+            self._require_open_locked()
             (total,) = self._conn.execute("SELECT COUNT(*) FROM events").fetchone()
         return {"total": total}
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            if self._closed:
+                return
+            try:
+                self._conn.close()
+            finally:
+                self._closed = True

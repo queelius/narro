@@ -464,4 +464,4 @@ class TestConfigRows:
         from muse.core import config
         assert config.get("server.default_max_concurrency") == 0
         assert config.get("server.queue_timeout_seconds") == 300.0
-        assert config.get("server.max_queue_depth") == 0
+        assert config.get("server.max_queue_depth") == 256

@@ -19,6 +19,20 @@ import threading
 # caps its memory growth instead of letting it accumulate for the life
 # of the connection.
 SUBSCRIBER_QUEUE_MAXSIZE = 1024
+_TRUNCATION_MARKER = b"...[truncated]"
+
+
+def _truncate_line(line: str, max_bytes: int) -> str:
+    """Fit one line into ``max_bytes`` without emitting invalid UTF-8."""
+    raw = line.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return line
+    if max_bytes <= len(_TRUNCATION_MARKER):
+        return _TRUNCATION_MARKER[:max_bytes].decode("ascii")
+    prefix = raw[: max_bytes - len(_TRUNCATION_MARKER)].decode(
+        "utf-8", errors="ignore",
+    )
+    return prefix + _TRUNCATION_MARKER.decode("ascii")
 
 
 class LogHub:
@@ -33,6 +47,12 @@ class LogHub:
     """
 
     def __init__(self, *, buffer_bytes: int = 65536) -> None:
+        if (
+            isinstance(buffer_bytes, bool)
+            or not isinstance(buffer_bytes, int)
+            or buffer_bytes <= 0
+        ):
+            raise ValueError("buffer_bytes must be a positive integer")
         self._buffer_bytes = buffer_bytes
         self._lock = threading.Lock()
         self._buffers: dict[str, collections.deque] = {}
@@ -40,6 +60,7 @@ class LogHub:
         self._subscribers: dict[str, set[queue.Queue]] = {}
 
     def append(self, model_id: str, line: str) -> None:
+        line = _truncate_line(line, self._buffer_bytes)
         with self._lock:
             buf = self._buffers.setdefault(model_id, collections.deque())
             buf.append(line)
@@ -47,10 +68,9 @@ class LogHub:
                 line.encode("utf-8")
             )
 
-            # Evict oldest lines until under the byte bound, but always keep
-            # at least one line so a single oversized line is retained
-            # rather than evicted to empty.
-            while len(buf) > 1 and self._byte_counts[model_id] > self._buffer_bytes:
+            # Every individual line is already capped, so evicting older
+            # lines makes the advertised byte bound unconditional.
+            while self._byte_counts[model_id] > self._buffer_bytes:
                 oldest = buf.popleft()
                 self._byte_counts[model_id] -= len(oldest.encode("utf-8"))
 
@@ -75,11 +95,30 @@ class LogHub:
             self._subscribers.setdefault(model_id, set()).add(q)
         return q
 
+    def subscribe_with_snapshot(
+        self, model_id: str,
+    ) -> tuple[list[str], queue.Queue]:
+        """Atomically subscribe and snapshot buffered history.
+
+        The lock gives each append exactly one side of the handoff: an append
+        that wins the lock first appears in ``history``; one that follows the
+        subscription appears in the queue. This removes the snapshot-then-
+        subscribe gap without duplicating a line in both channels.
+        """
+        q: queue.Queue = queue.Queue(maxsize=SUBSCRIBER_QUEUE_MAXSIZE)
+        with self._lock:
+            self._subscribers.setdefault(model_id, set()).add(q)
+            buf = self._buffers.get(model_id)
+            history = list(buf) if buf is not None else []
+        return history, q
+
     def unsubscribe(self, model_id: str, q: queue.Queue) -> None:
         with self._lock:
             subscribers = self._subscribers.get(model_id)
             if subscribers is not None:
                 subscribers.discard(q)
+                if not subscribers:
+                    self._subscribers.pop(model_id, None)
 
     def drop(self, model_id: str) -> None:
         with self._lock:

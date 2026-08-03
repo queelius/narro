@@ -12,11 +12,18 @@ import logging
 import os
 import signal
 import threading
+from contextlib import ExitStack
 from pathlib import Path
 
 from muse.cli_impl.serve_util import run_uvicorn
 from muse.core import config
-from muse.core.catalog import get_manifest, is_pulled, known_models, load_backend
+from muse.core.catalog import (
+    _model_resource_lease,
+    get_manifest,
+    is_pulled,
+    known_models,
+    load_backend,
+)
 from muse.core.discovery import discover_modalities
 from muse.core.registry import ModalityRegistry
 from muse.core.server import create_app
@@ -24,6 +31,8 @@ from muse.core.server import create_app
 log = logging.getLogger(__name__)
 
 _SUPERVISOR_PID_ENV = "MUSE_SUPERVISOR_PID"
+_WORKER_NONCE_ENV = "MUSE_WORKER_NONCE"
+_WORKER_NONCE_HEADER = "X-Muse-Worker-Nonce"
 
 
 def _watch_parent(
@@ -104,6 +113,23 @@ def run_worker(*, host: str, port: int, models: list[str], device: str) -> int:
     `models == []` is a valid test configuration (empty-registry
     router mounting smoke test); it does not trigger the fail-fast.
     """
+    with ExitStack() as leases:
+        # Sorted acquisition prevents two multi-model workers from deadlocking
+        # if a future placement strategy gives them overlapping assignments.
+        for model_id in sorted(set(models)):
+            leases.enter_context(_model_resource_lease(model_id, wait=True))
+        return _run_worker_with_leases(
+            host=host,
+            port=port,
+            models=models,
+            device=device,
+        )
+
+
+def _run_worker_with_leases(
+    *, host: str, port: int, models: list[str], device: str,
+) -> int:
+    """Load and serve after acquiring every assigned model resource lease."""
     raw_supervisor_pid = os.environ.get(_SUPERVISOR_PID_ENV)
     if raw_supervisor_pid:
         try:
@@ -158,6 +184,13 @@ def run_worker(*, host: str, port: int, models: list[str], device: str) -> int:
         routers[tag] = build_router(registry)
 
     app = create_app(registry=registry, routers=routers)
+    worker_nonce = os.environ.get(_WORKER_NONCE_ENV)
+    if worker_nonce:
+        @app.middleware("http")
+        async def _worker_identity_header(request, call_next):
+            response = await call_next(request)
+            response.headers[_WORKER_NONCE_HEADER] = worker_nonce
+            return response
     # run_uvicorn sets a bounded timeout_graceful_shutdown so a standalone
     # `muse _worker` process (or one whose supervisor SIGTERMs it) exits
     # promptly on Ctrl-C instead of hanging on an in-flight connection.

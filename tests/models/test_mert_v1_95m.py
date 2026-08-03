@@ -135,6 +135,12 @@ def test_manifest_allow_patterns_includes_required_files():
     assert any(".py" in p for p in patterns)
 
 
+def test_manifest_pins_reviewed_remote_code_revision():
+    revision = _manifest()["revision"]
+    assert len(revision) == 40
+    assert all(c in "0123456789abcdef" for c in revision)
+
+
 def test_manifest_license_is_mit():
     assert _manifest()["license"] == "MIT"
 
@@ -183,6 +189,14 @@ def test_model_threads_trust_remote_code_to_processor_and_model():
     assert kwargs.get("trust_remote_code") is True
     _, mkwargs = fake_model_class.from_pretrained.call_args
     assert mkwargs.get("trust_remote_code") is True
+
+
+def test_remote_fallback_threads_reviewed_revision():
+    mod, _, _, fake_ext_class, fake_model_class, _, _ = _patched_setup()
+    mod.Model(hf_repo="m-a-p/MERT-v1-95M", local_dir=None, device="cpu")
+    revision = mod.MANIFEST["revision"]
+    assert fake_ext_class.from_pretrained.call_args.kwargs["revision"] == revision
+    assert fake_model_class.from_pretrained.call_args.kwargs["revision"] == revision
 
 
 def test_embed_returns_audio_embedding_result():

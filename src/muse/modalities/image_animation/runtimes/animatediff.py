@@ -2,9 +2,9 @@
 
 Two-component model: a base SD 1.5 (or compatible) checkpoint provides
 text encoder + UNet + VAE; a MotionAdapter provides the temporal layers.
-The base is referenced by manifest field `base_model` (a Python string
-identifying an HF repo); the motion adapter is what `local_dir`/`hf_repo`
-points to.
+Muse-managed loads resolve both from fixed children of ``local_dir``.
+``hf_repo`` and ``base_model`` remain direct-construction fallbacks when no
+local bundle is supplied.
 
 Lazy-import sentinel pattern matches sd_turbo and runtimes/diffusers.
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from muse.core.artifacts import ArtifactBundleError, local_artifact_directory
 from muse.core.runtime_helpers import dtype_for_name, select_device
 from muse.modalities.image_animation.protocol import AnimationResult
 
@@ -58,7 +59,7 @@ class AnimateDiffRuntime:
 
     Construction kwargs:
       - hf_repo: motion adapter repo id (the manifest's hf_repo)
-      - local_dir: local cache for the adapter (from `muse pull`)
+      - local_dir: complete adapter + base bundle from `muse pull`
       - device, dtype, model_id: standard
       - base_model: HF repo id of the base SD 1.5 (or compatible) checkpoint
       - default_frames, default_fps, default_size, default_steps, default_guidance:
@@ -75,6 +76,8 @@ class AnimateDiffRuntime:
         dtype: str = "float16",
         model_id: str,
         base_model: str,
+        adapter_model_subdir: str | None = None,
+        base_model_subdir: str | None = None,
         default_frames: int = 16,
         default_fps: int = 8,
         default_size: tuple[int, int] = (512, 512),
@@ -100,7 +103,31 @@ class AnimateDiffRuntime:
         _torch = _mod.torch
         torch_dtype = dtype_for_name(dtype, _torch)
 
-        adapter_src = local_dir or hf_repo
+        if local_dir is None:
+            adapter_src = hf_repo
+            base_src = base_model
+        else:
+            if adapter_model_subdir is None or base_model_subdir is None:
+                raise RuntimeError(
+                    "AnimateDiff local weights predate the complete artifact "
+                    f"bundle; re-pull {model_id!r}"
+                )
+            try:
+                adapter_src = local_artifact_directory(
+                    local_dir,
+                    adapter_model_subdir,
+                    label="AnimateDiff motion adapter",
+                )
+                base_src = local_artifact_directory(
+                    local_dir,
+                    base_model_subdir,
+                    label="AnimateDiff base model",
+                )
+            except ArtifactBundleError as exc:
+                raise RuntimeError(
+                    f"AnimateDiff artifact bundle is invalid; re-pull "
+                    f"{model_id!r}: {exc}"
+                ) from exc
         logger.info(
             "loading MotionAdapter from %s (model_id=%s, dtype=%s)",
             adapter_src, model_id, dtype,
@@ -109,15 +136,15 @@ class AnimateDiffRuntime:
 
         logger.info(
             "loading AnimateDiffPipeline base=%s + adapter (device=%s, dtype=%s)",
-            base_model, self._device, dtype,
+            base_src, self._device, dtype,
         )
         self._pipe = AnimateDiffPipeline.from_pretrained(
-            base_model,
+            base_src,
             motion_adapter=adapter,
             torch_dtype=torch_dtype,
         )
         if self._device != "cpu":
-            self._pipe = self._pipe.to(self._device)
+            self._pipe.to(self._device)
 
     def generate(
         self,

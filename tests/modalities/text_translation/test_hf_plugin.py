@@ -332,6 +332,7 @@ def test_dispatch_resolves_both_tagged_family_named_repo_to_translation():
         "acme/opus-mt-en-es-hybrid",
         tags=["summarization", "translation"],
     )
+    info.sha = "a" * 40
     with patch.object(resolver._api, "repo_info", return_value=info):
         resolved = resolver.resolve("hf://acme/opus-mt-en-es-hybrid")
     assert resolved.manifest["modality"] == "text/translation"
@@ -349,6 +350,7 @@ def test_dispatch_resolves_both_tagged_non_family_repo_to_summarization():
         "acme/generic-seq2seq-model",
         tags=["summarization", "translation"],
     )
+    info.sha = "a" * 40
     with patch.object(resolver._api, "repo_info", return_value=info):
         resolved = resolver.resolve("hf://acme/generic-seq2seq-model")
     assert resolved.manifest["modality"] == "text/summarization"

@@ -18,6 +18,7 @@ MANIFEST = {
     "model_id": "depth-anything-v2-small",
     "modality": "image/cv",
     "hf_repo": "depth-anything/Depth-Anything-V2-Small-hf",
+    "revision": "5426e4f0f36572d16453bbda7a8389317b1bef99",
     "description": (
         "Depth-Anything V2 Small: 25M, relative inverse depth, "
         "Apache 2.0. Strong cross-domain generalization; CPU-friendly "

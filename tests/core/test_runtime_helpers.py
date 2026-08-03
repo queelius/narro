@@ -56,6 +56,13 @@ def test_select_device_auto_cuda_wins() -> None:
     assert select_device("auto", torch_module=torch) == "cuda"
 
 
+def test_select_device_auto_rocm_uses_cuda_label() -> None:
+    """PyTorch's ROCm API is CUDA-shaped, so the runtime label stays cuda."""
+    torch = _mock_torch(cuda=True, mps=False)
+    torch.version = SimpleNamespace(hip="6.2")
+    assert select_device("auto", torch_module=torch) == "cuda"
+
+
 def test_select_device_auto_mps_when_no_cuda() -> None:
     torch = _mock_torch(cuda=False, mps=True)
     assert select_device("auto", torch_module=torch) == "mps"

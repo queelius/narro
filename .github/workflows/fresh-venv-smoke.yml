@@ -52,15 +52,15 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
 
       - name: cache pip downloads
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
@@ -68,7 +68,7 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: cache HF model weights
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-hf-${{ hashFiles('pyproject.toml') }}-${{ matrix.model }}
@@ -101,6 +101,7 @@ jobs:
           MODEL_ID: ${{ matrix.model }}
           VENV_ROOT: ${{ runner.temp }}/muse-smoke-${{ matrix.model }}
         run: |
+          set -o pipefail
           mkdir -p "$VENV_ROOT"
           python scripts/smoke_fresh_venv.py \
             --model_id "$MODEL_ID" \
@@ -109,7 +110,7 @@ jobs:
 
       - name: upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: smoke-${{ matrix.model }}-logs
           path: |

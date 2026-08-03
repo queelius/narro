@@ -32,7 +32,11 @@ from fastapi import APIRouter, File, Form, UploadFile
 from muse.core import config
 from muse.core.errors import ModelNotFoundError, error_response
 from muse.core.registry import ModalityRegistry
-from muse.modalities.image_generation.image_input import decode_image_file
+from muse.modalities._native_offload import run_native_offload
+from muse.modalities.image_generation.image_input import (
+    close_decoded_images,
+    decode_image_file,
+)
 from muse.modalities.image_segmentation.codec import encode_segmentation
 from muse.modalities.image_segmentation.protocol import CapabilityError
 
@@ -203,20 +207,17 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 f"model {effective_id!r} does not support {human} segmentation",
             )
 
-        try:
-            pil_image = await decode_image_file(image)
-        except ValueError as e:
-            return error_response(
-                400, "invalid_parameter", f"image decode failed: {e}",
-            )
-
         max_side = _max_input_side()
-        ow, oh = pil_image.size
-        if ow > max_side or oh > max_side:
+        try:
+            pil_image = await decode_image_file(image, max_side=max_side)
+        except ValueError as e:
+            message = str(e)
+            if "exceeds max input side" in message:
+                message += (
+                    " (set MUSE_SEGMENTATION_MAX_INPUT_SIDE to raise)"
+                )
             return error_response(
-                400, "invalid_parameter",
-                f"image too large: {ow}x{oh} exceeds max input side "
-                f"{max_side} (set MUSE_SEGMENTATION_MAX_INPUT_SIDE to raise)",
+                400, "invalid_parameter", f"image decode failed: {message}",
             )
 
         def _call() -> object:
@@ -230,8 +231,17 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                     max_masks=max_masks,
                 )
 
+        abandoned = False
         try:
-            result = await asyncio.to_thread(_call)
+            result = await run_native_offload(
+                _call,
+                cleanup_abandoned=(
+                    lambda _result: close_decoded_images([pil_image])
+                ),
+            )
+        except asyncio.CancelledError:
+            abandoned = True
+            raise
         except (CapabilityError, ValueError) as e:
             # Client faults: an unsupported mode (CapabilityError, the
             # runtime's defense-in-depth for a mismatch the gate above
@@ -254,6 +264,9 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 500, "internal_error",
                 "segmentation backend failed; see server logs",
             )
+        finally:
+            if not abandoned:
+                close_decoded_images([pil_image])
 
         return encode_segmentation(
             result, model_id=effective_id, mask_format=mask_format,

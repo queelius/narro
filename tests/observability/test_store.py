@@ -37,6 +37,12 @@ def test_prune(store):
     assert store.summary_counts()["total"] == 1
 
 
+@pytest.mark.parametrize("cutoff", [float("nan"), float("inf"), "invalid"])
+def test_prune_rejects_nonfinite_or_nonnumeric_cutoff(store, cutoff):
+    with pytest.raises(ValueError, match="older_than_ts must be finite"):
+        store.prune(cutoff)
+
+
 def test_vram_series(store):
     store.insert_many([
         event_to_row("sample", 61.0, free_vram_gb=4.0),
@@ -80,3 +86,30 @@ def test_load_evict_series(store):
 def test_series_unknown_metric_raises(store):
     with pytest.raises(ValueError):
         store.series("bogus", since_ts=0.0, bucket_seconds=60.0)
+
+
+@pytest.mark.parametrize(
+    "since,bucket",
+    [
+        (float("nan"), 60.0),
+        (float("inf"), 60.0),
+        (0.0, 0.0),
+        (0.0, -1.0),
+        (0.0, float("inf")),
+    ],
+)
+def test_series_rejects_invalid_numeric_bounds(store, since, bucket):
+    with pytest.raises(ValueError):
+        store.series("request_rate", since_ts=since, bucket_seconds=bucket)
+
+
+def test_close_is_idempotent_and_later_operations_fail_clearly(tmp_path):
+    store = TelemetryStore(tmp_path / "t.db")
+
+    store.close()
+    store.close()
+
+    with pytest.raises(RuntimeError, match="telemetry store is closed"):
+        store.summary_counts()
+    with pytest.raises(RuntimeError, match="telemetry store is closed"):
+        store.insert_many([event_to_row("request", 1.0, model_id="m")])

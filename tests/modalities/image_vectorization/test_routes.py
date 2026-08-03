@@ -1,5 +1,5 @@
 import io
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -231,6 +231,26 @@ def test_runtime_error_returns_sanitized_500():
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert "/secret/path" not in response.text
+
+
+def test_route_closes_decoded_source_after_backend():
+    backend = _FakeVectorizer()
+    decoded = MagicMock()
+    decoded.size = (64, 32)
+    decoded.width = 64
+    decoded.height = 32
+
+    with patch(
+        "muse.modalities.image_vectorization.routes.decode_image_file",
+        new=AsyncMock(return_value=decoded),
+    ):
+        response = _client(backend).post(
+            "/v1/images/vectorize",
+            files={"image": ("diagram.png", b"placeholder", "image/png")},
+        )
+
+    assert response.status_code == 200, response.text
+    decoded.close.assert_called_once_with()
 
 
 def test_registry_attaches_inference_lock():

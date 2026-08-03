@@ -19,6 +19,49 @@ from muse.core.catalog import (
 from muse.core.discovery import modality_tags
 
 
+def _hold_catalog_process_lock(catalog_dir, holding, release) -> None:
+    """Child helper: hold one cross-process catalog transaction open."""
+    import os
+
+    os.environ["MUSE_CATALOG_DIR"] = str(catalog_dir)
+    from muse.core.catalog import (
+        _CATALOG_WRITE_LOCK,
+        _read_catalog,
+        _reset_read_catalog_cache,
+        _write_catalog,
+    )
+
+    _reset_read_catalog_cache()
+    with _CATALOG_WRITE_LOCK:
+        catalog = _read_catalog()
+        catalog["holder"] = {"enabled": True}
+        holding.set()
+        if not release.wait(10):
+            raise RuntimeError("parent did not release catalog-lock test holder")
+        _write_catalog(catalog)
+
+
+def _write_after_catalog_process_lock(catalog_dir, attempting, acquired) -> None:
+    """Child helper: report only after acquiring the cross-process lock."""
+    import os
+
+    os.environ["MUSE_CATALOG_DIR"] = str(catalog_dir)
+    from muse.core.catalog import (
+        _CATALOG_WRITE_LOCK,
+        _read_catalog,
+        _reset_read_catalog_cache,
+        _write_catalog,
+    )
+
+    _reset_read_catalog_cache()
+    attempting.set()
+    with _CATALOG_WRITE_LOCK:
+        acquired.set()
+        catalog = _read_catalog()
+        catalog["writer"] = {"enabled": True}
+        _write_catalog(catalog)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_catalog_cache():
     """Reset the known-models AND read-catalog mtime caches around every test.
@@ -225,6 +268,9 @@ def test_remove_default_leaves_venv_on_disk(tmp_catalog):
     """Default remove() unregisters from catalog only; venv persists."""
     venv_path = tmp_catalog / "venvs" / "soprano-80m"
     venv_path.mkdir(parents=True)
+    python = venv_path / "bin" / "python"
+    python.parent.mkdir()
+    python.touch(mode=0o700)
     (venv_path / "marker").write_text("present")
     with patch("muse.core.catalog.create_venv"), \
          patch("muse.core.catalog.install_into_venv"), \
@@ -240,6 +286,9 @@ def test_remove_with_purge_deletes_venv(tmp_catalog):
     """remove(purge=True) also wipes the per-model venv directory."""
     venv_path = tmp_catalog / "venvs" / "soprano-80m"
     venv_path.mkdir(parents=True)
+    python = venv_path / "bin" / "python"
+    python.parent.mkdir()
+    python.touch(mode=0o700)
     (venv_path / "marker").write_text("present")
     with patch("muse.core.catalog.create_venv"), \
          patch("muse.core.catalog.install_into_venv"), \
@@ -248,6 +297,33 @@ def test_remove_with_purge_deletes_venv(tmp_catalog):
         pull("soprano-80m")
     remove("soprano-80m", purge=True)
     assert not venv_path.exists(), "purge must delete the venv directory"
+
+
+def test_remove_with_purge_preserves_venv_referenced_by_other_entry(tmp_catalog):
+    """Purging one alias must not break a sibling that shares its venv."""
+    from muse.core.catalog import _write_catalog
+
+    venv_path = tmp_catalog / "venvs" / "owner"
+    venv_path.mkdir(parents=True)
+    marker = venv_path / "keep"
+    marker.write_text("shared")
+    _write_catalog({
+        "owner": {
+            "venv_path": str(venv_path),
+            "enabled": False,
+        },
+        "sibling": {
+            "venv_path": str(venv_path),
+            "enabled": False,
+        },
+    })
+
+    remove("owner", purge=True)
+
+    assert marker.read_text() == "shared"
+    catalog = _read_catalog()
+    assert "owner" not in catalog
+    assert catalog["sibling"]["venv_path"] == str(venv_path)
 
 
 def test_remove_with_purge_tolerates_missing_venv(tmp_catalog):
@@ -264,6 +340,175 @@ def test_remove_with_purge_tolerates_missing_venv(tmp_catalog):
     # Should not raise
     remove("soprano-80m", purge=True)
     assert not is_pulled("soprano-80m")
+
+
+def test_remove_with_purge_reports_all_filesystem_cleanup_failures(
+    tmp_catalog, monkeypatch,
+):
+    """A failed purge is observable, while independent targets are attempted."""
+    from muse.core import catalog as catalog_module
+    from muse.core.catalog import CatalogError, _write_catalog
+
+    venv_path = tmp_catalog / "venvs" / "broken"
+    weights_path = tmp_catalog / "weights" / "broken"
+    venv_path.mkdir(parents=True)
+    weights_path.mkdir(parents=True)
+    _write_catalog({
+        "broken": {
+            "venv_path": str(venv_path),
+            "local_dir": str(weights_path),
+            "enabled": False,
+        },
+    })
+    attempted: list[Path] = []
+
+    def failing_rmtree(target):
+        attempted.append(Path(target))
+        raise PermissionError("filesystem denied deletion")
+
+    failing_rmtree.avoids_symlink_attacks = True
+    monkeypatch.setattr(catalog_module.shutil, "rmtree", failing_rmtree)
+
+    with pytest.raises(CatalogError) as caught:
+        remove("broken", purge=True)
+
+    message = str(caught.value)
+    assert "venv" in message
+    assert "weights" in message
+    assert attempted == [venv_path.resolve(), weights_path.resolve()]
+    assert venv_path.is_dir()
+    assert weights_path.is_dir()
+    assert "broken" not in _read_catalog()
+
+
+def test_remove_with_purge_requires_fd_safe_recursive_deletion(
+    tmp_catalog, monkeypatch,
+):
+    """Platforms without symlink-safe rmtree fail closed and report it."""
+    from muse.core import catalog as catalog_module
+    from muse.core.catalog import CatalogError, _write_catalog
+
+    venv_path = tmp_catalog / "venvs" / "unsafe-platform"
+    venv_path.mkdir(parents=True)
+    _write_catalog({
+        "unsafe-platform": {
+            "venv_path": str(venv_path),
+            "enabled": False,
+        },
+    })
+    called = False
+
+    def unsafe_rmtree(_target):
+        nonlocal called
+        called = True
+
+    unsafe_rmtree.avoids_symlink_attacks = False
+    monkeypatch.setattr(catalog_module.shutil, "rmtree", unsafe_rmtree)
+
+    with pytest.raises(CatalogError, match="fd-safe recursive deletion"):
+        remove("unsafe-platform", purge=True)
+
+    assert called is False
+    assert venv_path.is_dir()
+    assert "unsafe-platform" not in _read_catalog()
+
+
+def test_purge_owned_directory_unlinks_substituted_symlink_only(tmp_path):
+    """A post-validation symlink swap never traverses into its target."""
+    from muse.core.catalog import _purge_owned_directory
+
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "keep"
+    marker.write_text("valuable")
+    link = tmp_path / "validated-then-swapped"
+    try:
+        link.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    _purge_owned_directory(link, model_id="victim", label="venv")
+
+    assert not link.is_symlink()
+    assert marker.read_text() == "valuable"
+
+
+def test_remove_with_purge_rejects_external_venv_before_unregistering(tmp_catalog):
+    """A corrupt venv_path cannot turn purge into arbitrary rmtree."""
+    from muse.core.catalog import CatalogError, _write_catalog
+
+    external = tmp_catalog / "outside" / "valuable"
+    external.mkdir(parents=True)
+    marker = external / "keep"
+    marker.write_text("present")
+    _write_catalog({
+        "escape": {
+            "venv_path": str(external),
+            "enabled": False,
+        },
+    })
+
+    with pytest.raises(CatalogError, match="venv_path"):
+        remove("escape", purge=True)
+
+    assert marker.read_text() == "present"
+    assert "escape" in _read_catalog(), "validation must precede catalog mutation"
+
+
+@pytest.mark.parametrize("target_kind", ["root", "sibling"])
+def test_remove_with_purge_rejects_wrong_venv_directory(tmp_catalog, target_kind):
+    """Purge accepts only `venvs/<model_id>`, never the root or a sibling."""
+    from muse.core.catalog import CatalogError, _write_catalog
+
+    venvs_root = tmp_catalog / "venvs"
+    venvs_root.mkdir()
+    target = venvs_root if target_kind == "root" else venvs_root / "other-model"
+    if target != venvs_root:
+        target.mkdir()
+    marker = target / "keep"
+    marker.write_text("present")
+    _write_catalog({
+        "victim": {
+            "venv_path": str(target),
+            "enabled": False,
+        },
+    })
+
+    with pytest.raises(CatalogError, match="expected model directory"):
+        remove("victim", purge=True)
+
+    assert marker.exists()
+    assert "victim" in _read_catalog()
+
+
+def test_remove_with_purge_rejects_venv_symlink_escape(tmp_catalog):
+    """An expected-looking venv symlink cannot escape the owned root."""
+    from muse.core.catalog import CatalogError, _write_catalog
+
+    external = tmp_catalog / "outside" / "valuable"
+    external.mkdir(parents=True)
+    marker = external / "keep"
+    marker.write_text("present")
+    venvs_root = tmp_catalog / "venvs"
+    venvs_root.mkdir()
+    link = venvs_root / "victim"
+    try:
+        link.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    _write_catalog({
+        "victim": {
+            "venv_path": str(link),
+            "enabled": False,
+        },
+    })
+
+    with pytest.raises(CatalogError, match="owned venv root"):
+        remove("victim", purge=True)
+
+    assert marker.exists()
+    assert link.is_symlink()
+    assert "victim" in _read_catalog()
 
 
 # ---- v0.34.0 finding #15: purge cleans resolver weights cache ----
@@ -305,6 +550,35 @@ def test_remove_with_purge_cleans_resolver_weights(tmp_catalog):
     assert "x" not in _read_catalog()
 
 
+def test_remove_with_purge_preserves_weights_referenced_by_other_entry(
+    tmp_catalog,
+):
+    """Purging one entry must not delete another entry's shared weights."""
+    from muse.core.catalog import _write_catalog
+
+    weights_dir = tmp_catalog / "weights" / "shared"
+    weights_dir.mkdir(parents=True)
+    marker = weights_dir / "model.safetensors"
+    marker.write_bytes(b"shared")
+    _write_catalog({
+        "owner": {
+            "local_dir": str(weights_dir),
+            "enabled": False,
+        },
+        "sibling": {
+            "local_dir": str(weights_dir),
+            "enabled": False,
+        },
+    })
+
+    remove("owner", purge=True)
+
+    assert marker.read_bytes() == b"shared"
+    catalog = _read_catalog()
+    assert "owner" not in catalog
+    assert catalog["sibling"]["local_dir"] == str(weights_dir)
+
+
 def test_remove_with_purge_leaves_external_weights(tmp_catalog):
     """A local_dir outside ~/.muse/weights/ (typically the HF shared
     cache at ~/.cache/huggingface) must NOT be rmtree'd, even under
@@ -335,6 +609,32 @@ def test_remove_with_purge_leaves_external_weights(tmp_catalog):
         "external cache must be left alone (not under ~/.muse/weights/)"
     assert (external_weights / "model.safetensors").exists()
     assert not venv_path.exists(), "venv still gets purged"
+
+
+def test_remove_with_purge_rejects_weights_root_before_unregistering(tmp_catalog):
+    """A corrupt local_dir equal to the owned root cannot erase all weights."""
+    from muse.core.catalog import CatalogError, _write_catalog
+
+    weights_root = tmp_catalog / "weights"
+    weights_root.mkdir()
+    marker = weights_root / "keep"
+    marker.write_text("present")
+    venv_path = tmp_catalog / "venvs" / "rooted"
+    venv_path.mkdir(parents=True)
+    _write_catalog({
+        "rooted": {
+            "local_dir": str(weights_root),
+            "venv_path": str(venv_path),
+            "enabled": False,
+        },
+    })
+
+    with pytest.raises(CatalogError, match="local_dir points at owned root"):
+        remove("rooted", purge=True)
+
+    assert marker.exists()
+    assert venv_path.exists()
+    assert "rooted" in _read_catalog()
 
 
 def test_remove_with_purge_tolerates_missing_weights_dir(tmp_catalog):
@@ -388,6 +688,240 @@ def test_remove_default_leaves_resolver_weights(tmp_catalog):
 def test_load_backend_raises_when_not_pulled(tmp_catalog):
     with pytest.raises(RuntimeError, match="not pulled"):
         load_backend("soprano-80m")
+
+
+def test_load_backend_rejects_stale_curated_remote_code_pin(tmp_catalog):
+    """An upgrade must not execute a pre-pin local snapshot."""
+    from muse.core.catalog import _write_catalog
+    from muse.core.curated import find_curated
+
+    curated = find_curated("nomic-embed-text-v1.5")
+    assert curated is not None
+    _write_catalog({
+        "nomic-embed-text-v1.5": {
+            "hf_repo": "nomic-ai/nomic-embed-text-v1.5",
+            "local_dir": "/fake/local",
+            "venv_path": "/fake/venv",
+            "python_path": "/fake/venv/bin/python",
+            "enabled": True,
+            "source": "hf://nomic-ai/nomic-embed-text-v1.5",
+            "manifest": {
+                "model_id": "nomic-embed-text-v1.5",
+                "modality": "embedding/text",
+                "hf_repo": "nomic-ai/nomic-embed-text-v1.5",
+                "backend_path": (
+                    "muse.modalities.embedding_text.runtimes."
+                    "sentence_transformers:SentenceTransformerModel"
+                ),
+                "capabilities": {"trust_remote_code": True},
+            },
+        },
+    })
+    fake_module = MagicMock()
+
+    with patch(
+        "muse.core.catalog._import_backend_module",
+        return_value=fake_module,
+    ), pytest.raises(RuntimeError, match="current reviewed remote-code pin"):
+        load_backend("nomic-embed-text-v1.5")
+
+    fake_module.SentenceTransformerModel.assert_not_called()
+
+
+def test_load_backend_rejects_stale_curated_non_remote_code_pin(tmp_catalog):
+    """Every reviewed resolver revision, not only executable code, is binding."""
+    from muse.core.catalog import _write_catalog
+    from muse.core.curated import CuratedEntry
+
+    curated = CuratedEntry(
+        id="opus-mt-en-es",
+        bundled=False,
+        uri="hf://Helsinki-NLP/opus-mt-en-es",
+        modality="text/translation",
+        size_gb=None,
+        description=None,
+        tags=(),
+        capabilities={},
+        revision="1" * 40,
+    )
+    stale_revision = "0" * 40
+    assert stale_revision != curated.revision
+    _write_catalog({
+        "opus-mt-en-es": {
+            "hf_repo": "Helsinki-NLP/opus-mt-en-es",
+            "local_dir": "/fake/local",
+            "venv_path": "/fake/venv",
+            "python_path": "/fake/venv/bin/python",
+            "enabled": True,
+            "source": "hf://Helsinki-NLP/opus-mt-en-es",
+            "revision": stale_revision,
+            "manifest": {
+                "model_id": "opus-mt-en-es",
+                "modality": "text/translation",
+                "hf_repo": "Helsinki-NLP/opus-mt-en-es",
+                "backend_path": "muse.fake:TranslationModel",
+                "capabilities": {},
+                "revision": stale_revision,
+            },
+        },
+    })
+    fake_module = MagicMock()
+
+    with patch("muse.core.catalog.find_curated", return_value=curated), patch(
+        "muse.core.catalog._import_backend_module", return_value=fake_module,
+    ), pytest.raises(RuntimeError, match="immutable resolver provenance"):
+        load_backend("opus-mt-en-es")
+
+    fake_module.TranslationModel.assert_not_called()
+
+
+def test_load_backend_rejects_inconsistent_resolver_artifact_receipt(tmp_catalog):
+    from muse.core.catalog import _write_catalog
+
+    revision = "1" * 40
+    receipt = [{
+        "repo_id": "org/model",
+        "revision": revision,
+        "subdir": ".",
+    }]
+    _write_catalog({
+        "receipt-model": {
+            "hf_repo": "org/model",
+            "local_dir": "/fake/local",
+            "venv_path": "/fake/venv",
+            "python_path": "/fake/venv/bin/python",
+            "enabled": True,
+            "source": "hf://org/model",
+            "revision": revision,
+            "artifact_provenance": [{**receipt[0], "revision": "2" * 40}],
+            "manifest": {
+                "model_id": "receipt-model",
+                "modality": "embedding/text",
+                "hf_repo": "org/model",
+                "backend_path": "muse.fake:Model",
+                "capabilities": {},
+                "revision": revision,
+                "artifact_provenance": receipt,
+            },
+        },
+    })
+
+    with patch("muse.core.catalog._import_backend_module") as importer, \
+         pytest.raises(RuntimeError, match="artifact receipt"):
+        load_backend("receipt-model")
+
+    importer.assert_not_called()
+
+
+def test_load_backend_rejects_stale_bundled_remote_code_pin(tmp_catalog):
+    """Bundled remote-code models pulled before pinning also need a re-pull."""
+    from muse.core.catalog import _write_catalog
+
+    _write_catalog({
+        "mert-v1-95m": {
+            "hf_repo": "m-a-p/MERT-v1-95M",
+            "local_dir": "/fake/local",
+            "venv_path": "/fake/venv",
+            "python_path": "/fake/venv/bin/python",
+            "enabled": True,
+        },
+    })
+    fake_module = MagicMock()
+
+    with patch(
+        "muse.core.catalog._import_backend_module",
+        return_value=fake_module,
+    ), pytest.raises(RuntimeError, match="current reviewed remote-code pin"):
+        load_backend("mert-v1-95m")
+
+    fake_module.Model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "artifact_provenance",
+    [
+        None,
+        [
+            {
+                "repo_id": "ekwek/Soprano-1.1-80M",
+                "revision": "0" * 40,
+                "subdir": "",
+                "allow_patterns": None,
+            }
+        ],
+    ],
+)
+def test_load_backend_rejects_missing_or_stale_bundled_artifact_receipt(
+    tmp_catalog,
+    artifact_provenance,
+):
+    """Ordinary bundled snapshots must match the complete pull receipt."""
+    from muse.core.catalog import _write_catalog
+
+    entry = {
+        "hf_repo": "ekwek/Soprano-1.1-80M",
+        "local_dir": "/fake/local",
+        "venv_path": "/fake/venv",
+        "python_path": "/fake/venv/bin/python",
+        "enabled": True,
+        "revision": "27b5a5f5f541a1db3a51d6fd1b0fc7147b92cd01",
+    }
+    if artifact_provenance is not None:
+        entry["artifact_provenance"] = artifact_provenance
+    _write_catalog({"soprano-80m": entry})
+    fake_module = MagicMock()
+
+    with patch(
+        "muse.core.catalog._import_backend_module",
+        return_value=fake_module,
+    ), pytest.raises(RuntimeError, match="immutable artifact provenance"):
+        load_backend("soprano-80m")
+
+    fake_module.Model.assert_not_called()
+
+
+def test_load_backend_accepts_matching_curated_remote_code_pins(tmp_catalog):
+    """A freshly pinned pull reaches the backend with its external code pin."""
+    from muse.core.catalog import _write_catalog
+    from muse.core.curated import find_curated
+
+    curated = find_curated("nomic-embed-text-v1.5")
+    assert curated is not None
+    _write_catalog({
+        "nomic-embed-text-v1.5": {
+            "hf_repo": "nomic-ai/nomic-embed-text-v1.5",
+            "local_dir": "/fake/local",
+            "venv_path": "/fake/venv",
+            "python_path": "/fake/venv/bin/python",
+            "enabled": True,
+            "source": "hf://nomic-ai/nomic-embed-text-v1.5",
+            "revision": curated.revision,
+            "code_revision": curated.code_revision,
+            "manifest": {
+                "model_id": "nomic-embed-text-v1.5",
+                "modality": "embedding/text",
+                "hf_repo": "nomic-ai/nomic-embed-text-v1.5",
+                "backend_path": (
+                    "muse.modalities.embedding_text.runtimes."
+                    "sentence_transformers:SentenceTransformerModel"
+                ),
+                "capabilities": {"trust_remote_code": True},
+                "revision": curated.revision,
+            },
+        },
+    })
+    fake_cls = MagicMock()
+    fake_module = MagicMock(SentenceTransformerModel=fake_cls)
+
+    with patch(
+        "muse.core.catalog._import_backend_module",
+        return_value=fake_module,
+    ):
+        load_backend("nomic-embed-text-v1.5")
+
+    kwargs = fake_cls.call_args.kwargs
+    assert kwargs["code_revision"] == curated.code_revision
+    assert kwargs["trust_remote_code"] is True
 
 
 def test_load_backend_imports_and_constructs(tmp_catalog):
@@ -542,6 +1076,112 @@ def test_pull_records_enabled_true_by_default(tmp_catalog):
         pull("soprano-80m")
     catalog = _read_catalog()
     assert catalog["soprano-80m"]["enabled"] is True
+
+
+def test_bundled_repull_preserves_latest_operator_state(tmp_catalog):
+    """An admin edit during download wins over replacement defaults."""
+    from muse.core.catalog import (
+        _pull_bundled_transaction,
+        _write_catalog,
+        set_device_override,
+        set_enabled,
+        set_gpu_layers_override,
+    )
+
+    model_id = "soprano-80m"
+    entry = known_models()[model_id]
+    _write_catalog({
+        model_id: {
+            "enabled": True,
+            "device_override": "cpu",
+            "gpu_layers_override": 1,
+        },
+    })
+
+    def download_after_admin_edit(**_kwargs):
+        set_enabled(model_id, False)
+        set_device_override(model_id, "cuda")
+        set_gpu_layers_override(model_id, 12)
+        return "/fake/new-weights"
+
+    with patch("muse.core.catalog.ensure_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.install_python_sources"), \
+         patch(
+             "muse.core.catalog.snapshot_download",
+             side_effect=download_after_admin_edit,
+         ), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        _pull_bundled_transaction(
+            model_id,
+            entry,
+            tmp_catalog / "venvs" / model_id,
+        )
+
+    persisted = _read_catalog()[model_id]
+    assert persisted["local_dir"] == "/fake/new-weights"
+    assert persisted["enabled"] is False
+    assert persisted["device_override"] == "cuda"
+    assert persisted["gpu_layers_override"] == 12
+
+
+def test_resolver_repull_preserves_latest_operator_state(tmp_catalog):
+    """Resolver replacement also merges controls from its final locked read."""
+    from muse.core.catalog import (
+        _pull_resolved_transaction,
+        _write_catalog,
+        set_device_override,
+        set_enabled,
+        set_gpu_layers_override,
+    )
+
+    model_id = "resolved-model"
+    _write_catalog({
+        model_id: {
+            "enabled": True,
+            "device_override": "cpu",
+            "gpu_layers_override": 2,
+        },
+    })
+
+    class _Resolved:
+        artifact_provenance = ()
+
+        @staticmethod
+        def download(_cache):
+            set_enabled(model_id, False)
+            set_device_override(model_id, "mps")
+            set_gpu_layers_override(model_id, 24)
+            return tmp_catalog / "weights" / "resolved-v2"
+
+    manifest = {
+        "model_id": model_id,
+        "modality": "embedding/text",
+        "hf_repo": "org/resolved-v2",
+        "backend_path": "fake:Model",
+        "pip_extras": [],
+        "system_packages": [],
+        "python_sources": [],
+        "capabilities": {},
+    }
+    with patch("muse.core.catalog.ensure_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.install_python_sources"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        _pull_resolved_transaction(
+            uri="hf://org/resolved-v2",
+            model_id=model_id,
+            manifest=manifest,
+            effective_base_override=None,
+            resolved=_Resolved(),
+            venv_path=tmp_catalog / "venvs" / model_id,
+        )
+
+    persisted = _read_catalog()[model_id]
+    assert persisted["hf_repo"] == "org/resolved-v2"
+    assert persisted["enabled"] is False
+    assert persisted["device_override"] == "mps"
+    assert persisted["gpu_layers_override"] == 24
 
 
 def test_read_catalog_backfills_enabled_for_legacy_entries(tmp_catalog):
@@ -771,6 +1411,89 @@ def test_bundled_scripts_win_on_collision_with_resolver_manifest(tmp_catalog):
     assert entries["kokoro-82m"].hf_repo == "hexgrad/Kokoro-82M"
 
 
+def test_get_manifest_also_ignores_resolver_collision_with_bundled(tmp_catalog):
+    """Construction and route-gating must agree that bundled scripts win."""
+    from muse.core.catalog import get_manifest
+
+    _write_persisted_resolver_entry(
+        tmp_catalog,
+        model_id="kokoro-82m",
+        modality="chat/completion",
+        hf_repo="malicious/fake",
+        backend_path="malicious.module:Model",
+        capabilities={"supports_tools": True},
+    )
+    _reset_known_models_cache()
+
+    manifest = get_manifest("kokoro-82m")
+
+    assert manifest["hf_repo"] == "hexgrad/Kokoro-82M"
+    assert manifest["modality"] == "audio/speech"
+
+
+def test_invalid_persisted_manifest_isolated_from_valid_entries(
+    tmp_catalog, caplog,
+):
+    import json
+    import logging
+    from muse.core.catalog import (
+        _catalog_path,
+        _read_catalog,
+        _reset_known_models_cache,
+        _reset_read_catalog_cache,
+    )
+
+    _write_persisted_resolver_entry(tmp_catalog, model_id="valid-resolver")
+    state = _read_catalog()
+    state["broken-resolver-unique"] = {
+        "enabled": True,
+        "manifest": {
+            "model_id": "different-id",
+            "modality": "chat/completion",
+            "hf_repo": "fake/repo",
+            "backend_path": "fake.module:Model",
+        },
+    }
+    _catalog_path().write_text(json.dumps(state))
+    _reset_read_catalog_cache()
+    _reset_known_models_cache()
+    _reset_known_models_cache()
+    caplog.set_level(logging.WARNING)
+
+    entries = known_models()
+
+    assert "valid-resolver" in entries
+    assert "broken-resolver-unique" not in entries
+    assert "skipping invalid persisted manifest" in caplog.text
+
+
+def test_get_manifest_reports_invalid_requested_persisted_entry(tmp_catalog):
+    import json
+    from muse.core.catalog import (
+        CatalogError,
+        _catalog_path,
+        _reset_read_catalog_cache,
+        get_manifest,
+    )
+
+    _catalog_path().write_text(json.dumps({
+        "broken-resolver-unique": {
+            "enabled": True,
+            "manifest": {
+                "model_id": "wrong-id",
+                "modality": "chat/completion",
+                "hf_repo": "fake/repo",
+                "backend_path": "fake.module:Model",
+            },
+        },
+    }))
+    _reset_read_catalog_cache()
+    _reset_known_models_cache()
+
+    with pytest.raises(CatalogError, match="invalid manifest"):
+        get_manifest("broken-resolver-unique")
+
+
 def test_legacy_catalog_entries_without_manifest_are_skipped_in_merge(tmp_catalog):
     """Old catalog entries (pre-resolver) lack `manifest`; they don't break merge."""
     import json
@@ -850,22 +1573,21 @@ def test_read_catalog_caches_consecutive_reads(tmp_catalog):
     _write_catalog({"alpha": {"hf_repo": "x/y", "enabled": True}})
     _reset_read_catalog_cache()
 
-    real_path_read_text = type(tmp_catalog).read_text
-    call_count = {"n": 0}
+    from muse.core import catalog as catalog_module
 
-    def counting_read_text(self, *a, **kw):
-        call_count["n"] += 1
-        return real_path_read_text(self, *a, **kw)
-
-    with patch.object(type(tmp_catalog), "read_text", counting_read_text):
+    with patch.object(
+        catalog_module,
+        "_open_catalog_regular_file",
+        wraps=catalog_module._open_catalog_regular_file,
+    ) as safe_open:
         c1 = _read_catalog()
         c2 = _read_catalog()
         c3 = _read_catalog()
 
     assert c1 == c2 == c3
-    # Three calls, exactly ONE disk read. Cache hits skip Path.read_text.
-    assert call_count["n"] == 1, (
-        f"_read_catalog hit disk {call_count['n']} times across 3 calls; "
+    # Three calls, exactly ONE safe file open. Cache hits skip disk reads.
+    assert safe_open.call_count == 1, (
+        f"_read_catalog hit disk {safe_open.call_count} times across 3 calls; "
         "expected 1 (mtime cache)"
     )
 
@@ -899,6 +1621,24 @@ def test_read_catalog_cache_invalidates_on_mtime_change(tmp_catalog):
 
     second = _read_catalog()
     assert "beta" in second, "_read_catalog cache failed to invalidate after _write_catalog"
+
+
+def test_read_catalog_cache_detects_same_mtime_atomic_replacement(tmp_catalog):
+    """Inode/ctime identity prevents stale reads when mtimes are preserved."""
+    import os
+    from muse.core.catalog import _catalog_path, _read_catalog, _write_catalog
+
+    _write_catalog({"alpha": {"enabled": True}})
+    assert set(_read_catalog()) == {"alpha"}
+    path = _catalog_path()
+    original = path.stat()
+
+    # Same-length key keeps file size stable; restoring the old mtime models
+    # backup/restore tools and coarse filesystems that preserve timestamps.
+    _write_catalog({"bravo": {"enabled": True}})
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    assert set(_read_catalog()) == {"bravo"}
 
 
 # --- _read_catalog corrupt-file guard ---------------------------------------
@@ -946,6 +1686,193 @@ def test_read_catalog_corrupt_falls_back_to_last_known_good(tmp_catalog):
     )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    ["[]", "null", '{"alpha": null}', '{"alpha": []}'],
+)
+def test_read_catalog_malformed_schema_with_no_prior_cache_raises(tmp_catalog, payload):
+    """Valid JSON with the wrong outer shape follows the corruption path."""
+    from muse.core.catalog import CatalogError, _catalog_path
+
+    _catalog_path().write_text(payload)
+
+    with pytest.raises(CatalogError, match="invalid schema"):
+        _read_catalog()
+
+
+def test_read_catalog_malformed_schema_falls_back_to_last_known_good(tmp_catalog):
+    """Schema corruption uses the same LKG behavior as invalid JSON."""
+    import os
+    from muse.core.catalog import _catalog_path, _write_catalog
+
+    _write_catalog({"alpha": {"enabled": True}})
+    assert "alpha" in _read_catalog()
+    path = _catalog_path()
+    prior = path.stat()
+    path.write_text("[]")
+    os.utime(
+        path,
+        ns=(prior.st_atime_ns, max(path.stat().st_mtime_ns, prior.st_mtime_ns + 1)),
+    )
+
+    assert "alpha" in _read_catalog()
+
+
+@pytest.mark.parametrize(
+    "entry,match",
+    [
+        ({"enabled": "yes"}, "enabled"),
+        ({"device_override": "gpu"}, "device_override"),
+        ({"gpu_layers_override": True}, "gpu_layers_override"),
+        ({"local_dir": 42}, "local_dir"),
+        (
+            {"measurements": {"cpu": {"peak_bytes": -1}}},
+            "peak_bytes",
+        ),
+        (
+            {
+                "artifact_provenance": [{
+                    "repo_id": "org/model",
+                    "revision": "main",
+                    "subdir": ".",
+                }],
+            },
+            "40-character commit",
+        ),
+    ],
+)
+def test_read_catalog_rejects_invalid_present_field_semantics(
+    tmp_catalog,
+    entry,
+    match,
+):
+    import json
+    from muse.core.catalog import CatalogError, _catalog_path
+
+    _catalog_path().write_text(json.dumps({"alpha": entry}))
+    with pytest.raises(CatalogError, match=match):
+        _read_catalog()
+
+
+def test_semantic_corruption_falls_back_to_last_known_good(tmp_catalog):
+    import json
+    import os
+    from muse.core.catalog import _catalog_path, _write_catalog
+
+    _write_catalog({"alpha": {"enabled": True}})
+    assert _read_catalog()["alpha"]["enabled"] is True
+    path = _catalog_path()
+    prior = path.stat()
+    path.write_text(json.dumps({"alpha": {"enabled": "not-a-bool"}}))
+    os.utime(
+        path,
+        ns=(prior.st_atime_ns, max(path.stat().st_mtime_ns, prior.st_mtime_ns + 1)),
+    )
+
+    assert _read_catalog()["alpha"]["enabled"] is True
+
+
+def test_write_catalog_rejects_invalid_present_field_semantics(tmp_catalog):
+    from muse.core.catalog import CatalogError, _write_catalog
+
+    with pytest.raises(CatalogError, match="gpu_layers_override"):
+        _write_catalog({"alpha": {"gpu_layers_override": -2}})
+    with pytest.raises(CatalogError, match="capabilities"):
+        _write_catalog({
+            "alpha": {
+                "manifest": {
+                    "model_id": "alpha",
+                    "modality": "embedding/text",
+                    "hf_repo": "org/model",
+                    "backend_path": "fake:Model",
+                    "capabilities": [],
+                },
+            },
+        })
+
+
+def test_catalog_extensions_are_bounded_but_forward_compatible(tmp_catalog):
+    import json
+    from muse.core.catalog import CatalogError, _catalog_path, _write_catalog
+
+    extension = {"nested": [{"future": "value"}]}
+    _write_catalog({"alpha": {"enabled": True, "extension": extension}})
+    assert _read_catalog()["alpha"]["extension"] == extension
+
+    nested = {}
+    cursor = nested
+    for index in range(30):
+        child = {}
+        cursor[f"level_{index}"] = child
+        cursor = child
+    _catalog_path().write_text(json.dumps({"alpha": {"extension": nested}}))
+    from muse.core.catalog import _reset_read_catalog_cache
+    _reset_read_catalog_cache()
+    with pytest.raises(CatalogError, match="nesting depth"):
+        _read_catalog()
+
+
+def test_write_catalog_failure_preserves_old_file_and_cleans_temp(tmp_catalog):
+    """A failed atomic replace neither corrupts the old file nor leaks temp files."""
+    from muse.core.catalog import _write_catalog
+
+    _write_catalog({"old": {"enabled": True}})
+    with patch("muse.core.catalog.os.replace", side_effect=OSError("replace failed")):
+        with pytest.raises(OSError, match="replace failed"):
+            _write_catalog({"new": {"enabled": True}})
+
+    assert "old" in _read_catalog()
+    assert "new" not in _read_catalog()
+    assert not list(tmp_catalog.glob(".catalog.json.*.tmp"))
+
+
+def test_catalog_rmw_lock_serializes_independent_processes(tmp_catalog):
+    """A second process cannot enter an RMW while the first holds the lock."""
+    import multiprocessing
+
+    from muse.core.catalog import _write_catalog
+
+    _write_catalog({})
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process flock regression requires POSIX fork")
+    context = multiprocessing.get_context("fork")
+    holding = context.Event()
+    release = context.Event()
+    attempting = context.Event()
+    acquired = context.Event()
+    holder = context.Process(
+        target=_hold_catalog_process_lock,
+        args=(str(tmp_catalog), holding, release),
+    )
+    writer = context.Process(
+        target=_write_after_catalog_process_lock,
+        args=(str(tmp_catalog), attempting, acquired),
+    )
+    started = []
+    try:
+        holder.start()
+        started.append(holder)
+        assert holding.wait(10), "holder process did not acquire catalog lock"
+        writer.start()
+        started.append(writer)
+        assert attempting.wait(10), "writer process did not reach catalog lock"
+        entered_while_held = acquired.wait(0.3)
+        release.set()
+        holder.join(10)
+        writer.join(10)
+
+        assert not entered_while_held, "file lock did not exclude another process"
+        assert holder.exitcode == 0
+        assert writer.exitcode == 0
+        assert _read_catalog().keys() >= {"holder", "writer"}
+    finally:
+        release.set()
+        for process in started:
+            if process.is_alive():
+                process.terminate()
+            process.join(2)
+
+
 def test_get_manifest_does_not_re_read_catalog_each_call(tmp_catalog):
     """get_manifest is on the gateway hot path; back-to-back calls must
     hit the catalog file only once thanks to the mtime cache.
@@ -965,20 +1892,19 @@ def test_get_manifest_does_not_re_read_catalog_each_call(tmp_catalog):
     _reset_known_models_cache()
     _reset_read_catalog_cache()
 
-    real_path_read_text = type(tmp_catalog).read_text
-    call_count = {"n": 0}
+    from muse.core import catalog as catalog_module
 
-    def counting_read_text(self, *a, **kw):
-        call_count["n"] += 1
-        return real_path_read_text(self, *a, **kw)
-
-    with patch.object(type(tmp_catalog), "read_text", counting_read_text):
+    with patch.object(
+        catalog_module,
+        "_open_catalog_regular_file",
+        wraps=catalog_module._open_catalog_regular_file,
+    ) as safe_open:
         get_manifest("q3-gguf-q4")
-        baseline = call_count["n"]
+        baseline = safe_open.call_count
         # Second call MUST be a cache hit. Without the cache, this would
         # re-read the catalog file from disk (the bug Issue 2 flagged).
         get_manifest("q3-gguf-q4")
-        after_second = call_count["n"]
+        after_second = safe_open.call_count
 
     assert after_second == baseline, (
         f"second get_manifest call hit disk {after_second - baseline} extra times; "
@@ -1065,9 +1991,13 @@ class TestMuseServerInstallArgs:
 
     def test_pypi_target_when_no_source_tree(self):
         from muse.core.catalog import _muse_server_install_args
-        with patch("muse.core.catalog._muse_repo_root", return_value=None):
+        with patch("muse.core.catalog._muse_repo_root", return_value=None), \
+             patch(
+                 "muse.core.catalog.importlib_metadata.version",
+                 return_value="1.2.3",
+             ):
             args = _muse_server_install_args()
-        assert args == ["museq[server]"]
+        assert args == ["museq[server]==1.2.3"]
         assert "-e" not in args
 
     def test_pull_bundled_installs_museq_from_pypi_when_not_source_tree(
@@ -1075,14 +2005,19 @@ class TestMuseServerInstallArgs:
     ):
         from muse.core.catalog import pull
         with patch("muse.core.catalog._muse_repo_root", return_value=None), \
+             patch(
+                 "muse.core.catalog.importlib_metadata.version",
+                 return_value="1.2.3",
+             ), \
              patch("muse.core.catalog.create_venv"), \
              patch("muse.core.catalog.install_into_venv") as mock_install, \
+             patch("muse.core.catalog.install_python_sources"), \
              patch("muse.core.catalog.snapshot_download", return_value="/fake"), \
              patch("muse.core.catalog.check_system_packages", return_value=[]):
             pull("kokoro-82m")
         # The muse-self install (first call) must be the published dist, no -e.
         first_args = mock_install.call_args_list[0].args[1]
-        assert first_args == ["museq[server]"]
+        assert first_args == ["museq[server]==1.2.3"]
 
 
 def test_repull_resolver_model_by_bare_id_routes_through_resolver(tmp_catalog):
@@ -1667,6 +2602,8 @@ def test_pull_via_resolver_merges_curated_capabilities_overlay(tmp_catalog):
     from muse.core.curated import CuratedEntry
     from muse.core.resolvers import ResolvedModel
 
+    revision = "1" * 40
+    code_revision = "2" * 40
     fake_curated = CuratedEntry(
         id="my-model",
         bundled=False,
@@ -1676,6 +2613,8 @@ def test_pull_via_resolver_merges_curated_capabilities_overlay(tmp_catalog):
         description="custom",
         tags=(),
         capabilities={"trust_remote_code": True, "custom_flag": 42},
+        revision=revision,
+        code_revision=code_revision,
     )
 
     fake_resolved = ResolvedModel(
@@ -1685,6 +2624,7 @@ def test_pull_via_resolver_merges_curated_capabilities_overlay(tmp_catalog):
             "hf_repo": "org/repo",
             "pip_extras": [],
             "system_packages": [],
+            "revision": revision,
             "capabilities": {"base_caps_key": "base_val"},
         },
         backend_path="fake.mod:Cls",
@@ -1695,7 +2635,7 @@ def test_pull_via_resolver_merges_curated_capabilities_overlay(tmp_catalog):
     # (`from muse.core.resolvers import resolve`), so the patch must
     # target the source module, not muse.core.catalog.
     with patch("muse.core.catalog.find_curated", return_value=fake_curated), \
-         patch("muse.core.resolvers.resolve", return_value=fake_resolved), \
+         patch("muse.core.resolvers.resolve", return_value=fake_resolved) as mock_resolve, \
          patch("muse.core.catalog.create_venv"), \
          patch("muse.core.catalog.install_into_venv"), \
          patch("muse.core.catalog.check_system_packages", return_value=[]), \
@@ -1709,7 +2649,18 @@ def test_pull_via_resolver_merges_curated_capabilities_overlay(tmp_catalog):
         "base_caps_key": "base_val",
         "trust_remote_code": True,
         "custom_flag": 42,
+        "code_revision": code_revision,
     }
+    assert catalog["my-model"]["revision"] == revision
+    assert catalog["my-model"]["code_revision"] == code_revision
+    expected_receipt = [{
+        "repo_id": "org/repo",
+        "revision": revision,
+        "subdir": ".",
+    }]
+    assert catalog["my-model"]["artifact_provenance"] == expected_receipt
+    assert persisted["artifact_provenance"] == expected_receipt
+    assert mock_resolve.call_args.kwargs["revision"] == revision
 
 
 def test_pull_via_resolver_overlay_wins_on_collision(tmp_catalog):
@@ -1752,6 +2703,61 @@ def test_pull_via_resolver_overlay_wins_on_collision(tmp_catalog):
 
     persisted = _read_catalog()["collide"]["manifest"]
     assert persisted["capabilities"]["shared_key"] == "curated_wins"
+
+
+def test_pull_via_resolver_installs_and_persists_reviewed_python_sources(
+    tmp_catalog,
+):
+    """Source materialization belongs to the venv and precedes weight fetch."""
+    from muse.core.resolvers import ResolvedModel
+
+    source = {
+        "type": "git",
+        "name": "reviewed-sdk",
+        "url": "https://github.com/example/reviewed-sdk.git",
+        "revision": "a" * 40,
+        "sparse_paths": ["sdk"],
+        "required_paths": ["sdk/__init__.py"],
+        "pth_path": ".",
+        "submodules": [],
+    }
+    events = []
+
+    def download(cache_root):
+        events.append("download")
+        return cache_root / "weights" / "source-model"
+
+    fake_resolved = ResolvedModel(
+        manifest={
+            "model_id": "source-model",
+            "modality": "3d/generation",
+            "hf_repo": "org/source-model",
+            "pip_extras": [],
+            "system_packages": ["git"],
+            "python_sources": [source],
+            "capabilities": {},
+        },
+        backend_path="fake.mod:Runtime",
+        download=download,
+    )
+    expected_venv = tmp_catalog / "venvs" / "source-model"
+
+    with patch("muse.core.catalog.find_curated", return_value=None), \
+         patch("muse.core.catalog.find_curated_by_uri", return_value=None), \
+         patch("muse.core.resolvers.resolve", return_value=fake_resolved), \
+         patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]), \
+         patch(
+             "muse.core.catalog.install_python_sources",
+             side_effect=lambda *_: events.append("source"),
+         ) as install_sources, \
+         patch("muse.core.catalog.venv_python", return_value=Path("/fake/py")):
+        pull("hf://org/source-model")
+
+    install_sources.assert_called_once_with(expected_venv, [source])
+    assert events == ["source", "download"]
+    assert _read_catalog()["source-model"]["manifest"]["python_sources"] == [source]
 
 
 def test_pull_uri_direct_inherits_curated_capabilities(tmp_catalog):
@@ -2099,17 +3105,48 @@ def test_pull_bundled_honors_allow_patterns_capability(tmp_catalog):
     assert any("unet" in p for p in patterns)
 
 
-def test_pull_bundled_no_allow_patterns_calls_default(tmp_catalog):
-    """Models without allow_patterns capability call snapshot_download without it."""
+def test_pull_bundled_kokoro_uses_local_only_artifact_filter(tmp_catalog):
+    """Kokoro pulls every required local file and no unrelated artifact."""
     with patch("muse.core.catalog.create_venv"), \
          patch("muse.core.catalog.install_into_venv"), \
          patch("muse.core.catalog.snapshot_download", return_value="/fake") as mock_download, \
          patch("muse.core.catalog.check_system_packages", return_value=[]):
-        pull("kokoro-82m")  # no allow_patterns in MANIFEST
+        pull("kokoro-82m")
     mock_download.assert_called_once()
     kwargs = mock_download.call_args.kwargs
-    assert "allow_patterns" not in kwargs
-    assert "revision" not in kwargs
+    assert kwargs["allow_patterns"] == [
+        "config.json",
+        "kokoro-v1_0.pth",
+        "voices/*.pt",
+    ]
+    assert kwargs["revision"] == "f3ff3571791e39611d31c381e3a41a3af07b4987"
+
+
+def test_bundled_pull_rejects_missing_revision_before_side_effects(
+    tmp_catalog,
+):
+    """A packaged mutable manifest cannot create or install a venv."""
+    from muse.core.catalog import (
+        CatalogEntry,
+        CatalogError,
+        _pull_bundled_transaction,
+    )
+
+    entry = CatalogEntry(
+        model_id="mutable-bundled",
+        modality="embedding/text",
+        backend_path="fake:Model",
+        hf_repo="org/repo",
+        bundled=True,
+    )
+    with patch("muse.core.catalog.ensure_venv") as ensure:
+        with pytest.raises(CatalogError, match="must declare an immutable"):
+            _pull_bundled_transaction(
+                "mutable-bundled",
+                entry,
+                tmp_catalog / "venvs" / "mutable-bundled",
+            )
+    ensure.assert_not_called()
 
 
 def test_pull_bundled_honors_pinned_revision(tmp_catalog):
@@ -2130,7 +3167,76 @@ def test_pull_bundled_honors_pinned_revision(tmp_catalog):
     assert kwargs["revision"] == revision
     assert "*.safetensors" in kwargs["allow_patterns"]
     assert "*.py" not in kwargs["allow_patterns"]
-    assert _read_catalog()["starvector-1b-im2svg"]["revision"] == revision
+    persisted = _read_catalog()["starvector-1b-im2svg"]
+    assert persisted["revision"] == revision
+    assert persisted["artifact_provenance"] == [
+        {
+            "repo_id": "starvector/starvector-1b-im2svg",
+            "revision": revision,
+            "subdir": "",
+            "allow_patterns": kwargs["allow_patterns"],
+        }
+    ]
+
+
+def test_pull_bundled_projects_top_level_revision_and_filters(tmp_catalog):
+    """Top-level download metadata must not be lost during discovery."""
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch(
+             "muse.core.catalog.snapshot_download",
+             return_value="/fake/mert",
+         ) as mock_download, \
+         patch("muse.core.catalog.check_system_packages", return_value=[]):
+        pull("mert-v1-95m")
+
+    kwargs = mock_download.call_args.kwargs
+    revision = "12af15fef9d0ac838c3f475bfbbf26d2060dd4f5"
+    assert kwargs["revision"] == revision
+    assert "*.safetensors" in kwargs["allow_patterns"]
+    assert "*.py" in kwargs["allow_patterns"]
+    assert _read_catalog()["mert-v1-95m"]["revision"] == revision
+
+
+def test_pull_bundled_routes_multi_artifact_manifest_to_atomic_bundle(
+    tmp_catalog,
+):
+    bundle = tmp_catalog / "weights" / "animatediff-bundle"
+    with patch("muse.core.catalog.create_venv"), \
+         patch("muse.core.catalog.install_into_venv"), \
+         patch("muse.core.catalog.check_system_packages", return_value=[]), \
+         patch(
+             "muse.core.artifacts.download_hf_artifact_bundle",
+             return_value=bundle,
+         ) as download_bundle:
+        pull("animatediff-motion-v3")
+
+    kwargs = download_bundle.call_args.kwargs
+    assert kwargs["bundle_name"] == "animatediff-motion-v3"
+    artifacts = kwargs["artifacts"]
+    assert [artifact.repo_id for artifact in artifacts] == [
+        "guoyww/animatediff-motion-adapter-v1-5-3",
+        "emilianJR/epiCRealism",
+    ]
+    assert artifacts[0].revision == "2e8139b1d1269fd8a21deb96ad19455e187692eb"
+    assert artifacts[1].revision == "6522cf856b8c8e14638a0aaa7bd89b1b098aed17"
+    persisted = _read_catalog()["animatediff-motion-v3"]
+    assert persisted["local_dir"] == str(bundle)
+    assert persisted["revision"] == artifacts[0].revision
+    assert persisted["artifact_provenance"] == [
+        {
+            "repo_id": artifact.repo_id,
+            "revision": artifact.revision,
+            "subdir": artifact.subdir,
+            "allow_patterns": (
+                list(artifact.allow_patterns)
+                if artifact.allow_patterns is not None
+                else None
+            ),
+            "required_patterns": list(artifact.required_patterns),
+        }
+        for artifact in artifacts
+    ]
 
 
 def test_known_models_surfaces_memory_annotation():
@@ -2516,7 +3622,14 @@ class TestBaseOverrideDurability:
         _reset_read_catalog_cache()
         _reset_known_models_cache()
 
-        def fake_resolve(uri, *, modality=None, base_override=None):
+        def fake_resolve(
+            uri,
+            *,
+            modality=None,
+            base_override=None,
+            revision=None,
+        ):
+            assert revision is None
             return ResolvedModel(
                 manifest={
                     "model_id": "pixel-art-xl",
@@ -2551,6 +3664,35 @@ class TestBaseOverrideDurability:
         entry = catalog["pixel-art-xl"]
         assert entry.get("base_override") == "sdxl-turbo-pinned"
         assert entry["manifest"]["capabilities"]["base_model"] == "sdxl-turbo-pinned"
+
+
+def test_model_resource_lease_is_exclusive_and_released(tmp_catalog):
+    from muse.core.catalog import ModelInUseError, _model_resource_lease
+
+    with _model_resource_lease("soprano-80m", wait=True):
+        with pytest.raises(ModelInUseError, match="is in use"):
+            with _model_resource_lease("soprano-80m"):
+                pytest.fail("a second owner must not acquire the lease")
+
+    with _model_resource_lease("soprano-80m"):
+        pass
+
+
+def test_remove_refuses_to_mutate_catalog_while_model_is_leased(tmp_catalog):
+    from muse.core.catalog import (
+        ModelInUseError,
+        _model_resource_lease,
+        _read_catalog,
+        _write_catalog,
+        remove,
+    )
+
+    _write_catalog({"soprano-80m": {"enabled": True}})
+    with _model_resource_lease("soprano-80m", wait=True):
+        with pytest.raises(ModelInUseError, match="stop or unload"):
+            remove("soprano-80m", purge=True)
+
+    assert "soprano-80m" in _read_catalog()
 
 
 class TestGpuLayersOverride:
@@ -2743,3 +3885,156 @@ class TestModelIdFilesystemSafety:
         with pytest.raises(ValueError, match="invalid model id"):
             _pull_bundled("a/b")
         assert not (tmp_catalog / "venvs").exists()
+
+
+class TestTransactionalPullRollback:
+    """A failed pull must leave both the prior venv and catalog intact."""
+
+    @staticmethod
+    def _existing_venv(tmp_catalog: Path, model_id: str) -> tuple[Path, Path]:
+        venv_path = tmp_catalog / "venvs" / model_id
+        python = venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("#!/bin/sh\n")
+        python.chmod(0o700)
+        marker = venv_path / "marker"
+        marker.write_text("prior")
+        pth = venv_path / "lib" / "python" / "site-packages" / "reviewed.pth"
+        pth.parent.mkdir(parents=True)
+        pth.write_text("prior-checkout\n")
+        return venv_path, python
+
+    @staticmethod
+    def _create_replacement(path: Path) -> None:
+        python = path / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("#!/bin/sh\n")
+        python.chmod(0o700)
+        (path / "marker").write_text("replacement")
+
+    def test_bundled_dependency_failure_restores_prior_venv_and_catalog(
+        self, tmp_catalog,
+    ):
+        from muse.core.catalog import _write_catalog
+
+        venv_path, python = self._existing_venv(tmp_catalog, "soprano-80m")
+        prior_catalog = {
+            "soprano-80m": {
+                "enabled": False,
+                "venv_path": str(venv_path),
+                "python_path": str(python),
+                "sentinel": "prior-catalog",
+            },
+        }
+        _write_catalog(prior_catalog)
+
+        def fail_install(path, _packages):
+            (path / "marker").write_text("dependency-mutated")
+            raise RuntimeError("dependency install failed")
+
+        with patch(
+            "muse.core.catalog.create_venv",
+            side_effect=self._create_replacement,
+        ), patch(
+            "muse.core.catalog.install_into_venv",
+            side_effect=fail_install,
+        ), patch("muse.core.catalog.snapshot_download") as download, patch(
+            "muse.core.catalog.check_system_packages", return_value=[],
+        ):
+            with pytest.raises(RuntimeError, match="dependency install failed"):
+                pull("soprano-80m")
+
+        download.assert_not_called()
+        assert (venv_path / "marker").read_text() == "prior"
+        assert _read_catalog() == prior_catalog
+
+    def test_resolver_source_failure_restores_prior_venv_and_catalog(
+        self, tmp_catalog,
+    ):
+        from muse.core.catalog import _write_catalog
+        from muse.core.resolvers import ResolvedModel
+
+        model_id = "transactional-source"
+        venv_path, python = self._existing_venv(tmp_catalog, model_id)
+        pth = venv_path / "lib" / "python" / "site-packages" / "reviewed.pth"
+        prior_catalog = {
+            model_id: {
+                "enabled": False,
+                "venv_path": str(venv_path),
+                "python_path": str(python),
+                "sentinel": "prior-catalog",
+            },
+        }
+        _write_catalog(prior_catalog)
+        download = MagicMock(side_effect=AssertionError("download must not run"))
+        resolved = ResolvedModel(
+            manifest={
+                "model_id": model_id,
+                "modality": "3d/generation",
+                "hf_repo": "org/transactional-source",
+                "pip_extras": [],
+                "system_packages": [],
+                "python_sources": [{"type": "git", "name": "reviewed"}],
+                "capabilities": {},
+            },
+            backend_path="fake.module:Runtime",
+            download=download,
+        )
+
+        def fail_source(path, _sources):
+            target = path / "lib" / "python" / "site-packages" / "reviewed.pth"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("unreviewed-checkout\n")
+            (path / "marker").write_text("source-mutated")
+            raise RuntimeError("reviewed source activation failed")
+
+        with patch("muse.core.catalog.find_curated", return_value=None), patch(
+            "muse.core.catalog.find_curated_by_uri", return_value=None,
+        ), patch(
+            "muse.core.resolvers.resolve", return_value=resolved,
+        ), patch(
+            "muse.core.catalog.create_venv",
+            side_effect=self._create_replacement,
+        ), patch("muse.core.catalog.install_into_venv"), patch(
+            "muse.core.catalog.install_python_sources", side_effect=fail_source,
+        ), patch("muse.core.catalog.check_system_packages", return_value=[]):
+            with pytest.raises(RuntimeError, match="reviewed source activation failed"):
+                pull("hf://org/transactional-source")
+
+        download.assert_not_called()
+        assert (venv_path / "marker").read_text() == "prior"
+        assert pth.read_text() == "prior-checkout\n"
+        assert _read_catalog() == prior_catalog
+
+    def test_catalog_write_failure_restores_prior_venv_and_catalog(
+        self, tmp_catalog,
+    ):
+        from muse.core.catalog import _write_catalog
+
+        venv_path, python = self._existing_venv(tmp_catalog, "soprano-80m")
+        prior_catalog = {
+            "soprano-80m": {
+                "enabled": False,
+                "venv_path": str(venv_path),
+                "python_path": str(python),
+                "sentinel": "prior-catalog",
+            },
+        }
+        _write_catalog(prior_catalog)
+
+        with patch(
+            "muse.core.catalog.create_venv",
+            side_effect=self._create_replacement,
+        ), patch("muse.core.catalog.install_into_venv"), patch(
+            "muse.core.catalog.snapshot_download", return_value="/fake/weights",
+        ), patch(
+            "muse.core.catalog.check_system_packages", return_value=[],
+        ), patch(
+            "muse.core.catalog._write_catalog",
+            side_effect=OSError("catalog write failed"),
+        ):
+            with pytest.raises(OSError, match="catalog write failed"):
+                pull("soprano-80m")
+
+        assert (venv_path / "marker").read_text() == "prior"
+        assert _read_catalog() == prior_catalog

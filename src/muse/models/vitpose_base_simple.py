@@ -17,6 +17,7 @@ MANIFEST = {
     "model_id": "vitpose-base-simple",
     "modality": "image/cv",
     "hf_repo": "usyd-community/vitpose-base-simple",
+    "revision": "a93ac0c67e0b7e2c55287d21d4c460c8f3c54d45",
     "description": (
         "ViTPose Base Simple: ~85M, COCO 17-keypoint pose, "
         "Apache 2.0. v1 takes one full-image bbox per call; "

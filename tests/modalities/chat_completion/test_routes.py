@@ -154,8 +154,9 @@ def test_streaming_backend_error_emits_sse_error_event():
     error_events = [e for e in events if e[0] == "error"]
     assert len(error_events) == 1, f"expected one error event, got {events}"
     payload = json.loads(error_events[0][1])
-    assert payload["error"]["code"] == "internal"
-    assert "backend exploded" in payload["error"]["message"]
+    assert payload["error"]["code"] == "internal_error"
+    assert "backend exploded" not in payload["error"]["message"]
+    assert "see server logs" in payload["error"]["message"]
     assert payload["error"]["type"] == "server_error"
 
 
@@ -174,6 +175,37 @@ def test_empty_messages_returns_422(client):
     r = client.post(
         "/v1/chat/completions",
         json={"model": "fake-chat", "messages": []},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("field,value", [
+    ("max_tokens", 0),
+    ("max_tokens", 32_769),
+    ("temperature", 2.1),
+    ("top_p", 1.1),
+    ("top_logprobs", 21),
+])
+def test_generation_controls_are_bounded(client, field, value):
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            field: value,
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_extra_body_cannot_bypass_max_tokens(client):
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "extra_body": {"max_new_tokens": 1_000_000},
+        },
     )
     assert r.status_code == 422
 
@@ -472,3 +504,57 @@ def test_streaming_lock_released_after_chat_stream_raises():
     assert not model._inference_lock.locked(), (
         "_inference_lock was not released after chat_stream raised"
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_stops_waiting_for_inference_lock():
+    """A disconnected queued stream must not become a ghost generation."""
+    import asyncio
+    import threading
+    from muse.modalities.chat_completion.routes import ChatCompletionRequest
+
+    class _LockWaitingModel:
+        model_id = "lock-waiting-chat"
+
+        def __init__(self):
+            self._inference_lock = threading.Lock()
+            self.called = threading.Event()
+
+        def chat(self, messages, **kwargs):
+            raise NotImplementedError
+
+        def chat_stream(self, messages, **kwargs):
+            self.called.set()
+            yield ChatChunk(
+                id="never", model_id=self.model_id, created=0,
+                choice_index=0, delta={"content": "late"},
+                finish_reason=None,
+            )
+
+    model = _LockWaitingModel()
+    reg = ModalityRegistry()
+    reg.register("chat/completion", model)
+    endpoint = next(
+        route.endpoint
+        for route in build_router(reg).routes
+        if route.path == "/v1/chat/completions"
+    )
+
+    model._inference_lock.acquire()
+    try:
+        response = await endpoint(ChatCompletionRequest(
+            model=model.model_id,
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        ))
+        pending = asyncio.create_task(response.body_iterator.__anext__())
+        await asyncio.sleep(0.15)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await asyncio.sleep(0.15)
+
+        assert not model.called.is_set()
+        assert model._inference_lock.locked()
+    finally:
+        model._inference_lock.release()

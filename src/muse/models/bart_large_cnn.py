@@ -61,6 +61,7 @@ MANIFEST = {
     "model_id": "bart-large-cnn",
     "modality": "text/summarization",
     "hf_repo": "facebook/bart-large-cnn",
+    "revision": "37f520fa929c961707657b28798b30c003dd100b",
     "description": (
         "BART large CNN: news summarization, ~400MB, CPU-friendly, Apache 2.0"
     ),

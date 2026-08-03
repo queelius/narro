@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from typer.testing import CliRunner
 
 from muse.cli import app
@@ -147,7 +149,10 @@ class TestRunMcpServer:
 
         monkeypatch.setattr("muse.cli_impl.mcp_server.asyncio.run", fake_asyncio_run)
         monkeypatch.delenv("MUSE_ADMIN_TOKEN", raising=False)
-        with patch("muse.mcp.client.MuseClient.health", return_value={"status": "ok"}):
+        with (
+            patch("muse.mcp.client.MuseClient.health", return_value={"status": "ok"}),
+            patch("muse.cli_impl.mcp_server.config.get", return_value=None),
+        ):
             rc = run_mcp_server(
                 http=False, port=8088,
                 server_url="http://test",
@@ -187,6 +192,10 @@ class TestRunMcpServer:
         Starlette app from them and drive it with TestClient to confirm
         an unauthenticated request is rejected with 401.
         """
+        pytest.importorskip(
+            "mcp.server.streamable_http_manager",
+            reason="mcp SDK without streamable HTTP support",
+        )
         from muse.cli_impl.mcp_server import run_mcp_server
         from starlette.testclient import TestClient
 

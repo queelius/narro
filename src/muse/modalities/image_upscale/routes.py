@@ -22,13 +22,16 @@ from fastapi import APIRouter, File, Form, UploadFile
 from muse.core import config
 from muse.core.errors import ModelNotFoundError, error_response
 from muse.core.registry import ModalityRegistry
-from muse.modalities.image_generation.image_input import decode_image_file
+from muse.modalities._native_offload import run_native_offload
+from muse.modalities.image_generation.image_input import (
+    close_decoded_images,
+    decode_image_file,
+)
 from muse.modalities.image_upscale.codec import to_bytes, to_data_url
 
 logger = logging.getLogger(__name__)
 
 MODALITY = "image/upscale"
-
 
 
 def _max_input_side() -> int:
@@ -108,20 +111,15 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 f"model {effective_id!r} only supports scales: {supported}",
             )
 
-        try:
-            init_image = await decode_image_file(image)
-        except ValueError as e:
-            return error_response(
-                400, "invalid_parameter", f"image decode failed: {e}",
-            )
-
         max_side = _max_input_side()
-        ow, oh = init_image.size
-        if ow > max_side or oh > max_side:
+        try:
+            init_image = await decode_image_file(image, max_side=max_side)
+        except ValueError as e:
+            message = str(e)
+            if "exceeds max input side" in message:
+                message += " (set MUSE_UPSCALE_MAX_INPUT_SIDE to raise)"
             return error_response(
-                400, "invalid_parameter",
-                f"image too large: {ow}x{oh} exceeds max input side "
-                f"{max_side} (set MUSE_UPSCALE_MAX_INPUT_SIDE to raise)",
+                400, "invalid_parameter", f"image decode failed: {message}",
             )
 
         def _call_one(seed_offset: int):
@@ -138,17 +136,46 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 return backend.upscale(init_image, **kwargs)
 
         results = []
-        for i in range(n):
-            results.append(await asyncio.to_thread(_call_one, i))
+
+        def _cleanup_abandoned(current_result) -> None:
+            close_decoded_images(
+                [init_image]
+                + [getattr(result, "image", None) for result in results]
+                + [getattr(current_result, "image", None)]
+            )
+
+        try:
+            for i in range(n):
+                result = await run_native_offload(
+                    lambda i=i: _call_one(i),
+                    cleanup_abandoned=_cleanup_abandoned,
+                )
+                results.append(result)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            close_decoded_images(
+                [init_image]
+                + [getattr(result, "image", None) for result in results]
+            )
+            raise
 
         data = []
-        for r in results:
-            entry: dict = {"revised_prompt": prompt or None}
-            if response_format == "url":
-                entry["url"] = to_data_url(r.image, fmt="png")
-            else:
-                entry["b64_json"] = base64.b64encode(to_bytes(r.image, fmt="png")).decode()
-            data.append(entry)
+        try:
+            for r in results:
+                entry: dict = {"revised_prompt": prompt or None}
+                if response_format == "url":
+                    entry["url"] = to_data_url(r.image, fmt="png")
+                else:
+                    entry["b64_json"] = base64.b64encode(
+                        to_bytes(r.image, fmt="png"),
+                    ).decode()
+                data.append(entry)
+        finally:
+            close_decoded_images(
+                [init_image]
+                + [getattr(r, "image", None) for r in results]
+            )
 
         return {"created": int(time.time()), "data": data}
 

@@ -82,7 +82,7 @@ def test_protocol_capability_advertised_in_models(base_url, trellis_loaded):
     caps = entries[0].get("capabilities") or {}
     assert caps.get("supports_image_to_3d") is True
     assert caps.get("supports_text_to_3d") is False
-    assert caps.get("trust_remote_code") is True
+    assert "trust_remote_code" not in caps
 
 
 def test_protocol_glb_magic_bytes(base_url, trellis_loaded):

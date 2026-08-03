@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import io
+import inspect
 import logging
 import re
 from typing import Any
@@ -38,6 +39,8 @@ _ALLOWED_IMAGE_MIME = frozenset({
     "image/png", "image/jpeg", "image/jpg", "image/webp",
 })
 _HARD_DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10MB
+_HARD_DEFAULT_MAX_PIXELS = 4096 * 4096
+_HARD_DEFAULT_MAX_TOTAL_PIXELS = 32 * 1024 * 1024
 _HTTP_TIMEOUT = 30.0
 
 
@@ -55,7 +58,64 @@ def _default_max_bytes() -> int:
     return n
 
 
-async def decode_image_input(value: str, *, max_bytes: int | None = None) -> Any:
+def _default_max_pixels() -> int:
+    """Decoded-raster cap shared by every image ingress shape."""
+    n = config.get("limits.image_input_max_pixels")
+    if n is None or n <= 0:
+        return _HARD_DEFAULT_MAX_PIXELS
+    return int(n)
+
+
+def _default_max_total_pixels() -> int:
+    """Aggregate decoded-raster cap shared by batched image routes."""
+    n = config.get("limits.image_input_max_total_pixels")
+    if n is None or n <= 0:
+        return _HARD_DEFAULT_MAX_TOTAL_PIXELS
+    return int(n)
+
+
+def validate_total_image_pixels(
+    images: list[Any], *, max_total_pixels: int | None = None,
+) -> int:
+    """Return aggregate pixels, rejecting batches above the configured cap."""
+    cap = (
+        max_total_pixels
+        if max_total_pixels is not None
+        else _default_max_total_pixels()
+    )
+    if cap <= 0:
+        raise ValueError("max_total_pixels must be positive")
+    total = sum(int(image.size[0]) * int(image.size[1]) for image in images)
+    if total > cap:
+        raise ValueError(
+            f"image batch too large: {total} decoded pixels exceeds "
+            f"aggregate limit {cap}"
+        )
+    return total
+
+
+def close_decoded_images(images: list[Any]) -> None:
+    """Best-effort deterministic cleanup for request-owned PIL images."""
+    seen: set[int] = set()
+    for image in images:
+        identity = id(image)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        close = getattr(image, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                logger.debug("failed to close decoded request image", exc_info=True)
+
+
+async def decode_image_input(
+    value: str,
+    *,
+    max_bytes: int | None = None,
+    max_pixels: int | None = None,
+) -> Any:
     """Parse a data URL or HTTP(S) URL into a PIL.Image.
 
     Async because the http path uses `httpx.AsyncClient` and must not
@@ -67,10 +127,13 @@ async def decode_image_input(value: str, *, max_bytes: int | None = None) -> Any
     per request.
     """
     cap = max_bytes if max_bytes is not None else _default_max_bytes()
+    pixel_cap = max_pixels if max_pixels is not None else _default_max_pixels()
     if value.startswith("data:"):
-        return _decode_data_url(value, max_bytes=cap)
+        return _decode_data_url(value, max_bytes=cap, max_pixels=pixel_cap)
     if value.startswith(("http://", "https://")):
-        return await _fetch_http_url(value, max_bytes=cap)
+        return await _fetch_http_url(
+            value, max_bytes=cap, max_pixels=pixel_cap,
+        )
     raise ValueError(
         f"image must be a data: URL or http(s):// URL; got {value[:30]!r}..."
     )
@@ -81,6 +144,7 @@ async def decode_image_file(
     *,
     max_bytes: int | None = None,
     max_side: int | None = None,
+    max_pixels: int | None = None,
 ) -> Any:
     """Decode a multipart UploadFile into a PIL.Image.
 
@@ -105,17 +169,33 @@ async def decode_image_file(
     full raster.
     """
     cap = max_bytes if max_bytes is not None else _default_max_bytes()
-    raw = await file.read(cap + 1)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    try:
+        raw = await file.read(cap + 1)
+    finally:
+        # Multipart UploadFile objects may be backed by a spooled temporary
+        # file.  The decoder owns the upload after its single bounded read, so
+        # close it on success, rejection, and cancellation.  Test doubles with
+        # no close method remain supported.
+        close = getattr(file, "close", None)
+        if callable(close):
+            try:
+                outcome = close()
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:  # noqa: BLE001
+                logger.debug("failed to close image upload", exc_info=True)
     if not raw:
         raise ValueError("empty image file")
     if len(raw) > cap:
         raise ValueError(
             f"image bytes exceeds max ({len(raw)} > {cap})"
         )
-    return _bytes_to_pil(raw, max_side=max_side)
+    return _bytes_to_pil(raw, max_side=max_side, max_pixels=max_pixels)
 
 
-def _decode_data_url(value: str, *, max_bytes: int):
+def _decode_data_url(value: str, *, max_bytes: int, max_pixels: int):
     m = _DATA_URL_RE.match(value)
     if not m:
         raise ValueError("malformed data URL")
@@ -141,17 +221,17 @@ def _decode_data_url(value: str, *, max_bytes: int):
         raise ValueError(
             f"image bytes exceeds max ({len(raw)} > {max_bytes})"
         )
-    return _bytes_to_pil(raw)
+    return _bytes_to_pil(raw, max_pixels=max_pixels)
 
 
-async def _fetch_http_url(value: str, *, max_bytes: int):
+async def _fetch_http_url(value: str, *, max_bytes: int, max_pixels: int):
     try:
         raw = await afetch_url_bytes(value, max_bytes=max_bytes, timeout=_HTTP_TIMEOUT)
     except ValueError:
         raise
     except Exception as e:  # noqa: BLE001
         raise ValueError(f"fetch failed: {e}") from e
-    return _bytes_to_pil(raw)
+    return _bytes_to_pil(raw, max_pixels=max_pixels)
 
 
 def _validate_public_host(url: str) -> None:
@@ -166,8 +246,14 @@ def _validate_public_host(url: str) -> None:
     _validate_public_host_impl(url)
 
 
-def _bytes_to_pil(raw: bytes, *, max_side: int | None = None):
+def _bytes_to_pil(
+    raw: bytes,
+    *,
+    max_side: int | None = None,
+    max_pixels: int | None = None,
+):
     from PIL import Image, UnidentifiedImageError
+    img = None
     try:
         img = Image.open(io.BytesIO(raw))
         width, height = img.size
@@ -178,11 +264,26 @@ def _bytes_to_pil(raw: bytes, *, max_side: int | None = None):
                 f"image too large: {width}x{height} exceeds max input side "
                 f"{max_side}"
             )
+        pixel_cap = max_pixels if max_pixels is not None else _default_max_pixels()
+        if pixel_cap <= 0:
+            raise ValueError("max_pixels must be positive")
+        pixels = width * height
+        if pixels > pixel_cap:
+            raise ValueError(
+                f"image too large: {width}x{height} ({pixels} pixels) "
+                f"exceeds max input pixels {pixel_cap}"
+            )
         img.load()  # force decode now so errors surface here, not later
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
         # DecompressionBombError is a plain Exception (not OSError): a tiny
         # PNG declaring huge dimensions would otherwise escape as a 500. PIL
         # still blocks the memory DoS; we only reclassify it as a client
         # error (ValueError -> 400).
+        if img is not None:
+            img.close()
         raise ValueError(f"image decode failed: {e}") from e
+    except BaseException:
+        if img is not None:
+            img.close()
+        raise
     return img

@@ -25,11 +25,15 @@ Security hardening (v0.45.6):
       * Unset (default): all path inputs raise ValueError.
       * Set: the path is realpath()'d to defeat ../ traversal and
         symlink escapes, then checked against the realpath()'d prefixes.
+  - Base64 and path inputs use the same byte cap as URL inputs; base64 is
+    rejected by encoded length before decoding and files are read at most
+    ``cap + 1`` bytes.
 """
 from __future__ import annotations
 
 import base64
 import os
+import stat
 from typing import Any
 
 from muse.core import config
@@ -57,6 +61,46 @@ def _enforce_size_cap(data: bytes, *, field_name: str, slot: str) -> bytes:
     return data
 
 
+def _decode_base64_bounded(
+    encoded: str,
+    *,
+    field_name: str,
+    slot: str,
+) -> bytes:
+    """Strictly decode base64 without allocating beyond the shared cap."""
+    cap = _default_max_bytes()
+    max_encoded = (cap * 4) // 3 + 4
+    if len(encoded) > max_encoded:
+        raise ValueError(
+            f"{field_name}_{slot} exceeds the max encoded length "
+            f"({len(encoded)} > {max_encoded})"
+        )
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(
+            f"malformed base64 in {field_name}_{slot}: {e}"
+        ) from e
+    return _enforce_size_cap(decoded, field_name=field_name, slot=slot)
+
+
+def _normalize_input_slot(
+    value: str | None,
+    *,
+    field_name: str,
+    slot: str,
+) -> str | None:
+    """Validate one JSON-facing binary slot and normalize ``""`` away."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{field_name}_{slot} must be a string, got "
+            f"{type(value).__name__}"
+        )
+    return value or None
+
+
 def resolve_binary_input(
     *,
     b64: str | None = None,
@@ -79,9 +123,15 @@ def resolve_binary_input(
     # slot blank sends "" (falsy) rather than omitting it; without this an
     # empty b64="" would pass the truthiness guard yet be dispatched by the
     # `is not None` check, silently decoding b"" and dropping a real URL.
-    b64 = b64 or None
-    url = url or None
-    path = path or None
+    b64 = _normalize_input_slot(
+        b64, field_name=field_name, slot="b64",
+    )
+    url = _normalize_input_slot(
+        url, field_name=field_name, slot="url",
+    )
+    path = _normalize_input_slot(
+        path, field_name=field_name, slot="path",
+    )
     provided = [k for k, v in (("b64", b64), ("url", url), ("path", path)) if v]
     if len(provided) == 0:
         raise ValueError(
@@ -101,18 +151,17 @@ def resolve_binary_input(
             if comma == -1:
                 raise ValueError(f"malformed data URL in {field_name}_b64")
             b64 = b64[comma + 1:]
-        try:
-            decoded = base64.b64decode(b64)
-        except Exception as e:  # noqa: BLE001
-            raise ValueError(f"malformed base64 in {field_name}_b64: {e}") from e
-        return _enforce_size_cap(decoded, field_name=field_name, slot="b64")
+        return _decode_base64_bounded(
+            b64, field_name=field_name, slot="b64",
+        )
     if url is not None:
         if url.startswith("data:"):
             comma = url.find(",")
             if comma == -1:
                 raise ValueError(f"malformed data URL in {field_name}_url")
-            decoded = base64.b64decode(url[comma + 1:])
-            return _enforce_size_cap(decoded, field_name=field_name, slot="url")
+            return _decode_base64_bounded(
+                url[comma + 1:], field_name=field_name, slot="url",
+            )
         if url.startswith(("http://", "https://")):
             # Route through the hardened primitive: SSRF guard, per-hop
             # redirect re-validation, and streaming size cap.
@@ -162,10 +211,71 @@ def _resolve_path(path: str, *, field_name: str) -> bytes:
             f"{field_name}_path {path!r} is not within an allowed prefix; "
             f"set MUSE_MCP_ALLOWED_PATH_PREFIXES to include its directory"
         )
-    if not os.path.exists(real_path):
-        raise ValueError(f"{field_name}_path not found: {path}")
-    with open(real_path, "rb") as f:
-        return f.read()
+    cap = _default_max_bytes()
+    fd = -1
+    try:
+        fd = _open_absolute_regular_nofollow(real_path)
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            data = f.read(cap + 1)
+    except FileNotFoundError as e:
+        raise ValueError(f"{field_name}_path not found: {path}") from e
+    except OSError as e:
+        raise ValueError(f"could not read {field_name}_path {path!r}: {e}") from e
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > cap:
+        raise ValueError(
+            f"{field_name}_path exceeds the max of {cap} bytes "
+            f"(set MUSE_IMAGE_INPUT_MAX_BYTES to raise it)"
+        )
+    return data
+
+
+def _open_absolute_regular_nofollow(path: str) -> int:
+    """Open an absolute path without following a symlink in any component.
+
+    ``realpath`` plus a later builtin ``open`` has a race: an allowed parent
+    can be replaced by a symlink between the check and the read.  Walk from a
+    descriptor for ``/`` with ``openat``-style calls instead.  Every directory
+    and the final file is opened no-follow, and the returned descriptor is
+    required to name a regular file.
+    """
+    if not os.path.isabs(path):
+        raise OSError("resolved path is not absolute")
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    parts = [part for part in path.split(os.sep) if part]
+    if not parts:
+        raise OSError("path does not name a regular file")
+
+    current_fd = os.open(os.sep, os.O_RDONLY | directory | cloexec)
+    try:
+        for component in parts[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | directory | nofollow | cloexec,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        result_fd = os.open(
+            parts[-1],
+            os.O_RDONLY | nofollow | cloexec,
+            dir_fd=current_fd,
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(result_fd).st_mode):
+                raise OSError("path does not name a regular file")
+        except BaseException:
+            os.close(result_fd)
+            raise
+        return result_fd
+    finally:
+        os.close(current_fd)
 
 
 def binary_input_schema(field_name: str = "image") -> dict[str, Any]:

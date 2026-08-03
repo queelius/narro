@@ -190,7 +190,15 @@ class MCPServer:
         import contextlib
         import secrets as _secrets
 
-        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        try:
+            from mcp.server.streamable_http_manager import (
+                StreamableHTTPSessionManager,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "MCP HTTP transport requires mcp>=1.8.0,<2; reinstall "
+                "the server extra with: pip install 'museq[server]'"
+            ) from exc
         from starlette.applications import Starlette
         from starlette.responses import Response
         from starlette.routing import Mount

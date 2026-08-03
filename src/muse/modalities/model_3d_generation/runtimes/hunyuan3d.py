@@ -21,6 +21,7 @@ import logging
 import threading
 from typing import Any
 
+from muse.core.artifacts import ArtifactBundleError, local_artifact_directory
 from muse.core.runtime_helpers import (
     LoadTimer, dtype_for_name, select_device, set_inference_mode,
 )
@@ -38,6 +39,27 @@ _HUNYUAN3D_PIPELINE: Any = None      # Hunyuan3DDiTFlowMatchingPipeline
 _HUNYUAN3D_T2I_PIPELINE: Any = None  # HunyuanDiTPipeline (optional, text-to-3D only)
 trimesh: Any = None
 _LAST_IMPORT_ERROR: Exception | None = None
+
+
+def _bundle_member(local_dir: str, subdir: str, *, label: str) -> str:
+    """Resolve one fixed, real child directory inside a local bundle."""
+    try:
+        return local_artifact_directory(local_dir, subdir, label=label)
+    except ArtifactBundleError as exc:
+        raise RuntimeError(f"Hunyuan3D {exc}; re-pull the model") from exc
+
+
+def _close_intermediate_image(image: Any) -> None:
+    """Best-effort release of a text-to-3D stage-one image."""
+    close = getattr(image, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException:  # noqa: BLE001
+        # Cleanup failure must not replace a shape-pipeline failure or a
+        # cancellation already propagating through the synchronous runtime.
+        logger.debug("failed to close Hunyuan text-to-3D image", exc_info=True)
 
 
 def _ensure_deps(load_t2i: bool = False) -> None:
@@ -92,20 +114,18 @@ class Hunyuan3DRuntime:
       - ``model_id`` (required): catalog id; echoed in result envelope.
       - ``hf_repo``, ``local_dir``: standard weight source.
       - ``device``, ``dtype``: standard device + dtype selection.
-      - ``trust_remote_code``: accepted but not forwarded to from_pretrained
-        (Hunyuan3D-2 uses a pip-installed SDK, not transformers
-        trust_remote_code). The flag is in capabilities for documentation;
-        it means "install the hy3dgen package from GitHub."
+      - ``trust_remote_code``: deprecated compatibility kwarg, accepted but
+        not forwarded (Hunyuan3D-2 uses a pip-installed SDK, not Transformers
+        dynamic modules).
       - ``num_inference_steps`` (default 50): denoising steps for the
         shape pipeline. The SDK default is 50; lower values are faster.
       - ``guidance_scale`` (default 5.0): classifier-free guidance for
         shape generation. SDK default.
-      - ``t2i_model_id`` (default 'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled'):
-        HF repo for the text-to-image model used in text_to_3d.
-        Lazily loaded on first text_to_3d call. Note: this is a separate
-        HF repo downloaded on first text_to_3d use; pre-cache via
-        `huggingface-cli download Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled`
-        for air-gapped hosts.
+      - ``shape_model_subdir``, ``t2i_model_subdir``: fixed members of the
+        local two-checkpoint bundle created by ``muse pull``. The text-to-image
+        pipeline is loaded lazily from that local bundle on first use.
+      - ``t2i_model_id``: compatibility source used only when constructing the
+        runtime directly without a Muse-managed ``local_dir``.
     """
 
     model_id: str
@@ -120,11 +140,13 @@ class Hunyuan3DRuntime:
         local_dir: str | None = None,
         device: str = "auto",
         dtype: str = "fp16",
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         seed: int | None = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
         t2i_model_id: str = "Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled",
+        shape_model_subdir: str | None = None,
+        t2i_model_subdir: str | None = None,
         **_: Any,
     ) -> None:
         _ensure_deps()
@@ -155,25 +177,43 @@ class Hunyuan3DRuntime:
         self._default_seed = seed
         self._default_num_inference_steps = int(num_inference_steps)
         self._default_guidance_scale = float(guidance_scale)
-        self._t2i_model_id = t2i_model_id
+        if local_dir is None:
+            shape_src = hf_repo
+            self._t2i_model_source: str | None = t2i_model_id
+        else:
+            shape_src = (
+                _bundle_member(local_dir, shape_model_subdir, label="shape-model")
+                if shape_model_subdir is not None
+                else local_dir
+            )
+            self._t2i_model_source = (
+                _bundle_member(local_dir, t2i_model_subdir, label="text-to-image")
+                if t2i_model_subdir is not None
+                else None
+            )
         # Lazily loaded on first text_to_3d call; guarded by _t2i_lock.
         self._t2i_pipeline: Any = None
         self._t2i_lock = threading.Lock()
 
-        src = local_dir or hf_repo
-        with LoadTimer(f"loading Hunyuan3D-2 shape pipeline from {src}", logger):
+        with LoadTimer(
+            f"loading Hunyuan3D-2 shape pipeline from {shape_src}", logger,
+        ):
             # from_pretrained signature (verified 2026-05-06):
             #   from_pretrained(model_path, device, dtype, ...)
             # device and dtype are forwarded directly.
             self._pipeline = _HUNYUAN3D_PIPELINE.from_pretrained(
-                src,
+                shape_src,
                 device=self._device,
                 dtype=self._dtype,
             )
             # Belt-and-suspenders: chain .to() in case from_pretrained
             # did not apply device/dtype (SDK behavior may vary across versions).
             if hasattr(self._pipeline, "to"):
-                self._pipeline = self._pipeline.to(self._device, self._dtype)
+                moved = self._pipeline.to(self._device, self._dtype)
+                # Some in-place SDK implementations return None, while
+                # fluent implementations return the moved pipeline.
+                if moved is not None:
+                    self._pipeline = moved
         set_inference_mode(self._pipeline)
 
     def _load_t2i_pipeline(self) -> Any:
@@ -182,6 +222,11 @@ class Hunyuan3DRuntime:
         Uses _HUNYUAN3D_T2I_PIPELINE sentinel so tests can inject a mock
         without triggering a real download.
         """
+        if self._t2i_model_source is None:
+            raise RuntimeError(
+                "text_to_3d requires the pinned text-to-image checkpoint in "
+                f"the Muse-managed bundle; re-pull {self.model_id!r}"
+            )
         _ensure_deps(load_t2i=True)
         if _HUNYUAN3D_T2I_PIPELINE is None:
             raise RuntimeError(
@@ -193,17 +238,14 @@ class Hunyuan3DRuntime:
         with LoadTimer("loading Hunyuan3D-2 text-to-image pipeline", logger):
             try:
                 return _HUNYUAN3D_T2I_PIPELINE(
-                    self._t2i_model_id,
+                    self._t2i_model_source,
                     device=self._device,
                 )
             except (OSError, EnvironmentError) as e:
                 raise RuntimeError(
-                    f"text_to_3d requires the HunyuanDiT-v1.1-Diffusers-Distilled "
-                    f"weights from {self._t2i_model_id!r}, which were not found in "
-                    f"the local HuggingFace cache and could not be downloaded. "
-                    f"Pre-cache the weights via "
-                    f"`huggingface-cli download {self._t2i_model_id}` before using "
-                    f"text_to_3d, or ensure network access from this host. "
+                    "text_to_3d could not load its pinned local "
+                    "HunyuanDiT-v1.1 checkpoint from "
+                    f"{self._t2i_model_source!r}; re-pull {self.model_id!r}. "
                     f"Original error: {e}"
                 ) from e
 
@@ -307,12 +349,16 @@ class Hunyuan3DRuntime:
             # Verified call signature: t2i_pipeline(prompt) -> PIL.Image.Image
             image = self._t2i_pipeline(prompt)
 
-            # Stage 2: image -> mesh via Hunyuan3DDiTFlowMatchingPipeline.
-            output = self._pipeline(
-                image=image,
-                num_inference_steps=steps,
-                guidance_scale=gs,
-                generator=generator,
-            )
+            try:
+                # Stage 2: image -> mesh via
+                # Hunyuan3DDiTFlowMatchingPipeline.
+                output = self._pipeline(
+                    image=image,
+                    num_inference_steps=steps,
+                    guidance_scale=gs,
+                    generator=generator,
+                )
+            finally:
+                _close_intermediate_image(image)
             results.append(mesh_to_glb_result(output[0][0], self.model_id))
         return results

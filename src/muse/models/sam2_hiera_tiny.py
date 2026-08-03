@@ -65,6 +65,7 @@ MANIFEST = {
     "model_id": "sam2-hiera-tiny",
     "modality": "image/segmentation",
     "hf_repo": "facebook/sam2-hiera-tiny",
+    "revision": "7c218beaf0bb87874785f32b582f640134fc1c09",
     "description": (
         "SAM-2 Hiera tiny: ~40MB promptable segmentation, Apache 2.0"
     ),

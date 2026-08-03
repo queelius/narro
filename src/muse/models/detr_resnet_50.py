@@ -15,6 +15,7 @@ MANIFEST = {
     "model_id": "detr-resnet-50",
     "modality": "image/cv",
     "hf_repo": "facebook/detr-resnet-50",
+    "revision": "1d5f47bd3bdd2c4bbfa585418ffe6da5028b4c0b",
     "description": (
         "DETR ResNet-50: ~41M, COCO 80-class object detection, "
         "Apache 2.0. CPU-friendly default for the image/cv "

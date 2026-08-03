@@ -1,11 +1,17 @@
 """Smoke tests for run_worker (single-worker mode)."""
+import asyncio
 import os
 import signal
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from muse.cli_impl.worker import run_worker
+
+
+@pytest.fixture(autouse=True)
+def _isolate_catalog(tmp_path, monkeypatch):
+    monkeypatch.setenv("MUSE_CATALOG_DIR", str(tmp_path / "catalog"))
 
 
 def test_parent_watchdog_terminates_worker_when_supervisor_disappears():
@@ -28,6 +34,31 @@ def test_worker_starts_parent_watchdog_from_supervisor_env(
         run_worker(host="127.0.0.1", port=9999, models=[], device="cpu")
 
     mock_watchdog.assert_called_once_with(12345)
+
+
+@patch("muse.cli_impl.worker.run_uvicorn")
+@patch("muse.cli_impl.worker.discover_modalities", return_value={})
+def test_worker_adds_spawn_nonce_to_response_headers(
+    _mock_discover, mock_run_uvicorn, monkeypatch,
+):
+    from starlette.responses import Response
+
+    monkeypatch.delenv("MUSE_SUPERVISOR_PID", raising=False)
+    monkeypatch.setenv("MUSE_WORKER_NONCE", "spawn-nonce")
+
+    run_worker(host="127.0.0.1", port=9999, models=[], device="cpu")
+
+    app = mock_run_uvicorn.call_args.args[0]
+    dispatch = next(
+        middleware.kwargs["dispatch"]
+        for middleware in app.user_middleware
+        if "dispatch" in middleware.kwargs
+    )
+    call_next = AsyncMock(return_value=Response())
+    response = asyncio.run(dispatch(MagicMock(), call_next))
+
+    call_next.assert_awaited_once()
+    assert response.headers["X-Muse-Worker-Nonce"] == "spawn-nonce"
 
 
 def _collect_route_paths(app) -> set:
@@ -67,6 +98,42 @@ def test_worker_loads_requested_models_and_runs_uvicorn(mock_pulled, mock_load, 
     kwargs = mock_run_uvicorn.call_args.kwargs
     assert kwargs["host"] == "127.0.0.1"
     assert kwargs["port"] == 9999
+
+
+@patch("muse.cli_impl.worker.load_backend")
+@patch("muse.cli_impl.worker.is_pulled", return_value=True)
+def test_worker_holds_resource_lease_through_uvicorn(mock_pulled, mock_load):
+    from contextlib import contextmanager
+
+    active: set[str] = set()
+    events: list[tuple[str, str]] = []
+
+    @contextmanager
+    def fake_lease(model_id, *, wait):
+        assert wait is True
+        active.add(model_id)
+        events.append(("enter", model_id))
+        try:
+            yield
+        finally:
+            events.append(("exit", model_id))
+            active.remove(model_id)
+
+    def fake_uvicorn(*_args, **_kwargs):
+        assert active == {"soprano-80m"}
+
+    with patch("muse.cli_impl.worker._model_resource_lease", new=fake_lease), \
+         patch("muse.cli_impl.worker.run_uvicorn", side_effect=fake_uvicorn):
+        rc = run_worker(
+            host="127.0.0.1",
+            port=9999,
+            models=["soprano-80m"],
+            device="cpu",
+        )
+
+    assert rc == 0
+    assert events == [("enter", "soprano-80m"), ("exit", "soprano-80m")]
+    assert not active
 
 
 @patch("muse.cli_impl.worker.run_uvicorn")

@@ -1,17 +1,21 @@
 """HF plugin tests for 3d/generation."""
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 from muse.core.discovery import REQUIRED_HF_PLUGIN_KEYS
 from muse.core.resolvers import ResolvedModel
 from muse.modalities.model_3d_generation.hf import HF_PLUGIN
 
 
-def _fake_info(siblings=None, tags=None, repo_id="org/repo"):
+def _fake_info(siblings=None, tags=None, repo_id="org/repo", sha="a" * 40):
     info = MagicMock()
     info.siblings = [MagicMock(rfilename=f) for f in (siblings or [])]
     info.tags = tags or []
     info.card_data = MagicMock(license=None)
     info.id = repo_id
+    info.sha = sha
     return info
 
 
@@ -139,6 +143,105 @@ def test_resolve_supports_text_to_3d_for_hunyuan3d():
     info = _fake_info(tags=["image-to-3d"], repo_id="tencent/Hunyuan3D-2")
     result = HF_PLUGIN["resolve"]("tencent/Hunyuan3D-2", None, info)
     assert result.manifest["capabilities"]["supports_text_to_3d"] is True
+
+
+def test_hunyuan_manifest_pins_both_bundle_members():
+    info = _fake_info(repo_id="tencent/Hunyuan3D-2", sha="b" * 40)
+    result = HF_PLUGIN["resolve"]("tencent/Hunyuan3D-2", None, info)
+
+    assert result.manifest["revision"] == "b" * 40
+    caps = result.manifest["capabilities"]
+    assert caps["shape_model_subdir"] == "shape"
+    assert caps["t2i_model_subdir"] == "text_to_image"
+    assert caps["t2i_revision"] == "527cf2ecce7c04021975938f8b0e44e35d2b1ed9"
+    assert result.artifact_provenance == (
+        {
+            "repo_id": "tencent/Hunyuan3D-2",
+            "revision": "b" * 40,
+            "subdir": "shape",
+        },
+        {
+            "repo_id": "Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled",
+            "revision": "527cf2ecce7c04021975938f8b0e44e35d2b1ed9",
+            "subdir": "text_to_image",
+        },
+    )
+
+
+def test_hunyuan_download_builds_two_pinned_snapshot_bundle(monkeypatch, tmp_path):
+    from muse.modalities.model_3d_generation import hf as module
+
+    calls = []
+
+    def fake_snapshot_download(**kwargs):
+        calls.append(kwargs)
+        local_dir = Path(kwargs["local_dir"])
+        local_dir.mkdir(parents=True)
+        (local_dir / "weights.safetensors").write_bytes(b"weights")
+        return str(local_dir)
+
+    monkeypatch.setattr(module, "snapshot_download", fake_snapshot_download)
+    info = _fake_info(repo_id="tencent/Hunyuan3D-2", sha="c" * 40)
+    result = module.HF_PLUGIN["resolve"]("tencent/Hunyuan3D-2", None, info)
+
+    bundle = result.download(tmp_path)
+
+    assert bundle.parent == tmp_path
+    assert (bundle / "shape" / "weights.safetensors").is_file()
+    assert (bundle / "text_to_image" / "weights.safetensors").is_file()
+    assert [(call["repo_id"], call["revision"]) for call in calls] == [
+        ("tencent/Hunyuan3D-2", "c" * 40),
+        (
+            "Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled",
+            "527cf2ecce7c04021975938f8b0e44e35d2b1ed9",
+        ),
+    ]
+    assert not list(tmp_path.glob(".*.staging-*"))
+
+
+def test_hunyuan_download_failure_removes_private_staging(monkeypatch, tmp_path):
+    from muse.modalities.model_3d_generation import hf as module
+
+    def fail_snapshot_download(**kwargs):
+        local_dir = Path(kwargs["local_dir"])
+        local_dir.mkdir(parents=True)
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(module, "snapshot_download", fail_snapshot_download)
+    result = module.HF_PLUGIN["resolve"](
+        "tencent/Hunyuan3D-2",
+        None,
+        _fake_info(repo_id="tencent/Hunyuan3D-2", sha="d" * 40),
+    )
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        result.download(tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_refuses_missing_immutable_revision(tmp_path):
+    result = HF_PLUGIN["resolve"](
+        "stabilityai/TripoSR",
+        None,
+        _fake_info(repo_id="stabilityai/TripoSR", sha=None),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing mutable"):
+        result.download(tmp_path)
+
+
+def test_installed_sdk_families_do_not_claim_transformers_remote_code():
+    for repo_id in (
+        "JeffreyXiang/TRELLIS-image-large",
+        "tencent/Hunyuan3D-2",
+    ):
+        result = HF_PLUGIN["resolve"](
+            repo_id,
+            None,
+            _fake_info(tags=["image-to-3d"], repo_id=repo_id),
+        )
+        assert "trust_remote_code" not in result.manifest["capabilities"]
 
 
 def test_resolve_supports_text_to_3d_for_shap_e():

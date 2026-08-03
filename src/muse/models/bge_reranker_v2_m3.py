@@ -47,6 +47,7 @@ MANIFEST = {
     "model_id": "bge-reranker-v2-m3",
     "modality": "text/rerank",
     "hf_repo": "BAAI/bge-reranker-v2-m3",
+    "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
     "description": (
         "BAAI bge-reranker-v2-m3: multilingual cross-encoder reranker, "
         "8192-token context, ~568MB"

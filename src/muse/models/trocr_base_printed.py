@@ -16,6 +16,7 @@ MANIFEST = {
     "model_id": "trocr-base-printed",
     "modality": "image/ocr",
     "hf_repo": "microsoft/trocr-base-printed",
+    "revision": "93450be3f1ed40a930690d951ef3932687cc1892",
     "description": (
         "TrOCR base printed: 334M, English printed text, MIT. "
         "CPU-friendly default OCR for line-level extraction."

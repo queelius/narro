@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from muse.observability.log_tickets import LogTicketStore
 
 
@@ -74,6 +76,35 @@ def test_two_mints_are_distinct():
     t1, _ = store.mint()
     t2, _ = store.mint()
     assert t1 != t2
+
+
+def test_mint_capacity_evicts_oldest_ticket():
+    store = LogTicketStore(60.0, max_tickets=2)
+    first, _ = store.mint()
+    second, _ = store.mint()
+    third, _ = store.mint()
+
+    assert len(store._tickets) == 2
+    assert store.validate(first) is False
+    assert store.validate(second) is True
+    assert store.validate(third) is True
+
+
+def test_nonpositive_ticket_capacity_rejected():
+    with pytest.raises(ValueError, match="positive"):
+        LogTicketStore(60.0, max_tickets=0)
+
+
+@pytest.mark.parametrize("ttl", [-1, float("nan"), float("inf"), True, "60"])
+def test_invalid_ticket_ttl_rejected(ttl):
+    with pytest.raises(ValueError, match="finite non-negative"):
+        LogTicketStore(ttl)
+
+
+@pytest.mark.parametrize("capacity", [-1, True, 1.5, "2"])
+def test_invalid_ticket_capacity_type_rejected(capacity):
+    with pytest.raises(ValueError, match="positive integer"):
+        LogTicketStore(60.0, max_tickets=capacity)
 
 
 def test_concurrent_mint_and_validate_does_not_raise():

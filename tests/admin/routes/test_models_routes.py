@@ -136,6 +136,32 @@ class TestEnableRoute:
         assert captured["kwargs"]["op_name"] == "enable"
         assert captured["kwargs"]["model_id"] == "kokoro-82m"
 
+    def test_job_capacity_returns_structured_503(
+        self, client, headers, tmp_catalog, monkeypatch,
+    ):
+        _seed_catalog({
+            "kokoro-82m": {
+                "pulled_at": "...", "hf_repo": "k", "local_dir": "/k",
+                "venv_path": "/v", "python_path": "/v/bin/python",
+                "enabled": False,
+            },
+        })
+        from muse.admin.operations import OperationError
+
+        def reject(*_args, **_kwargs):
+            raise OperationError(
+                "admin_job_capacity", "admin job capacity reached",
+                status=503, retryable=True,
+            )
+
+        monkeypatch.setattr("muse.admin.routes.models.launch_async", reject)
+        response = client.post(
+            "/v1/admin/models/kokoro-82m/enable", headers=headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "admin_job_capacity"
+
 
 class TestDisableRoute:
     def test_unknown_model_returns_404(self, client, headers, tmp_catalog):
@@ -272,10 +298,16 @@ class TestDeleteRoute:
         assert r.json()["error"]["code"] == "model_loaded"
 
     def test_unloaded_removes_with_purge(self, client, headers, tmp_catalog):
+        venv_path = tmp_catalog / "venvs" / "kokoro-82m"
+        weights_path = tmp_catalog / "weights" / "kokoro-82m"
+        venv_path.mkdir(parents=True)
+        weights_path.mkdir(parents=True)
         _seed_catalog({
             "kokoro-82m": {
-                "pulled_at": "...", "hf_repo": "k", "local_dir": "/k",
-                "venv_path": "/v", "python_path": "/v/bin/python",
+                "pulled_at": "...", "hf_repo": "k",
+                "local_dir": str(weights_path),
+                "venv_path": str(venv_path),
+                "python_path": str(venv_path / "bin" / "python"),
                 "enabled": True,
             },
         })
@@ -288,6 +320,8 @@ class TestDeleteRoute:
         body = r.json()
         assert body["removed"] is True
         assert body["purged"] is True
+        assert not venv_path.exists()
+        assert not weights_path.exists()
 
 
 class TestStatusRoute:
@@ -344,7 +378,14 @@ class TestStatusRoute:
 
 
 class TestAuthRequired:
-    def test_no_token_returns_503(self, client, monkeypatch):
+    def test_no_token_returns_503(self, client, monkeypatch, tmp_path):
         monkeypatch.delenv(ADMIN_TOKEN_ENV, raising=False)
-        r = client.get("/v1/admin/models/kokoro-82m/status")
-        assert r.status_code == 503
+        monkeypatch.setenv("MUSE_CONFIG", str(tmp_path / "absent-config.yaml"))
+        from muse.core import config
+
+        config.reset_config()
+        try:
+            r = client.get("/v1/admin/models/kokoro-82m/status")
+            assert r.status_code == 503
+        finally:
+            config.reset_config()

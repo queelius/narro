@@ -1,11 +1,11 @@
 """Tests for `muse models probe` via run_probe().
 
 run_probe() is the parent-side dispatcher: it validates the model, finds
-its venv, spawns the in-venv probe worker via subprocess.run, parses the
+its venv, spawns the in-venv probe worker via the owned command runner, parses the
 JSON record on the last line of stdout, and persists it under
 catalog['<id>']['measurements']['<device>'].
 
-These tests stub subprocess.run with crafted stdout so we don't actually
+These tests stub the owned runner with crafted stdout so we don't actually
 spawn anything. The probe-worker's own behavior is covered separately
 in test_probe_worker.py.
 """
@@ -113,7 +113,7 @@ def test_run_probe_subprocess_failure_returns_error(tmp_catalog, capsys):
     fake_completed.returncode = 7
     fake_completed.stdout = ""
     fake_completed.stderr = "boom"
-    with patch("muse.cli_impl.probe.subprocess.run", return_value=fake_completed):
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed):
         rc = run_probe(
             model_id="kokoro-82m",
             no_inference=False,
@@ -124,6 +124,27 @@ def test_run_probe_subprocess_failure_returns_error(tmp_catalog, capsys):
     err = capsys.readouterr().err
     assert "exited 7" in err
     assert "boom" in err
+
+
+def test_run_probe_cleanup_failure_returns_clean_error(tmp_catalog, capsys):
+    from muse.core.venv import _OwnedProcessCleanupError
+
+    _seed_pulled_entry(tmp_catalog)
+    with patch(
+        "muse.cli_impl.probe.run_owned_command",
+        side_effect=_OwnedProcessCleanupError("process group remained alive"),
+    ):
+        rc = run_probe(
+            model_id="kokoro-82m",
+            no_inference=False,
+            device=None,
+            as_json=False,
+        )
+
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert "cleanup failed" in err
+    assert "process group remained alive" in err
 
 
 def test_run_probe_persists_measurement_to_catalog(tmp_catalog):
@@ -143,7 +164,7 @@ def test_run_probe_persists_measurement_to_catalog(tmp_catalog):
     fake_completed.returncode = 0
     fake_completed.stdout = "baseline log\n" + json.dumps(record) + "\n"
     fake_completed.stderr = ""
-    with patch("muse.cli_impl.probe.subprocess.run", return_value=fake_completed):
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed):
         rc = run_probe(
             model_id="kokoro-82m",
             no_inference=False,
@@ -174,7 +195,7 @@ def test_run_probe_json_output_emits_record(tmp_catalog, capsys):
     fake_completed.returncode = 0
     fake_completed.stdout = json.dumps(record)
     fake_completed.stderr = ""
-    with patch("muse.cli_impl.probe.subprocess.run", return_value=fake_completed):
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed):
         rc = run_probe(
             model_id="kokoro-82m",
             no_inference=True,
@@ -193,7 +214,7 @@ def test_run_probe_no_output_returns_error(tmp_catalog, capsys):
     fake_completed.returncode = 0
     fake_completed.stdout = ""
     fake_completed.stderr = ""
-    with patch("muse.cli_impl.probe.subprocess.run", return_value=fake_completed):
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed):
         rc = run_probe(
             model_id="kokoro-82m",
             no_inference=False,
@@ -211,7 +232,7 @@ def test_run_probe_non_json_output_returns_error(tmp_catalog, capsys):
     fake_completed.returncode = 0
     fake_completed.stdout = "not json at all"
     fake_completed.stderr = ""
-    with patch("muse.cli_impl.probe.subprocess.run", return_value=fake_completed):
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed):
         rc = run_probe(
             model_id="kokoro-82m",
             no_inference=False,
@@ -221,6 +242,71 @@ def test_run_probe_non_json_output_returns_error(tmp_catalog, capsys):
     assert rc == 4
     err = capsys.readouterr().err
     assert "not JSON" in err
+
+
+@pytest.mark.parametrize("payload", ["[]", '"text"', "123", "null"])
+def test_run_probe_rejects_non_object_json(tmp_catalog, capsys, payload):
+    _seed_pulled_entry(tmp_catalog)
+    fake_completed = MagicMock(returncode=0, stdout=payload, stderr="")
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed):
+        rc = run_probe(
+            model_id="kokoro-82m",
+            no_inference=False,
+            device=None,
+            as_json=False,
+        )
+    assert rc == 4
+    assert "not an object" in capsys.readouterr().err
+
+
+def test_run_probe_handles_missing_capture_text(tmp_catalog, capsys):
+    _seed_pulled_entry(tmp_catalog)
+    fake_completed = MagicMock(returncode=0, stdout=None, stderr=None)
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed):
+        rc = run_probe(
+            model_id="kokoro-82m",
+            no_inference=False,
+            device=None,
+            as_json=False,
+        )
+    assert rc == 4
+    assert "no output" in capsys.readouterr().err
+
+
+def test_run_probe_reports_stale_python_executable(tmp_catalog, capsys):
+    _seed_pulled_entry(tmp_catalog)
+    with patch(
+        "muse.cli_impl.probe.run_owned_command",
+        side_effect=FileNotFoundError("stale python"),
+    ):
+        rc = run_probe(
+            model_id="kokoro-82m",
+            no_inference=False,
+            device=None,
+            as_json=False,
+        )
+    assert rc == 3
+    assert "could not start probe subprocess" in capsys.readouterr().err
+
+
+def test_run_probe_refuses_live_worker_lease(tmp_catalog, capsys):
+    from muse.core.catalog import ModelInUseError
+
+    _seed_pulled_entry(tmp_catalog)
+    with patch(
+        "muse.cli_impl.probe._model_resource_lease",
+        side_effect=ModelInUseError("model 'kokoro-82m' is in use"),
+    ), patch("muse.cli_impl.probe.run_owned_command") as runner:
+        rc = run_probe(
+            model_id="kokoro-82m",
+            no_inference=False,
+            device=None,
+            as_json=False,
+        )
+
+    assert rc == 3
+    assert "is in use" in capsys.readouterr().err
+    runner.assert_not_called()
 
 
 def test_run_probe_passes_no_inference_flag_to_subprocess(tmp_catalog):
@@ -238,7 +324,7 @@ def test_run_probe_passes_no_inference_flag_to_subprocess(tmp_catalog):
     fake_completed.returncode = 0
     fake_completed.stdout = json.dumps(record)
     fake_completed.stderr = ""
-    with patch("muse.cli_impl.probe.subprocess.run", return_value=fake_completed) as mock_run:
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed) as mock_run:
         run_probe(
             model_id="kokoro-82m",
             no_inference=True,
@@ -260,7 +346,7 @@ def test_run_probe_uses_per_model_venv_python(tmp_catalog):
     fake_completed.returncode = 0
     fake_completed.stdout = json.dumps(record)
     fake_completed.stderr = ""
-    with patch("muse.cli_impl.probe.subprocess.run", return_value=fake_completed) as mock_run:
+    with patch("muse.cli_impl.probe.run_owned_command", return_value=fake_completed) as mock_run:
         run_probe(
             model_id="kokoro-82m", no_inference=False, device=None, as_json=False,
         )
@@ -273,7 +359,7 @@ def test_run_probe_timeout_returns_error(tmp_catalog, capsys):
     _seed_pulled_entry(tmp_catalog)
     import subprocess as sp
     with patch(
-        "muse.cli_impl.probe.subprocess.run",
+        "muse.cli_impl.probe.run_owned_command",
         side_effect=sp.TimeoutExpired(cmd="x", timeout=600),
     ):
         rc = run_probe(

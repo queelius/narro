@@ -64,7 +64,7 @@ def test_embed_returns_embedding_result():
 
 
 def test_trust_remote_code_forwarded():
-    """For repos that require it (Qwen3, Nomic, some Instruct models)."""
+    """For reviewed repos that require it (Nomic and some custom models)."""
     with patch(
         "muse.modalities.embedding_text.runtimes.sentence_transformers.SentenceTransformer"
     ) as mock_cls:
@@ -78,6 +78,30 @@ def test_trust_remote_code_forwarded():
         )
         kwargs = mock_cls.call_args.kwargs
         assert kwargs["trust_remote_code"] is True
+
+
+def test_external_code_revision_forwarded_to_config_and_model():
+    revision = "2" * 40
+    with patch(
+        "muse.modalities.embedding_text.runtimes.sentence_transformers.SentenceTransformer"
+    ) as mock_cls:
+        mock_cls.return_value = _mock_st_model()
+        from muse.modalities.embedding_text.runtimes.sentence_transformers import (
+            SentenceTransformerModel,
+        )
+        SentenceTransformerModel(
+            model_id="nomic",
+            hf_repo="nomic-ai/nomic-embed-text-v1.5",
+            local_dir="/fake",
+            trust_remote_code=True,
+            code_revision=revision,
+        )
+
+    kwargs = mock_cls.call_args.kwargs
+    assert kwargs["model_kwargs"]["code_revision"] == revision
+    assert kwargs["config_kwargs"]["code_revision"] == revision
+    assert kwargs["model_kwargs"].pop("code_revision") == revision
+    assert kwargs["model_kwargs"]["code_revision"] == revision
 
 
 def test_defaults_trust_remote_code_false():

@@ -4,10 +4,11 @@ Sniffs HF repos that ship a complete diffusers pipeline (model_index.json
 sibling), advertise the `text-to-video` tag, and have `animate` or
 `motion` in the repo name. AnimateLCM is the canonical match.
 
-Limitation: the plugin pairs every match with a default SD 1.5 base
-(`emilianJR/epiCRealism`) so resolver-pulled models work out of the box.
-Pre-curated configs that need a different base should use the bundled
-`animatediff-motion-v3` script or override via curated capabilities.
+The plugin pairs every match with one immutable SD 1.5 base
+(`emilianJR/epiCRealism`) and pulls both repositories as a local bundle.
+A different base requires a model definition whose artifact bundle declares
+that base explicitly; changing only a capability cannot replace downloaded
+assets.
 
 Loaded via single-file import; no relative imports.
 """
@@ -18,7 +19,8 @@ from typing import Any, Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.artifacts import download_hf_artifact_bundle
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _RUNTIME_PATH = (
@@ -32,6 +34,52 @@ _PIP_EXTRAS = (
     "accelerate",
     "Pillow>=9.1.0",
     "safetensors",
+)
+_BASE_MODEL = "emilianJR/epiCRealism"
+_BASE_REVISION = "6522cf856b8c8e14638a0aaa7bd89b1b098aed17"
+_ADAPTER_SUBDIR = "motion_adapter"
+_BASE_SUBDIR = "base_model"
+_ADAPTER_ALLOW_PATTERNS = (
+    "*.safetensors",
+    "*.json",
+    "*.txt",
+    "*.md",
+)
+_ADAPTER_REQUIRED_PATTERNS = (
+    "model_index.json",
+    "*.safetensors",
+)
+_BASE_ALLOW_PATTERNS = (
+    "*.safetensors",
+    "*.json",
+    "*.txt",
+    "*.model",
+    "*.md",
+    "feature_extractor/*",
+    "scheduler/*",
+    "safety_checker/*.safetensors",
+    "safety_checker/*.json",
+    "text_encoder/*.safetensors",
+    "text_encoder/*.json",
+    "tokenizer/*",
+    "unet/*.safetensors",
+    "unet/*.json",
+    "vae/*.safetensors",
+    "vae/*.json",
+)
+_BASE_REQUIRED_PATTERNS = (
+    "model_index.json",
+    "feature_extractor/preprocessor_config.json",
+    "safety_checker/config.json",
+    "safety_checker/*.safetensors",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/*.safetensors",
+    "tokenizer/tokenizer_config.json",
+    "unet/config.json",
+    "unet/*.safetensors",
+    "vae/config.json",
+    "vae/*.safetensors",
 )
 
 
@@ -50,16 +98,20 @@ def _infer_defaults(repo_id: str) -> dict[str, Any]:
     """Sensible per-pattern defaults for fused AnimateDiff variants.
 
     Resolver-pulled models advertise `supports_text_to_animation: True`
-    and `supports_image_to_animation: False`. Base model defaults to a
-    SD 1.5 checkpoint; users can override via curated capabilities or
-    by editing the persisted manifest.
+    and `supports_image_to_animation: False`. The base-model fields describe
+    the fixed second member of the immutable bundle used by Muse-managed
+    loads. Direct runtime construction without ``local_dir`` may still pass a
+    different compatible base repository.
     """
     rid = repo_id.lower()
     base = {
         "default_size": [512, 512],
         "default_frames": 16,
         "default_fps": 8,
-        "base_model": "emilianJR/epiCRealism",
+        "base_model": _BASE_MODEL,
+        "base_model_revision": _BASE_REVISION,
+        "adapter_model_subdir": _ADAPTER_SUBDIR,
+        "base_model_subdir": _BASE_SUBDIR,
         "supports_text_to_animation": True,
         "supports_image_to_animation": False,
         "min_frames": 8,
@@ -85,6 +137,7 @@ def _sniff(info) -> bool:
 
 def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
     capabilities = _infer_defaults(repo_id)
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "image/animation",
@@ -95,17 +148,48 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
+
+    artifacts = (
+        {
+            "repo_id": repo_id,
+            "revision": revision,
+            "subdir": _ADAPTER_SUBDIR,
+            "allow_patterns": _ADAPTER_ALLOW_PATTERNS,
+            "required_patterns": _ADAPTER_REQUIRED_PATTERNS,
+        },
+        {
+            "repo_id": _BASE_MODEL,
+            "revision": _BASE_REVISION,
+            "subdir": _BASE_SUBDIR,
+            "allow_patterns": _BASE_ALLOW_PATTERNS,
+            "required_patterns": _BASE_REQUIRED_PATTERNS,
+        },
+    )
 
     def _download(cache_root: Path) -> Path:
-        return Path(snapshot_download(
-            repo_id=repo_id,
-            cache_dir=str(cache_root) if cache_root else None,
-        ))
+        return download_hf_artifact_bundle(
+            cache_root,
+            bundle_name=_model_id(repo_id),
+            artifacts=artifacts,
+            snapshot_download_fn=snapshot_download,
+        )
 
     return ResolvedModel(
         manifest=manifest,
         backend_path=_RUNTIME_PATH,
         download=_download,
+        artifact_provenance=tuple(
+            {
+                "repo_id": artifact["repo_id"],
+                "revision": artifact["revision"],
+                "subdir": artifact["subdir"],
+                "allow_patterns": list(artifact["allow_patterns"]),
+                "required_patterns": list(artifact["required_patterns"]),
+            }
+            for artifact in artifacts
+        ),
     )
 
 

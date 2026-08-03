@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -73,6 +74,28 @@ class TestResolveBinaryInput:
         with pytest.raises(ValueError, match="malformed base64"):
             resolve_binary_input(b64="not!!!base64!!!", field_name="image")
 
+    def test_oversized_b64_rejected_before_decode(self, monkeypatch):
+        from muse.core import config
+        from muse.mcp import binary_io
+
+        monkeypatch.setenv("MUSE_IMAGE_INPUT_MAX_BYTES", "3")
+        config.reset_config()
+        decode = MagicMock(side_effect=AssertionError("decode should not run"))
+        monkeypatch.setattr(binary_io.base64, "b64decode", decode)
+        try:
+            with pytest.raises(ValueError, match="encoded length"):
+                resolve_binary_input(b64="A" * 100, field_name="image")
+            decode.assert_not_called()
+        finally:
+            config.reset_config()
+
+    def test_malformed_data_url_base64_is_normalized(self):
+        with pytest.raises(ValueError, match="malformed base64"):
+            resolve_binary_input(
+                url="data:image/png;base64,not!!!base64!!!",
+                field_name="image",
+            )
+
     def test_malformed_data_b64_no_comma(self):
         with pytest.raises(ValueError, match="malformed data URL"):
             resolve_binary_input(b64="data:image/png;base64", field_name="image")
@@ -104,6 +127,25 @@ class TestResolveBinaryInput:
         with pytest.raises(ValueError, match="missing image input"):
             resolve_binary_input(b64="", url="", path="", field_name="image")
 
+    @pytest.mark.parametrize("slot", ["b64", "url", "path"])
+    @pytest.mark.parametrize(
+        "value",
+        [False, True, 0, 1, 1.5, [], {}, b"bytes"],
+        ids=[
+            "false", "true", "zero", "one", "float", "list", "dict", "bytes",
+        ],
+    )
+    def test_non_string_slot_is_rejected(self, slot, value):
+        """Malformed MCP JSON must fail as validation, not Python internals."""
+        with pytest.raises(
+            ValueError,
+            match=rf"image_{slot} must be a string",
+        ):
+            resolve_binary_input(
+                field_name="image",
+                **{slot: value},
+            )
+
     def test_http_url_routes_through_net_fetch(self, monkeypatch):
         """URL inputs now route through muse.core.net_fetch.fetch_url_bytes
         (SSRF-protected, size-capped). Patch at that boundary."""
@@ -124,6 +166,52 @@ class TestResolveBinaryInput:
         assert out == SAMPLE_BYTES
         assert called["url"] == "http://example.com/img.png"
         assert isinstance(called["max_bytes"], int)
+
+    def test_allowlisted_path_obeys_shared_size_cap(self, tmp_path, monkeypatch):
+        from muse.core import config
+
+        monkeypatch.setenv("MUSE_MCP_ALLOWED_PATH_PREFIXES", str(tmp_path))
+        monkeypatch.setenv("MUSE_IMAGE_INPUT_MAX_BYTES", "4")
+        target = tmp_path / "too-large.bin"
+        target.write_bytes(b"12345")
+        config.reset_config()
+        try:
+            with pytest.raises(ValueError, match="exceeds the max of 4 bytes"):
+                resolve_binary_input(path=str(target), field_name="image")
+        finally:
+            config.reset_config()
+
+    def test_allowlisted_directory_is_clean_read_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MUSE_MCP_ALLOWED_PATH_PREFIXES", str(tmp_path))
+        with pytest.raises(ValueError, match="could not read"):
+            resolve_binary_input(path=str(tmp_path), field_name="image")
+
+    def test_path_read_rejects_symlink_swapped_after_realpath(
+        self, tmp_path, monkeypatch,
+    ):
+        """The descriptor walk must fail closed if the checked leaf changed."""
+        from muse.mcp import binary_io
+
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"secret")
+        stale_target = allowed / "target.bin"
+        stale_target.symlink_to(outside)
+        monkeypatch.setenv("MUSE_MCP_ALLOWED_PATH_PREFIXES", str(allowed))
+
+        realpath = binary_io.os.path.realpath
+
+        def stale_realpath(value):
+            if os.fspath(value) == os.fspath(stale_target):
+                # Simulate a target that was regular during canonicalization
+                # but became a symlink before descriptor acquisition.
+                return os.fspath(stale_target)
+            return realpath(value)
+
+        monkeypatch.setattr(binary_io.os.path, "realpath", stale_realpath)
+        with pytest.raises(ValueError, match="could not read"):
+            resolve_binary_input(path=str(stale_target), field_name="image")
 
 
 class TestPackOutputs:

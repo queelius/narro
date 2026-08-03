@@ -19,13 +19,15 @@ Loaded via single-file import; no relative imports.
 from __future__ import annotations
 
 import re
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.artifacts import download_hf_artifact_bundle
+from muse.core.resolvers import ResolvedModel, SearchResult, hf_commit_revision
 
 
 _TRIPOSR_RUNTIME_PATH = (
@@ -65,34 +67,81 @@ _TRELLIS_RUNTIME_PATH = (
 # real downloaded SDK. The TRELLIS GitHub repo has native-build deps
 # (kaolin, xformers, flash-attn, nvdiffrast) that pip cannot install
 # cleanly on all systems; Microsoft's setup.sh script is the official
-# install path. Users may need to follow that script manually after
-# `muse pull trellis-image` if the git pip-install below fails. See:
-#   https://github.com/microsoft/TRELLIS/blob/main/setup.sh
+# install reference. Muse installs its portable ``--basic`` dependencies and
+# a sparse, immutable SDK checkout; users still need compatible native CUDA
+# packages for their local PyTorch/CUDA stack. Upstream has no tags/releases;
+# the SDK API was reviewed at the immutable commit below.
+# See: https://github.com/microsoft/TRELLIS/blob/442aa1e1afb9014e80681d3bf604e8d728a86ee7/setup.sh
+_TRELLIS_REVISION = "442aa1e1afb9014e80681d3bf604e8d728a86ee7"
+_TRELLIS_FLEXICUBES_REVISION = "815e075a2a400d06c48d94c347674344ed6ae5c5"
 _TRELLIS_PIP_EXTRAS: tuple[str, ...] = (
     "torch>=2.1.0",
     "torchvision>=0.16.0",
     "transformers>=4.46.0",
     "diffusers>=0.27.0",
+    "safetensors",
+    "huggingface_hub",
     "trimesh",
     "accelerate",
     "Pillow",
     "numpy",
-    # TRELLIS standalone SDK from Microsoft. May fail to pip-install
-    # on hosts without CUDA toolchain or compatible NVIDIA driver. If
-    # so, fall back to following Microsoft's setup.sh inside the
-    # per-model venv at ~/.muse/venvs/trellis-image/.
-    "trellis @ git+https://github.com/microsoft/TRELLIS.git",
+    # Microsoft's official setup.sh --basic dependency inventory. Native
+    # CUDA/PyTorch-specific flags remain an explicit operator prerequisite.
+    "imageio",
+    "imageio-ffmpeg",
+    "tqdm",
+    "easydict",
+    "opencv-python-headless",
+    "scipy",
+    "ninja",
+    "rembg",
+    "onnxruntime",
+    "open3d",
+    "xatlas",
+    "pyvista",
+    "pymeshfix",
+    "igraph",
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8",
+)
+_TRELLIS_PYTHON_SOURCES: tuple[dict, ...] = (
+    {
+        "type": "git",
+        "name": "trellis",
+        "url": "https://github.com/microsoft/TRELLIS.git",
+        "revision": _TRELLIS_REVISION,
+        "sparse_paths": ("trellis",),
+        "required_paths": (
+            "trellis/__init__.py",
+            "trellis/pipelines/trellis_image_to_3d.py",
+            "trellis/representations/mesh/flexicubes/flexicubes.py",
+        ),
+        "pth_path": ".",
+        "submodules": (
+            {
+                "path": "trellis/representations/mesh/flexicubes",
+                "url": "https://github.com/MaxtirError/FlexiCubes.git",
+                "revision": _TRELLIS_FLEXICUBES_REVISION,
+            },
+        ),
+    },
 )
 _HUNYUAN3D_RUNTIME_PATH = (
     "muse.modalities.model_3d_generation.runtimes.hunyuan3d:Hunyuan3DRuntime"
 )
+_HUNYUAN3D_T2I_REPO = (
+    "Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled"
+)
+_HUNYUAN3D_T2I_REVISION = "527cf2ecce7c04021975938f8b0e44e35d2b1ed9"
+_HUNYUAN3D_SHAPE_SUBDIR = "shape"
+_HUNYUAN3D_T2I_SUBDIR = "text_to_image"
 # Hunyuan3D-2 uses Tencent's standalone SDK (NOT a transformers/diffusers
 # AutoPipeline). Verified at v0.45.0 implementation time. Tencent's
 # GitHub repo has native-build deps (kaolin, xformers, custom CUDA
 # extensions) that pip cannot install cleanly on all systems; Tencent's
-# setup script is the official install path. Users may need to follow
-# that script manually after `muse pull hunyuan3d-2` if the git
-# pip-install below fails. See: https://github.com/Tencent/Hunyuan3D-2/
+# setup script is the official install path. Users may need to follow that
+# script manually after `muse pull hunyuan3d-2` if the git pip-install below
+# fails. Upstream has no tags/releases; the SDK API was reviewed at the
+# immutable commit below. See: https://github.com/Tencent-Hunyuan/Hunyuan3D-2/tree/f8db63096c8282cb27354314d896feba5ba6ff8a
 _HUNYUAN3D_PIP_EXTRAS: tuple[str, ...] = (
     "torch>=2.1.0",
     "torchvision>=0.16.0",
@@ -105,7 +154,7 @@ _HUNYUAN3D_PIP_EXTRAS: tuple[str, ...] = (
     # Tencent Hunyuan3D-2 SDK from GitHub. May fail on hosts without
     # CUDA toolchain or compatible NVIDIA driver. Fallback: clone +
     # follow setup.sh inside the per-model venv at ~/.muse/venvs/hunyuan3d-2/.
-    "hy3dgen @ git+https://github.com/Tencent/Hunyuan3D-2.git",
+    "hy3dgen @ git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git@f8db63096c8282cb27354314d896feba5ba6ff8a",
 )
 
 
@@ -121,11 +170,9 @@ class _Family:
       name_hints: repo-name substrings (lowercased) that identify this family.
       runtime_path: backend_path written into the catalog manifest.
       pip_extras: per-model pip dependencies installed into the model venv.
+      python_sources: reviewed non-packaged source trees installed into the venv.
       capability_overrides: dict merged over the default capabilities block;
         values here win. Shap-E uses this to flip image/text support flags.
-      trust_remote_code: when True, forwarded into capabilities so the
-        runtime can pass trust_remote_code=True to from_pretrained. Used
-        by TRELLIS (v0.45.0) and Hunyuan3D-2 (v0.46.0).
       system_packages: OS-level packages (e.g. libGL) needed by the runtime.
         Empty for most families; Wonder3D / TRELLIS may declare libGL.
     """
@@ -133,8 +180,8 @@ class _Family:
     name_hints: tuple[str, ...]
     runtime_path: str
     pip_extras: tuple[str, ...]
+    python_sources: tuple[dict, ...] = ()
     capability_overrides: dict = field(default_factory=dict)
-    trust_remote_code: bool = False
     system_packages: tuple[str, ...] = ()
 
 
@@ -152,11 +199,12 @@ _FAMILIES: tuple[_Family, ...] = (
         name_hints=("trellis",),
         runtime_path=_TRELLIS_RUNTIME_PATH,
         pip_extras=_TRELLIS_PIP_EXTRAS,
+        python_sources=_TRELLIS_PYTHON_SOURCES,
         capability_overrides={
             "supports_image_to_3d": True,
             "supports_text_to_3d": False,
         },
-        trust_remote_code=True,
+        system_packages=("git", "nvcc"),
     ),
     _Family(  # NEW v0.45.0: Hunyuan3D-2, dual-direction
         name_hints=("hunyuan3d",),
@@ -166,7 +214,6 @@ _FAMILIES: tuple[_Family, ...] = (
             "supports_image_to_3d": True,
             "supports_text_to_3d": True,
         },
-        trust_remote_code=True,
     ),
     # Wonder3D: deferred indefinitely (v0.44.0 decision).
 )
@@ -220,6 +267,32 @@ def _model_id(repo_id: str) -> str:
     return repo_id.split("/", 1)[-1].lower()
 
 
+def _download_hunyuan_bundle(
+    cache_root: Path,
+    *,
+    repo_id: str,
+    revision: str,
+) -> Path:
+    """Download both immutable Hunyuan checkpoints and publish atomically."""
+    return download_hf_artifact_bundle(
+        cache_root,
+        bundle_name="hunyuan3d",
+        artifacts=(
+            {
+                "repo_id": repo_id,
+                "revision": revision,
+                "subdir": _HUNYUAN3D_SHAPE_SUBDIR,
+            },
+            {
+                "repo_id": _HUNYUAN3D_T2I_REPO,
+                "revision": _HUNYUAN3D_T2I_REVISION,
+                "subdir": _HUNYUAN3D_T2I_SUBDIR,
+            },
+        ),
+        snapshot_download_fn=snapshot_download,
+    )
+
+
 def _repo_license(info) -> str | None:
     card = getattr(info, "card_data", None)
     if card is None:
@@ -243,11 +316,13 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
 
     The per-family registry (_FAMILIES) selects the runtime by repo-name
     substring match. Current families: Shap-E (text-to-3D),
-    TRELLIS (image-to-3D, trust_remote_code), Hunyuan3D-2 (both
-    directions, trust_remote_code). Unknown repos fall through to
+    TRELLIS (image-to-3D, installed SDK), Hunyuan3D-2 (both
+    directions, installed SDK). Unknown repos fall through to
     TripoSR (image-to-3D) via _DEFAULT_FAMILY.
     """
     family = _family_for(repo_id)
+    revision = hf_commit_revision(info)
+    is_hunyuan = family.runtime_path == _HUNYUAN3D_RUNTIME_PATH
 
     capabilities: dict = {
         "device": "cuda",
@@ -256,9 +331,13 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "output_format": "glb",
     }
     capabilities.update(family.capability_overrides)
-
-    if family.trust_remote_code:
-        capabilities["trust_remote_code"] = True
+    if is_hunyuan:
+        capabilities.update({
+            "shape_model_subdir": _HUNYUAN3D_SHAPE_SUBDIR,
+            "t2i_model_subdir": _HUNYUAN3D_T2I_SUBDIR,
+            "t2i_model_id": _HUNYUAN3D_T2I_REPO,
+            "t2i_revision": _HUNYUAN3D_T2I_REVISION,
+        })
 
     manifest = {
         "model_id": _model_id(repo_id),
@@ -270,6 +349,10 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": list(family.system_packages),
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
+    if family.python_sources:
+        manifest["python_sources"] = copy.deepcopy(list(family.python_sources))
 
     def _download(cache_root: Path) -> Path:
         # snapshot_download returns the local cache directory. Without
@@ -277,15 +360,43 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         # tend to ship config.json + model.safetensors plus optional
         # decoder/triplane files, so taking everything is safer than
         # guessing patterns per family.
+        if revision is None:
+            raise RuntimeError(
+                f"refusing mutable Hugging Face download for {repo_id!r}: "
+                "repository metadata did not include an immutable commit"
+            )
+        if is_hunyuan:
+            return _download_hunyuan_bundle(
+                cache_root,
+                repo_id=repo_id,
+                revision=revision,
+            )
         return Path(snapshot_download(
             repo_id=repo_id,
+            revision=revision,
             cache_dir=str(cache_root) if cache_root else None,
         ))
+
+    provenance: tuple[dict, ...] = ()
+    if revision is not None:
+        items = [{
+            "repo_id": repo_id,
+            "revision": revision,
+            "subdir": _HUNYUAN3D_SHAPE_SUBDIR if is_hunyuan else ".",
+        }]
+        if is_hunyuan:
+            items.append({
+                "repo_id": _HUNYUAN3D_T2I_REPO,
+                "revision": _HUNYUAN3D_T2I_REVISION,
+                "subdir": _HUNYUAN3D_T2I_SUBDIR,
+            })
+        provenance = tuple(items)
 
     return ResolvedModel(
         manifest=manifest,
         backend_path=family.runtime_path,
         download=_download,
+        artifact_provenance=provenance,
     )
 
 

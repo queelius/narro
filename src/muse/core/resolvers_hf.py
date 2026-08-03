@@ -12,6 +12,8 @@ order on resolve, and filters by modality on search.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 import logging
 import time
 from typing import Iterable
@@ -25,12 +27,116 @@ from muse.core.resolvers import (
     ResolvedModel,
     ResolverError,
     SearchResult,
+    _HF_COMMIT_RE,
     _accepts_kwarg,
+    hf_commit_revision,
     parse_uri,
     register_resolver,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validated_hf_result(
+    resolved: ResolvedModel,
+    *,
+    repo_id: str,
+    revision: str,
+) -> ResolvedModel:
+    """Bind a plugin result to the exact Hub metadata commit and receipt."""
+    if not isinstance(resolved, ResolvedModel):
+        raise ResolverError("HF plugin returned an invalid resolved-model object")
+    manifest = resolved.manifest
+    if not isinstance(manifest, dict):
+        raise ResolverError("HF plugin returned a non-object manifest")
+    if manifest.get("hf_repo") != repo_id:
+        raise ResolverError(
+            f"HF plugin resolved an unexpected repository: expected {repo_id!r}, "
+            f"got {manifest.get('hf_repo')!r}"
+        )
+    if manifest.get("revision") != revision:
+        raise ResolverError(
+            f"HF plugin did not preserve the resolved immutable commit for "
+            f"{repo_id!r}: expected {revision}, got {manifest.get('revision')!r}"
+        )
+
+    raw_receipt: object = resolved.artifact_provenance or ({
+        "repo_id": repo_id,
+        "revision": revision,
+        "subdir": ".",
+    },)
+    if isinstance(raw_receipt, (str, bytes)) or not isinstance(raw_receipt, Sequence):
+        raise ResolverError("HF plugin artifact provenance must be a sequence")
+    receipt: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for index, raw in enumerate(raw_receipt):
+        if not isinstance(raw, Mapping):
+            raise ResolverError(f"HF artifact provenance item {index} is not an object")
+        unknown = set(raw) - {
+            "repo_id",
+            "revision",
+            "subdir",
+            "allow_patterns",
+            "required_patterns",
+        }
+        if unknown:
+            raise ResolverError(
+                f"HF artifact provenance item {index} has unknown keys: "
+                f"{sorted(unknown)}"
+            )
+        item_repo = raw.get("repo_id")
+        item_revision = raw.get("revision")
+        subdir = raw.get("subdir", ".")
+        if (
+            not isinstance(item_repo, str)
+            or item_repo.count("/") != 1
+            or any(char.isspace() for char in item_repo)
+        ):
+            raise ResolverError(f"HF artifact provenance item {index} has invalid repo_id")
+        if (
+            not isinstance(item_revision, str)
+            or _HF_COMMIT_RE.fullmatch(item_revision) is None
+        ):
+            raise ResolverError(
+                f"HF artifact provenance item {index} lacks an immutable commit"
+            )
+        if (
+            not isinstance(subdir, str)
+            or not subdir
+            or "/" in subdir
+            or "\\" in subdir
+            or subdir == ".."
+        ):
+            raise ResolverError(f"HF artifact provenance item {index} has invalid subdir")
+        canonical: dict[str, object] = {
+            "repo_id": item_repo,
+            "revision": item_revision,
+            "subdir": subdir,
+        }
+        for field_name in ("allow_patterns", "required_patterns"):
+            patterns = raw.get(field_name)
+            if patterns is None:
+                continue
+            if (
+                isinstance(patterns, (str, bytes))
+                or not isinstance(patterns, Sequence)
+                or not all(isinstance(value, str) and value for value in patterns)
+            ):
+                raise ResolverError(
+                    f"HF artifact provenance item {index} has invalid {field_name}"
+                )
+            canonical[field_name] = list(patterns)
+        identity = (item_repo, item_revision, subdir)
+        if identity in seen:
+            raise ResolverError(f"duplicate HF artifact provenance item {index}")
+        seen.add(identity)
+        receipt.append(canonical)
+    if not any(
+        item["repo_id"] == repo_id and item["revision"] == revision
+        for item in receipt
+    ):
+        raise ResolverError("HF artifact provenance omits the resolved primary repository")
+    return replace(resolved, artifact_provenance=tuple(receipt))
 
 # Transient-failure retry for Hub metadata fetches. repo_info() can fail
 # under rapid calls (rate-limit 429, 5xx, flaky socket) or return a
@@ -60,7 +166,7 @@ class HFResolver(Resolver):
             _default_hf_plugin_dirs()
         )
 
-    def _repo_info(self, repo_id: str):
+    def _repo_info(self, repo_id: str, *, revision: str | None = None):
         """Fetch Hub repo metadata, resilient to transient failures.
 
         repo_info() raises for two very different reasons:
@@ -77,7 +183,9 @@ class HFResolver(Resolver):
         last_exc: Exception | None = None
         for attempt in range(1, _REPO_INFO_MAX_ATTEMPTS + 1):
             try:
-                return self._api.repo_info(repo_id)
+                if revision is None:
+                    return self._api.repo_info(repo_id)
+                return self._api.repo_info(repo_id, revision=revision)
             except RepositoryNotFoundError:
                 raise  # missing/gated: meaningful, deterministic, do not mask
             except Exception as exc:  # noqa: BLE001 - transient/unexpected
@@ -97,16 +205,38 @@ class HFResolver(Resolver):
             f"({type(last_exc).__name__}: {last_exc})"
         ) from last_exc
 
-    def resolve(self, uri: str, *, base_override: str | None = None) -> ResolvedModel:
+    def resolve(
+        self,
+        uri: str,
+        *,
+        base_override: str | None = None,
+        revision: str | None = None,
+    ) -> ResolvedModel:
         scheme, repo_id, variant = parse_uri(uri)
         if scheme != "hf":
             raise ResolverError(f"HFResolver cannot resolve scheme {scheme!r}")
 
-        info = self._repo_info(repo_id)
+        info = self._repo_info(repo_id, revision=revision)
+        resolved_revision = hf_commit_revision(info)
+        if resolved_revision is None:
+            raise ResolverError(
+                f"Hugging Face did not return an immutable 40-character "
+                f"commit for {repo_id!r}"
+            )
+        if revision is not None and resolved_revision != revision:
+            raise ResolverError(
+                f"Hugging Face resolved {repo_id!r} to an unexpected commit; "
+                f"requested {revision}, got {resolved_revision!r}"
+            )
         for plugin in self._plugins:
             if plugin["sniff"](info):
-                return self._call_plugin_resolve(
+                resolved = self._call_plugin_resolve(
                     plugin, repo_id, variant, info, base_override,
+                )
+                return _validated_hf_result(
+                    resolved,
+                    repo_id=repo_id,
+                    revision=resolved_revision,
                 )
 
         tags = getattr(info, "tags", None) or []
@@ -117,7 +247,12 @@ class HFResolver(Resolver):
         )
 
     def resolve_via_modality(
-        self, uri: str, modality: str, *, base_override: str | None = None,
+        self,
+        uri: str,
+        modality: str,
+        *,
+        base_override: str | None = None,
+        revision: str | None = None,
     ) -> ResolvedModel:
         """Resolve a URI through the plugin for the named modality,
         bypassing priority-based sniff dispatch.
@@ -142,9 +277,26 @@ class HFResolver(Resolver):
 
         for plugin in self._plugins:
             if plugin["modality"] == modality:
-                info = self._repo_info(repo_id)
-                return self._call_plugin_resolve(
+                info = self._repo_info(repo_id, revision=revision)
+                resolved_revision = hf_commit_revision(info)
+                if resolved_revision is None:
+                    raise ResolverError(
+                        "Hugging Face did not return an immutable 40-character "
+                        f"commit for {repo_id!r}"
+                    )
+                if revision is not None and resolved_revision != revision:
+                    raise ResolverError(
+                        f"Hugging Face resolved {repo_id!r} to an unexpected "
+                        f"commit; requested {revision}, got "
+                        f"{resolved_revision!r}"
+                    )
+                resolved = self._call_plugin_resolve(
                     plugin, repo_id, variant, info, base_override,
+                )
+                return _validated_hf_result(
+                    resolved,
+                    repo_id=repo_id,
+                    revision=resolved_revision,
                 )
 
         supported = sorted({p["modality"] for p in self._plugins})

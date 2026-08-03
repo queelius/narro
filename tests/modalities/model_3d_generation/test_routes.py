@@ -431,6 +431,44 @@ def test_image_route_passes_pil_image_to_backend():
     )
 
 
+def test_image_route_closes_decoded_image_after_backend():
+    backend = _FakeBackend()
+    decoded = MagicMock()
+    decoded.mode = "RGB"
+    decoded.size = (1, 1)
+
+    with patch(
+        "muse.modalities.model_3d_generation.routes.decode_image_file",
+        return_value=decoded,
+    ):
+        response = _client(backend).post(
+            "/v1/3d/from-image",
+            files={"image": ("a.png", b"placeholder", "image/png")},
+        )
+
+    assert response.status_code == 200, response.text
+    decoded.close.assert_called_once_with()
+
+
+def test_image_route_enforces_shared_decoded_pixel_cap(monkeypatch):
+    from PIL import Image as PILImage
+    import io as _io
+
+    backend = _FakeBackend()
+    monkeypatch.setenv("MUSE_IMAGE_INPUT_MAX_PIXELS", "1")
+    buf = _io.BytesIO()
+    PILImage.new("RGB", (2, 1)).save(buf, format="PNG")
+
+    response = _client(backend).post(
+        "/v1/3d/from-image",
+        files={"image": ("wide.png", buf.getvalue(), "image/png")},
+    )
+
+    assert response.status_code == 400
+    assert "max input pixels" in response.json()["error"]["message"]
+    assert backend.image_called == 0
+
+
 def test_image_route_backend_exception_no_temp_file_left():
     """Even when the backend raises, no temp files should be left (no temp file
     is created in the new PIL-based flow)."""

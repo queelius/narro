@@ -21,6 +21,7 @@ MANIFEST = {
     "model_id": "ace-step-v1-3.5b",
     "modality": "audio/generation",
     "hf_repo": "ACE-Step/ACE-Step-v1-3.5B",
+    "revision": "82cd0d7b6322bd28cd4e830fe675ddb6180ce36c",
     "description": (
         "ACE-Step v1 3.5B: text-to-music + full songs (genre/style "
         "prompt + optional structured lyrics), 48kHz stereo. Apache 2.0."
@@ -32,8 +33,10 @@ MANIFEST = {
         # pin the git source; it pulls ACE-Step's own deps (transformers,
         # diffusers, etc.) transitively. NOTE: the distribution name is
         # `ace-step` (hyphen) even though the import name is `acestep`;
-        # `acestep @ git+...` fails pip's name-consistency check.
-        "ace-step @ git+https://github.com/ace-step/ACE-Step.git",
+        # `acestep @ git+...` fails pip's name-consistency check. Upstream has
+        # no tags/releases; Muse's adapter was reviewed against this immutable
+        # commit (including the upstream extend-mode shape-mismatch fix).
+        "ace-step @ git+https://github.com/ace-step/ACE-Step.git@1bee4c9f5b43e30995f8d4d33b3919197ce1bd68",
         # ACE-Step's save_wav_file calls torchaudio.save, which on modern
         # torchaudio (>=2.8) delegates encoding to torchcodec. Without it
         # generation fails at save time with "TorchCodec is required".

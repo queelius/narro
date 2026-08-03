@@ -273,6 +273,29 @@ def test_post_size_parsed_into_width_and_height(client_default):
     assert backend.last_kwargs["height"] == 480
 
 
+def test_post_oversized_dimensions_rejected_before_backend(client_default):
+    client, backend = client_default
+    r = client.post(
+        "/v1/video/generations",
+        json={"prompt": "x", "model": "fake-vid", "size": "4096x4096"},
+    )
+    assert r.status_code == 422
+    assert backend.last_kwargs is None
+
+
+def test_post_excessive_pixel_frame_workload_rejected(client_default):
+    client, backend = client_default
+    r = client.post(
+        "/v1/video/generations",
+        json={
+            "prompt": "x", "model": "fake-vid", "size": "1920x1080",
+            "duration_seconds": 30, "fps": 60, "n": 2,
+        },
+    )
+    assert r.status_code == 422
+    assert backend.last_kwargs is None
+
+
 def test_post_seed_offset_per_n(client_default):
     """For n>1, each result gets seed + offset."""
     backend = RecordingModel()

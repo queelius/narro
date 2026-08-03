@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -93,7 +94,11 @@ _WRITEBACK_LOCK = _CATALOG_WRITE_LOCK
 # introducing a tight spin loop.
 _INFLIGHT_WAIT_TIMEOUT_SECONDS = 180.0
 
-from muse.core.memory_probe import declared_device
+from muse.core.memory_probe import (
+    available_capacity_gb,
+    declared_device,
+    resolve_memory_pool,
+)
 
 # Task 9: fire-and-forget telemetry. Import the NAME (not the module) so
 # `record` is a module global here; tests monkeypatch
@@ -141,6 +146,10 @@ class LoadEntry:
     refcount: int
     last_touched_at: float
     loaded_at: float
+    # Concrete accounting pool. The default preserves compatibility for
+    # callers that construct LoadEntry directly; director-created entries
+    # always stamp the resolved pool explicitly.
+    pool: str = "cpu"
 
 
 @dataclass
@@ -181,6 +190,30 @@ class InFlightLoad:
     event: threading.Event
     memory_gb: float
     pool: str  # "cuda" or "cpu": the memory pool this load reserves against
+    # Lease metadata lets a waiter distinguish a genuinely active owner from
+    # an abandoned claim after its bounded wait. Unknown owners (legacy/test
+    # records) are reclaimable once the lease expires.
+    claimed_at: float = field(default_factory=time.monotonic)
+    owner_thread: threading.Thread | None = field(default=None, repr=False)
+
+
+@dataclass(eq=False)
+class ModelEviction:
+    """Identity token for one director-owned model teardown.
+
+    The entry is removed from ``loaded`` and, when present, remains accounted
+    in the evicting-memory maps until this exact token settles.  Admin disable
+    claims additionally keep the model blocked after success; idle claims are
+    only transiently blocked by the ordinary ``evicting`` marker.
+    """
+
+    model_id: str
+    entry: LoadEntry | None
+    reason: str
+    keep_blocked: bool
+    was_blocked: bool
+    free_before_gb: float | None
+    token: object = field(default_factory=object, repr=False)
 
 
 class LoadDirector:
@@ -224,15 +257,25 @@ class LoadDirector:
         cpu_budget_gb: float | None = None,
         gpu_headroom_gb: float = _DEFAULT_GPU_HEADROOM_GB,
         cpu_headroom_gb: float = _DEFAULT_CPU_HEADROOM_GB,
+        cuda_available_fn: Callable[[], bool] | None = None,
     ):
         self.enable_fn = enable_fn
         self.disable_fn = disable_fn
         self.memory_probe = memory_probe
 
-        self.gpu_budget_gb = gpu_budget_gb
-        self.cpu_budget_gb = cpu_budget_gb
-        self.gpu_headroom_gb = gpu_headroom_gb
-        self.cpu_headroom_gb = cpu_headroom_gb
+        self.gpu_budget_gb = self._validate_capacity_knob(
+            "gpu_budget_gb", gpu_budget_gb, optional=True,
+        )
+        self.cpu_budget_gb = self._validate_capacity_knob(
+            "cpu_budget_gb", cpu_budget_gb, optional=True,
+        )
+        self.gpu_headroom_gb = self._validate_capacity_knob(
+            "gpu_headroom_gb", gpu_headroom_gb,
+        )
+        self.cpu_headroom_gb = self._validate_capacity_knob(
+            "cpu_headroom_gb", cpu_headroom_gb,
+        )
+        self.cuda_available_fn = cuda_available_fn
 
         self.loaded: dict[str, LoadEntry] = {}
         self.in_flight_loads: dict[str, InFlightLoad] = {}
@@ -242,6 +285,30 @@ class LoadDirector:
         # director otherwise looks idle, so concurrent capacity 503s must
         # consult this set to stay retryable. Guarded by self.lock.
         self.evicting: set[str] = set()
+        # Concrete pool for director-owned markers. Keep the public set for
+        # compatibility/status tests; this side map prevents a CPU eviction
+        # from making an unrelated CUDA capacity failure look retryable (and
+        # vice versa). Unknown markers inserted by older callers remain
+        # conservatively relevant to both pools.
+        self._evicting_pools: dict[str, str] = {}
+        # Declared memory remains reserved from configured budgets until
+        # disable_fn confirms the worker has stopped. Without this, popping
+        # a victim from `loaded` makes a static-budget pool look free during
+        # the out-of-lock shutdown window and another cold load can overlap
+        # the still-resident victim.
+        self._evicting_memory_gb: dict[str, float] = {}
+        # Explicit admin disable is persistent: once claimed, new acquires
+        # remain blocked until the matching enable path calls allow_model().
+        # Idle/LRU eviction uses the transient `evicting` marker instead.
+        self._blocked_models: set[str] = set()
+        # A worker that started but could not be rolled back is conservatively
+        # represented in ``loaded`` and kept blocked until explicit teardown
+        # succeeds. This marker prevents admin enable from clearing that block
+        # and routing to a placeholder/uncertain worker port.
+        self._failed_rollbacks: set[str] = set()
+        # Exact claim identity prevents a stale finally block from clearing a
+        # newer teardown generation's markers or restoring its old LoadEntry.
+        self._eviction_claims: dict[str, ModelEviction] = {}
         self.recent_decisions: collections.deque = collections.deque(maxlen=20)
         self.lock = threading.RLock()
         # Monotonic counter bumped under the lock on every memory-mutating
@@ -253,12 +320,83 @@ class LoadDirector:
         # from).
         self._inflight_epoch = 0
 
+        # Bound passive catalog persistence to one drain thread per director.
+        # Repeated observations coalesce monotonically by model/device while
+        # that worker is busy instead of creating an unbounded thread burst.
+        self._writeback_state_lock = threading.Lock()
+        self._pending_writebacks: dict[tuple[str, str], int] = {}
+        self._writeback_thread: threading.Thread | None = None
+
+        # Pressure decisions serialize only within one accounting pool. CPU
+        # and CUDA evictions can still progress independently.
+        self._eviction_pool_locks = {
+            "cpu": threading.Lock(),
+            "cuda": threading.Lock(),
+        }
+
         # Fired (fire-and-forget) whenever capacity MAY have freed: a
         # release() that drops a refcount to 0, or a completed eviction.
         # The supervisor wires this to CapacityNotifier.notify so gateway
         # capacity-waiters wake and re-decide. Never allowed to raise into
         # the caller (wrapped at each call site).
         self.capacity_listener: Callable[[], None] | None = None
+
+    @staticmethod
+    def _validate_capacity_knob(
+        name: str, value: float | None, *, optional: bool = False,
+    ) -> float | None:
+        """Return a finite non-negative capacity setting or raise clearly."""
+        if value is None:
+            if optional:
+                return None
+            raise ValueError(f"{name} must be a finite non-negative number")
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite non-negative number")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name} must be a finite non-negative number",
+            ) from exc
+        if not math.isfinite(numeric) or numeric < 0.0:
+            raise ValueError(f"{name} must be a finite non-negative number")
+        return numeric
+
+    @staticmethod
+    def _memory_requirement_gb(manifest: dict, model_id: str) -> float:
+        """Validate one manifest memory estimate before accounting with it."""
+        manifest_valid = isinstance(manifest, dict)
+        capabilities = (
+            (manifest.get("capabilities") or {})
+            if manifest_valid
+            else manifest
+        )
+        capabilities_valid = isinstance(capabilities, dict)
+        raw = (
+            capabilities.get("memory_gb", 0.0)
+            if capabilities_valid
+            else capabilities
+        )
+        if raw is None:
+            raw = 0.0
+        try:
+            if not manifest_valid or not capabilities_valid or isinstance(raw, bool):
+                raise ValueError
+            memory_gb = float(raw)
+        except (TypeError, ValueError):
+            memory_gb = math.nan
+        if not math.isfinite(memory_gb) or memory_gb < 0.0:
+            from muse.admin.operations import OperationError
+            raise OperationError(
+                "invalid_model_manifest",
+                (
+                    f"model {model_id!r} has invalid capabilities.memory_gb "
+                    f"value {raw!r}; expected a finite non-negative number"
+                ),
+                status=503,
+                retryable=False,
+            )
+        return memory_gb
 
     # ------------------------------------------------------------------
     # Public API
@@ -364,9 +502,8 @@ class LoadDirector:
                 # thread becomes the new winner. This breaks the permanent
                 # hang without introducing a tight spin loop because each
                 # iteration is bounded by _INFLIGHT_WAIT_TIMEOUT_SECONDS.
-                event = self._get_in_flight_event(model_id)
-                if event is not None:
-                    event.wait(timeout=_INFLIGHT_WAIT_TIMEOUT_SECONDS)
+                claim = decision[1]
+                self._wait_for_in_flight(model_id, claim)
                 # Loop and re-decide. Either the entry is now hot (winner
                 # succeeded) or it's still cold (winner raised or was
                 # killed without calling _abort) and this thread will
@@ -395,7 +532,10 @@ class LoadDirector:
             # Run the (long) load phase outside the lock, then commit.
             initial_refcount = 1 if bump_refcount else 0
             return self._load_and_commit(
-                model_id, manifest=manifest, initial_refcount=initial_refcount,
+                model_id,
+                manifest=manifest,
+                claim=decision[1],
+                initial_refcount=initial_refcount,
             )
 
     def release(self, model_id: str) -> None:
@@ -427,6 +567,224 @@ class LoadDirector:
             dropped_to_zero = before > 0 and entry.refcount == 0
         if dropped_to_zero:
             self._fire_capacity_listener()
+
+    def allow_model(self, model_id: str) -> None:
+        """Allow future acquires after an explicit admin enable.
+
+        Clearing is intentionally independent of worker state: the next
+        acquire either observes an existing director entry or performs the
+        normal singleton load/commit against a worker the admin path warmed.
+        """
+        from muse.admin.operations import OperationError
+
+        with self.lock:
+            if model_id in self._eviction_claims:
+                return
+            if model_id in self._failed_rollbacks:
+                raise OperationError(
+                    "model_cleanup_required",
+                    f"model {model_id!r} has an uncertain worker from a "
+                    "failed load rollback; disable it before enabling",
+                    status=503,
+                    retryable=True,
+                )
+            removed = model_id in self._blocked_models
+            self._blocked_models.discard(model_id)
+        if removed:
+            self._fire_capacity_listener()
+
+    def begin_model_disable(self, model_id: str) -> ModelEviction:
+        """Atomically block new acquires and claim an idle model for disable.
+
+        The block is installed *before* checking refcounts/in-flight loads, so
+        an acquire cannot enter between a busy check and the teardown claim.
+        A refused claim restores the prior allow state.  Active requests and
+        cold loads are never killed out from under their owners; callers get a
+        retryable 409 and may retry once they settle.
+        """
+        from muse.admin.operations import OperationError
+
+        with self.lock:
+            was_blocked = model_id in self._blocked_models
+            self._blocked_models.add(model_id)
+            entry = self.loaded.get(model_id)
+            busy = (
+                model_id in self.evicting
+                or model_id in self._eviction_claims
+                or model_id in self.in_flight_loads
+                or (entry is not None and entry.refcount > 0)
+            )
+            if busy:
+                if not was_blocked:
+                    self._blocked_models.discard(model_id)
+                raise OperationError(
+                    "model_in_use",
+                    f"model {model_id!r} has active requests or a load in progress",
+                    status=409,
+                    retryable=True,
+                )
+            return self._begin_eviction_locked(
+                model_id,
+                entry=entry,
+                reason="admin_disabled",
+                keep_blocked=True,
+                was_blocked=was_blocked,
+            )
+
+    def begin_idle_eviction(
+        self,
+        model_id: str,
+        *,
+        expected_entry: LoadEntry,
+        idle_before: float,
+        reason: str,
+    ) -> ModelEviction | None:
+        """Claim an exact still-idle entry, or return None after any race.
+
+        Identity, refcount, and freshness are rechecked in the same lock hold
+        that publishes the evicting reservation and removes the entry.
+        """
+        with self.lock:
+            if model_id in self._blocked_models or model_id in self.evicting:
+                return None
+            entry = self.loaded.get(model_id)
+            if (
+                entry is not expected_entry
+                or entry.refcount > 0
+                or entry.last_touched_at > idle_before
+            ):
+                return None
+            return self._begin_eviction_locked(
+                model_id,
+                entry=entry,
+                reason=reason,
+                keep_blocked=False,
+                was_blocked=False,
+            )
+
+    def _begin_eviction_locked(
+        self,
+        model_id: str,
+        *,
+        entry: LoadEntry | None,
+        reason: str,
+        keep_blocked: bool,
+        was_blocked: bool,
+    ) -> ModelEviction:
+        """Publish one exact eviction claim. Caller holds ``self.lock``."""
+        if model_id in self._eviction_claims:
+            raise RuntimeError(f"model {model_id!r} already has an eviction claim")
+
+        free_before_gb: float | None = None
+        self.evicting.add(model_id)
+        try:
+            if entry is not None:
+                # Reserve before pop: configured-budget admission must continue
+                # to count the worker throughout its out-of-lock shutdown.
+                try:
+                    free_before_gb = self._free_for_device(entry.pool)
+                except Exception:  # noqa: BLE001
+                    # Measurement is observability only. A transient probe
+                    # failure must not prevent publishing a settleable claim.
+                    free_before_gb = None
+                    logger.warning(
+                        "could not measure memory before eviction of %r",
+                        model_id,
+                        exc_info=True,
+                    )
+                self._evicting_pools[model_id] = entry.pool
+                self._evicting_memory_gb[model_id] = entry.memory_gb
+                self.loaded.pop(model_id, None)
+                self._inflight_epoch += 1
+
+            claim = ModelEviction(
+                model_id=model_id,
+                entry=entry,
+                reason=reason,
+                keep_blocked=keep_blocked,
+                was_blocked=was_blocked,
+                free_before_gb=free_before_gb,
+            )
+            self._eviction_claims[model_id] = claim
+            return claim
+        except BaseException:
+            # No caller received a token it could settle. Roll back every
+            # marker under the same lock so an interruption or unexpected
+            # publication failure cannot leave the model permanently blocked.
+            self._eviction_claims.pop(model_id, None)
+            self.evicting.discard(model_id)
+            self._evicting_pools.pop(model_id, None)
+            self._evicting_memory_gb.pop(model_id, None)
+            if entry is not None:
+                self.loaded.setdefault(model_id, entry)
+            if keep_blocked and not was_blocked:
+                self._blocked_models.discard(model_id)
+            raise
+
+    def finish_eviction(
+        self,
+        claim: ModelEviction,
+        *,
+        success: bool,
+        error: BaseException | None = None,
+    ) -> bool:
+        """Settle one exact claim and wake capacity waiters outside the lock.
+
+        Failed teardown restores the claimed LoadEntry because the worker may
+        still own its memory.  Explicit-disable blocking is intentionally not
+        cleared here: the admin wrapper decides from the catalog's committed
+        state whether failure should remain fail-closed or restore allowance.
+        """
+        with self.lock:
+            if self._eviction_claims.get(claim.model_id) is not claim:
+                return False
+
+            entry = claim.entry
+            if not success and entry is not None:
+                self.loaded.setdefault(claim.model_id, entry)
+            elif success:
+                self._failed_rollbacks.discard(claim.model_id)
+
+            self.evicting.discard(claim.model_id)
+            self._evicting_pools.pop(claim.model_id, None)
+            self._evicting_memory_gb.pop(claim.model_id, None)
+
+            if not claim.keep_blocked:
+                # Idle eviction is transient and must never leave a persistent
+                # disabled state, on either success or rollback.
+                self._blocked_models.discard(claim.model_id)
+
+            self._eviction_claims.pop(claim.model_id, None)
+
+            if success and entry is not None:
+                try:
+                    free_after_gb = self._free_for_device(entry.pool)
+                except Exception:  # noqa: BLE001
+                    free_after_gb = None
+                    logger.warning(
+                        "could not measure memory after eviction of %r",
+                        claim.model_id,
+                        exc_info=True,
+                    )
+                self.recent_decisions.append(DecisionLogEntry(
+                    timestamp=time.time(),
+                    model_id=claim.model_id,
+                    action="evict",
+                    memory_gb=entry.memory_gb,
+                    free_before_gb=float(claim.free_before_gb or 0.0),
+                    free_after_gb=free_after_gb,
+                    reason=claim.reason,
+                    evicted=[claim.model_id],
+                ))
+            elif error is not None:
+                logger.warning(
+                    "eviction of %r failed; restored director accounting: %s",
+                    claim.model_id,
+                    error,
+                )
+
+        self._fire_capacity_listener()
+        return True
 
     def _fire_capacity_listener(self) -> None:
         """Fire capacity_listener, if set, swallowing any exception.
@@ -516,14 +874,49 @@ class LoadDirector:
         else:
             device_key = device
 
-        thread = threading.Thread(
-            target=self._observed_peak_writeback,
-            args=(model_id, observed_peak_bytes, device_key),
-            daemon=True,
-            name=f"observed-peak-writeback-{model_id}",
-        )
-        thread.start()
-        return thread
+        key = (model_id, device_key)
+        with self._writeback_state_lock:
+            self._pending_writebacks[key] = max(
+                observed_peak_bytes,
+                self._pending_writebacks.get(key, 0),
+            )
+            thread = self._writeback_thread
+            if thread is not None and thread.is_alive():
+                return thread
+            try:
+                thread = threading.Thread(
+                    target=self._drain_observed_peak_writebacks,
+                    daemon=True,
+                    name="observed-peak-writeback",
+                )
+                self._writeback_thread = thread
+                thread.start()
+                return thread
+            except Exception:  # noqa: BLE001
+                self._writeback_thread = None
+                self._pending_writebacks.clear()
+                logger.warning(
+                    "could not start observed-peak writeback for %r",
+                    model_id,
+                    exc_info=True,
+                )
+                return None
+
+    def _drain_observed_peak_writebacks(self) -> None:
+        """Drain coalesced observations until no work remains."""
+        while True:
+            with self._writeback_state_lock:
+                if not self._pending_writebacks:
+                    self._writeback_thread = None
+                    return
+                pending = self._pending_writebacks
+                self._pending_writebacks = {}
+            for (model_id, device_key), observed_peak_bytes in pending.items():
+                self._observed_peak_writeback(
+                    model_id,
+                    observed_peak_bytes,
+                    device_key,
+                )
 
     @staticmethod
     def _observed_peak_writeback(
@@ -625,6 +1018,22 @@ class LoadDirector:
         (failure). _commit and _abort cover both cases.
         """
         with self.lock:
+            if model_id in self._blocked_models:
+                from muse.admin.operations import OperationError
+                raise OperationError(
+                    "model_disabled",
+                    f"model {model_id!r} is disabled",
+                    status=409,
+                    retryable=False,
+                )
+            if model_id in self.evicting:
+                from muse.admin.operations import OperationError
+                raise OperationError(
+                    "model_eviction_in_progress",
+                    f"model {model_id!r} is being unloaded",
+                    status=503,
+                    retryable=True,
+                )
             entry = self.loaded.get(model_id)
             if entry is not None:
                 if bump_refcount:
@@ -635,15 +1044,35 @@ class LoadDirector:
                 # and this read.
                 return ("hot", entry.worker_port)
 
-            if model_id in self.in_flight_loads:
-                return ("wait",)
+            existing_claim = self.in_flight_loads.get(model_id)
+            if existing_claim is not None:
+                return ("wait", existing_claim)
 
             # We're going to do this load. Decide whether it fits before
             # we claim the in-flight slot, so that if the answer is "no"
             # we don't strand an Event.
-            memory_gb = float(manifest.get("capabilities", {}).get("memory_gb", 0.0) or 0.0)
+            memory_gb = self._memory_requirement_gb(manifest, model_id)
             device = declared_device(manifest.get("capabilities"))
             pool = self._resolve_pool_device(device)
+
+            # Defense in depth for non-gateway callers (notably admin
+            # warmup) and models pulled after boot: never evict a working set
+            # for a model that cannot fit even an empty physical/configured
+            # pool. Older injected probes without total-capacity methods
+            # leave this verdict unknown and retain historical behavior.
+            hard_capacity_gb = self._hard_capacity_for_device(device)
+            if hard_capacity_gb is not None and memory_gb > hard_capacity_gb:
+                from muse.admin.operations import OperationError
+                raise OperationError(
+                    "model_too_large_for_device",
+                    (
+                        f"cannot fit {model_id!r} on {pool}: "
+                        f"{memory_gb:.2f} GB required exceeds "
+                        f"{hard_capacity_gb:.2f} GB capacity"
+                    ),
+                    status=503,
+                    retryable=False,
+                )
 
             _, available_gb = self._available_for_device(device)
             # Debit same-pool loads that are claimed but not yet resident.
@@ -677,11 +1106,63 @@ class LoadDirector:
             # Claim ownership of the load, reserving its memory + pool so
             # concurrent decisions see it, and bump the epoch so overlapping
             # loads can detect each other for the observed-peak gate.
-            self.in_flight_loads[model_id] = InFlightLoad(
-                event=threading.Event(), memory_gb=memory_gb, pool=pool,
+            claim = InFlightLoad(
+                event=threading.Event(),
+                memory_gb=memory_gb,
+                pool=pool,
+                owner_thread=threading.current_thread(),
             )
+            self.in_flight_loads[model_id] = claim
             self._inflight_epoch += 1
-            return ("load",)
+            return ("load", claim)
+
+    def _wait_for_in_flight(
+        self, model_id: str, claim: InFlightLoad,
+    ) -> None:
+        """Wait once for an exact claim, then recover or fail explicitly.
+
+        A timeout must not simply re-enter ``_decide`` against the unchanged
+        record forever. An ownerless/dead-owner claim is removed with an
+        identity compare-and-swap; a still-live owner produces a retryable
+        timeout instead of spawning a duplicate worker behind its back.
+        """
+        if claim.event.wait(timeout=_INFLIGHT_WAIT_TIMEOUT_SECONDS):
+            return
+
+        try:
+            owner_alive = (
+                claim.owner_thread is not None
+                and claim.owner_thread.is_alive() is True
+            )
+        except Exception:  # noqa: BLE001
+            owner_alive = True
+
+        expired = (
+            time.monotonic() - claim.claimed_at
+            >= _INFLIGHT_WAIT_TIMEOUT_SECONDS
+        )
+        reclaimed = False
+        with self.lock:
+            current = self.in_flight_loads.get(model_id)
+            if current is not claim or claim.event.is_set():
+                return
+            if expired and not owner_alive:
+                self.in_flight_loads.pop(model_id, None)
+                reclaimed = True
+
+        if reclaimed:
+            claim.event.set()
+            self._fire_capacity_listener()
+            logger.warning("reclaimed abandoned in-flight load for %r", model_id)
+            return
+
+        from muse.admin.operations import OperationError
+        raise OperationError(
+            "model_load_timeout",
+            f"timed out waiting for the active load of {model_id!r}",
+            status=503,
+            retryable=True,
+        )
 
     def _get_in_flight_event(self, model_id: str) -> threading.Event | None:
         """Read the current in-flight Event under the lock.
@@ -707,7 +1188,12 @@ class LoadDirector:
         )
 
     def _load_and_commit(
-        self, model_id: str, *, manifest: dict, initial_refcount: int = 1,
+        self,
+        model_id: str,
+        *,
+        manifest: dict,
+        claim: InFlightLoad,
+        initial_refcount: int = 1,
     ) -> int:
         """Run the load phase outside the lock, then commit.
 
@@ -724,26 +1210,169 @@ class LoadDirector:
         OFF the request hot path so the caller is unaffected by catalog
         IO latency or filesystem failures.
         """
-        memory_gb = float(manifest.get("capabilities", {}).get("memory_gb", 0.0) or 0.0)
         device = declared_device(manifest.get("capabilities"))
 
-        with self.lock:
-            free_before_gb = self._free_for_device(device)
-            # Snapshot in-flight state to detect whether ANOTHER load overlaps
-            # our free_before .. free_after window. Our own slot is already in
-            # in_flight_loads (claimed in _decide), so len==1 means we are the
-            # only load right now. epoch catches a load that is claimed AND
-            # released entirely within our window (len would read 1 at both
-            # endpoints yet the delta is still polluted).
-            solo_at_start = len(self.in_flight_loads) == 1
-            epoch_before = self._inflight_epoch
+        try:
+            with self.lock:
+                current_claim = self.in_flight_loads.get(model_id)
+                if current_claim is not claim:
+                    from muse.admin.operations import OperationError
+                    raise OperationError(
+                        "model_load_claim_lost",
+                        f"load ownership for {model_id!r} expired before startup",
+                        status=503,
+                        retryable=True,
+                    )
+                memory_gb = claim.memory_gb
+                free_before_gb = self._free_for_device(device)
+                # Snapshot in-flight state to detect whether ANOTHER load
+                # overlaps our observation window. The epoch also catches a
+                # load claimed and released entirely within that window.
+                solo_at_start = len(self.in_flight_loads) == 1
+                epoch_before = self._inflight_epoch
+        except BaseException as exc:
+            self._abort(model_id, expected=claim)
+            from muse.admin.operations import OperationError
+            if isinstance(exc, Exception) and not isinstance(exc, OperationError):
+                raise OperationError(
+                    "model_load_failed",
+                    f"worker for {model_id!r} failed to load: {exc}",
+                    status=503,
+                ) from exc
+            raise
         load_start = time.monotonic()
+        enabled = False
         try:
             worker_port = self.enable_fn(model_id)
+            enabled = True
+            if (
+                type(worker_port) is not int
+                or worker_port < 1
+                or worker_port > 65535
+            ):
+                raise RuntimeError(
+                    f"enable callback returned invalid worker port {worker_port!r}"
+                )
+
+            # This probe is passive observation, not a prerequisite for using
+            # a worker that enable_fn already proved ready. A transient NVML /
+            # psutil failure must not turn success into a leaked failed load.
+            try:
+                free_after_gb: float | None = self._free_for_device(device)
+            except Exception as exc:  # noqa: BLE001
+                free_after_gb = None
+                logger.warning(
+                    "post-load memory observation failed for %r: %s",
+                    model_id,
+                    exc,
+                )
+
+            with self.lock:
+                if self.in_flight_loads.get(model_id) is not claim:
+                    from muse.admin.operations import OperationError
+                    raise OperationError(
+                        "model_load_claim_lost",
+                        f"load ownership for {model_id!r} expired during startup",
+                        status=503,
+                        retryable=True,
+                    )
+
+                now = time.monotonic()
+                entry = LoadEntry(
+                    model_id=model_id,
+                    worker_port=worker_port,
+                    memory_gb=memory_gb,
+                    refcount=initial_refcount,
+                    last_touched_at=now,
+                    loaded_at=now,
+                    pool=claim.pool,
+                )
+                self.loaded[model_id] = entry
+
+                self.recent_decisions.append(DecisionLogEntry(
+                    timestamp=time.time(),
+                    model_id=model_id,
+                    action="load",
+                    memory_gb=memory_gb,
+                    free_before_gb=free_before_gb,
+                    free_after_gb=free_after_gb,
+                    reason="fit",
+                    evicted=[],
+                ))
+
+                try:
+                    record(
+                        "model_load",
+                        model_id=model_id,
+                        pool=claim.pool,
+                        gb=memory_gb,
+                        cold_load_seconds=(time.monotonic() - load_start),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+                solo_at_end = len(self.in_flight_loads) == 1
+                epoch_after = self._inflight_epoch
+                rec = self.in_flight_loads.pop(model_id, None)
         except BaseException as e:
+            # If startup returned successfully but validation/commit failed,
+            # keep the exact claim reserved while disabling the worker. This
+            # prevents a waiter from enabling a replacement during rollback.
+            rollback_error: BaseException | None = None
+            if enabled:
+                try:
+                    self.disable_fn(model_id)
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    rollback_error = cleanup_error
+                    logger.error(
+                        "failed to roll back enabled worker for %r",
+                        model_id,
+                        exc_info=True,
+                    )
+            with self.lock:
+                loaded = self.loaded.get(model_id)
+                if rollback_error is None:
+                    if loaded is not None and loaded.worker_port == locals().get(
+                        "worker_port"
+                    ):
+                        self.loaded.pop(model_id, None)
+                else:
+                    # Teardown did not prove the worker is gone. Keep its
+                    # declared memory resident and block routing until an
+                    # explicit disable retries cleanup. Port 0 is a deliberate
+                    # non-routable placeholder when enable_fn returned an
+                    # invalid value before commit.
+                    rollback_port = locals().get("worker_port")
+                    if (
+                        type(rollback_port) is not int
+                        or rollback_port < 1
+                        or rollback_port > 65535
+                    ):
+                        rollback_port = 0
+                    now = time.monotonic()
+                    if loaded is None:
+                        loaded = LoadEntry(
+                            model_id=model_id,
+                            worker_port=rollback_port,
+                            memory_gb=memory_gb,
+                            refcount=0,
+                            last_touched_at=now,
+                            loaded_at=now,
+                            pool=claim.pool,
+                        )
+                        self.loaded[model_id] = loaded
+                    else:
+                        loaded.refcount = 0
+                    self._blocked_models.add(model_id)
+                    self._failed_rollbacks.add(model_id)
             # Cleanup: pop the Event, set it so waiters wake (they will
-            # find no LoadEntry and become the new winner), then surface.
-            self._abort(model_id)
+            # re-decide against either no entry or the fail-closed block),
+            # then surface.
+            self._abort(model_id, expected=claim)
+            if rollback_error is not None and not isinstance(
+                rollback_error, Exception
+            ):
+                raise rollback_error
             # Translate unexpected load failures (worker spawn OOM, venv
             # missing, health-poll timeout) into OperationError(503) so
             # the gateway and admin callers return an OpenAI-shaped
@@ -760,53 +1389,6 @@ class LoadDirector:
                     status=503,
                 ) from e
             raise
-
-        free_after_gb = self._free_for_device(device)
-
-        with self.lock:
-            now = time.monotonic()
-            entry = LoadEntry(
-                model_id=model_id,
-                worker_port=worker_port,
-                memory_gb=memory_gb,
-                refcount=initial_refcount,
-                last_touched_at=now,
-                loaded_at=now,
-            )
-            self.loaded[model_id] = entry
-
-            self.recent_decisions.append(DecisionLogEntry(
-                timestamp=time.time(),
-                model_id=model_id,
-                action="load",
-                memory_gb=memory_gb,
-                free_before_gb=free_before_gb,
-                free_after_gb=free_after_gb,
-                reason="fit",
-                evicted=[],
-            ))
-
-            # Task 9: fire-and-forget telemetry event for this cold load.
-            # Guarded by a local try/except so an unexpected failure here
-            # (e.g. a broken monkeypatch in a test, or _resolve_pool_device
-            # raising) can never break a real model load; `record` itself
-            # already swallows a full queue internally.
-            try:
-                record(
-                    "model_load",
-                    model_id=model_id,
-                    pool=self._resolve_pool_device(device),
-                    gb=memory_gb,
-                    cold_load_seconds=(time.monotonic() - load_start),
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
-            # Read the overlap snapshot BEFORE popping our own slot: len==1
-            # here means we are still the only in-flight load.
-            solo_at_end = len(self.in_flight_loads) == 1
-            epoch_after = self._inflight_epoch
-            rec = self.in_flight_loads.pop(model_id, None)
 
         # Our load is "solo" (no overlapping load polluting the free-memory
         # delta) iff we were the only in-flight load at BOTH endpoints and no
@@ -831,17 +1413,26 @@ class LoadDirector:
         # permanently inflate this model's recorded peak. Skipping just loses
         # one self-heal opportunity, exactly when it cannot be measured
         # cleanly. observed_peak swallows non-positive values internally.
-        if solo_load:
+        if solo_load and free_after_gb is not None:
             observed_bytes = int((free_before_gb - free_after_gb) * 1024**3)
-            self.observed_peak(
-                model_id,
-                observed_peak_bytes=observed_bytes,
-                device=device,
-            )
+            try:
+                self.observed_peak(
+                    model_id,
+                    observed_peak_bytes=observed_bytes,
+                    device=device,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "could not schedule observed-peak writeback for %r",
+                    model_id,
+                    exc_info=True,
+                )
 
         return worker_port
 
-    def _abort(self, model_id: str) -> None:
+    def _abort(
+        self, model_id: str, *, expected: InFlightLoad | None = None,
+    ) -> None:
         """Clean up after a failed load: drop + signal the Event.
 
         Called from the exception handler in _load_and_commit. After
@@ -851,7 +1442,11 @@ class LoadDirector:
         the new singleton winner.
         """
         with self.lock:
-            rec = self.in_flight_loads.pop(model_id, None)
+            current = self.in_flight_loads.get(model_id)
+            if expected is not None and current is not expected:
+                rec = None
+            else:
+                rec = self.in_flight_loads.pop(model_id, None)
         if rec is not None:
             rec.event.set()
         # v0.57.1: an aborted load frees its reservation -- capacity may
@@ -863,6 +1458,24 @@ class LoadDirector:
     # ------------------------------------------------------------------
 
     def _evict_lru_until_fits(
+        self,
+        *,
+        model_id: str,
+        shortfall_gb: float,
+        device: str,
+        required_gb: float = 0.0,
+    ) -> None:
+        """Serialize pressure eviction within the target memory pool."""
+        target_pool = self._resolve_pool_device(device)
+        with self._eviction_pool_locks[target_pool]:
+            self._evict_lru_until_fits_serialized(
+                model_id=model_id,
+                shortfall_gb=shortfall_gb,
+                device=device,
+                required_gb=required_gb,
+            )
+
+    def _evict_lru_until_fits_serialized(
         self,
         *,
         model_id: str,
@@ -910,13 +1523,32 @@ class LoadDirector:
         # acquire is welcome to retry the failed victim, since the
         # worker may have died on its own by then.
         failed_victims: set[str] = set()
+        target_pool = self._resolve_pool_device(device)
 
         while cumulative_freed_gb < shortfall_gb:
+            # Capacity may have changed since _decide computed the original
+            # shortfall (another eviction completed, an external allocation
+            # ended, or a previous victim in this loop freed a budget slot).
+            # Re-check before selecting another victim so we never evict a
+            # healthy idle worker after the incoming model already fits.
+            with self.lock:
+                _, current_available_gb = self._available_for_device(device)
+                current_reserved_gb = self._reserved_for_pool(
+                    target_pool, exclude=model_id,
+                )
+                fits_before_victim = (
+                    current_available_gb - current_reserved_gb >= required_gb
+                )
+            if fits_before_victim:
+                self._fire_capacity_listener()
+                return
+
             # fits_now is set inside the lock below only on the "the model
             # fits again without evicting anything further" path; checked
             # right after the lock releases so the capacity_listener fire
             # (which must never run under self.lock) happens outside it.
             fits_now = False
+            capacity_failure: BaseException | None = None
             # ---- under-lock: pick + pop a victim ----
             with self.lock:
                 # Re-snapshot every iteration: another thread may have
@@ -924,13 +1556,13 @@ class LoadDirector:
                 # evictable.
                 candidates = [
                     e for e in self.loaded.values()
-                    if e.refcount == 0 and e.model_id not in failed_victims
+                    if (
+                        e.pool == target_pool
+                        and e.refcount == 0
+                        and e.model_id not in failed_victims
+                    )
                 ]
                 if not candidates:
-                    # Pop the in-flight Event for the requested model in
-                    # case anything stranded one (defensive: the current
-                    # _decide path doesn't, but a future path might).
-                    self.in_flight_loads.pop(model_id, None)
                     # Re-check live fit before giving up: a concurrent
                     # acquire's eviction (or external memory release) may
                     # have freed enough since our shortfall was computed.
@@ -946,19 +1578,16 @@ class LoadDirector:
                     # can't fit gets the clean 503.
                     _, available_gb = self._available_for_device(device)
                     reserved_gb = self._reserved_for_pool(
-                        self._resolve_pool_device(device), exclude=model_id,
+                        target_pool, exclude=model_id,
                     )
                     if (available_gb - reserved_gb) >= required_gb:
                         fits_now = True
                     else:
-                        # Spec 2026-07-08: if ANY loaded model is currently
-                        # in-use (refcount > 0), capacity may free once its
-                        # request finishes -- worth the gateway parking and
-                        # retrying instead of surfacing a hard 503. The
-                        # loaded set is not pool-partitioned per-entry, so
-                        # this is the simpler (single-pool-exact,
-                        # mixed-pool-conservative) form rather than
-                        # filtering by device/pool.
+                        # Spec 2026-07-08: if a same-pool loaded model is
+                        # currently in-use (refcount > 0), capacity may free
+                        # once its request finishes -- worth the gateway
+                        # parking and retrying instead of surfacing a hard
+                        # 503.
                         # v0.57.1 (stress-test finding): a capacity 503
                         # is ALSO transient when OTHER cold loads are in
                         # flight -- their reservations made the fit fail,
@@ -972,30 +1601,32 @@ class LoadDirector:
                         # is the third transient state -- its VRAM frees
                         # when disable_fn completes, so the failure is
                         # worth parking on too.
-                        any_inuse = (
-                            any(e.refcount > 0 for e in self.loaded.values())
-                            or any(k != model_id for k in self.in_flight_loads)
-                            or bool(self.evicting)
+                        evicting_in_pool = any(
+                            self._evicting_pools.get(mid, target_pool)
+                            == target_pool
+                            for mid in self.evicting
                         )
-                        # v0.57.3 (review finding): earlier victims in THIS
-                        # call may have already freed memory; that is a
-                        # capacity event for OTHER parked models even though
-                        # this request still fails. Fire so they re-decide
-                        # instead of sleeping to their deadline. Safe under
-                        # the lock: the listener only schedules threadsafe.
-                        if cumulative_freed_gb > 0.0:
-                            self._fire_capacity_listener()
+                        any_inuse = (
+                            any(
+                                e.pool == target_pool and e.refcount > 0
+                                for e in self.loaded.values()
+                            )
+                            or any(
+                                k != model_id and rec.pool == target_pool
+                                for k, rec in self.in_flight_loads.items()
+                            )
+                            or evicting_in_pool
+                        )
                         # Lazy import to avoid a cycle: load_director ->
                         # admin.operations -> supervisor -> load_director
                         # (Task E will wire the supervisor to LoadDirector).
                         from muse.admin.operations import OperationError
-                        raise OperationError(
+                        capacity_failure = OperationError(
                             "model_too_large_for_device",
                             (
                                 f"cannot fit {model_id!r} on {device}: "
                                 f"shortfall {shortfall_gb:.2f} GB; "
-                                f"no evictable candidates remain "
-                                f"(all loaded models have refcount > 0)"
+                                f"no evictable {target_pool} candidates remain"
                             ),
                             status=503,
                             retryable=any_inuse,
@@ -1006,6 +1637,12 @@ class LoadDirector:
                     victim = candidates[0]
                     victim_id = victim.model_id
                     victim_memory_gb = victim.memory_gb
+
+                    # Capture before removing the accounting entry. Live
+                    # probes are unchanged by this ordering, while a static
+                    # budget correctly observes the victim's declared memory
+                    # becoming available after the pop.
+                    free_before_gb = self._free_for_device(device)
 
                     # Pop from loaded so other threads see the eviction
                     # commitment immediately. If disable_fn raises, the
@@ -1018,14 +1655,14 @@ class LoadDirector:
                     # this eviction completes) instead of mass-503ing while
                     # the director looks idle (v0.57.2 stress finding).
                     self.evicting.add(victim_id)
+                    self._evicting_pools[victim_id] = target_pool
+                    self._evicting_memory_gb[victim_id] = victim_memory_gb
                     # Bump the epoch: an eviction frees VRAM, which pollutes any
                     # concurrent load's free_before..free_after delta just like a
                     # concurrent load does. Counting it here lets _load_and_commit's
                     # solo gate skip that load's observed-peak writeback instead of
                     # recording an under-estimate.
                     self._inflight_epoch += 1
-
-                    free_before_gb = self._free_for_device(device)
 
                     decision = DecisionLogEntry(
                         timestamp=time.time(),
@@ -1053,6 +1690,14 @@ class LoadDirector:
                         pass
 
             # ---- lock released ----
+            if capacity_failure is not None:
+                # Earlier victims in THIS call may have freed memory; notify
+                # other parked requests before this request surfaces its own
+                # capacity error. Foreign callbacks must never run under the
+                # director lock.
+                if cumulative_freed_gb > 0.0:
+                    self._fire_capacity_listener()
+                raise capacity_failure
             if fits_now:
                 self._fire_capacity_listener()
                 return
@@ -1109,11 +1754,37 @@ class LoadDirector:
                     failed_victims.add(victim_id)
                     disable_failed = True
                 else:
-                    freed_this_round = self._wait_for_memory_release(
-                        min_freed_gb=victim_memory_gb,
-                        free_at_eviction_start_gb=free_before_gb,
-                        device=device,
-                    )
+                    # The shutdown owner has settled, so configured-budget
+                    # bookkeeping may now release the victim. Keep the
+                    # `evicting` marker itself until the whole iteration
+                    # settles so concurrent failures remain retryable while
+                    # a live driver counter catches up.
+                    with self.lock:
+                        self._evicting_memory_gb.pop(victim_id, None)
+                    # disable_fn returns only after the worker shutdown has
+                    # settled. If the model already fits (notably because a
+                    # configured working-set budget was the binding limit),
+                    # do not spend two seconds waiting for a noisy physical
+                    # free-memory counter to show the declared-size delta.
+                    with self.lock:
+                        _, available_after_shutdown = self._available_for_device(
+                            device,
+                        )
+                        reserved_after_shutdown = self._reserved_for_pool(
+                            target_pool, exclude=model_id,
+                        )
+                        fits_after_shutdown = (
+                            available_after_shutdown - reserved_after_shutdown
+                            >= required_gb
+                        )
+                    if fits_after_shutdown:
+                        freed_this_round = shortfall_gb - cumulative_freed_gb
+                    else:
+                        freed_this_round = self._wait_for_memory_release(
+                            min_freed_gb=victim_memory_gb,
+                            free_at_eviction_start_gb=free_before_gb,
+                            device=device,
+                        )
 
                     # ---- reacquire the lock briefly: writeback free_after ----
                     with self.lock:
@@ -1128,6 +1799,8 @@ class LoadDirector:
                 # marker must not outlive this iteration.
                 with self.lock:
                     self.evicting.discard(victim_id)
+                    self._evicting_pools.pop(victim_id, None)
+                    self._evicting_memory_gb.pop(victim_id, None)
             if disable_failed:
                 continue
 
@@ -1181,13 +1854,29 @@ class LoadDirector:
     def _auto_resolves_to_cuda(self) -> bool:
         """Whether a `device: "auto"` model binds to the GPU/VRAM pool here.
 
-        Mirrors the runtime's select_device("auto"): a CUDA GPU is visible
-        when pynvml reports a free-VRAM number (gpu_free_gb() is not None).
-        Shared by both the admission/eviction pool selection and the
-        observed-peak bucket key so they can never disagree about where an
-        auto model lives.
+        Mirrors the runtime's select_device("auto"): a CUDA-compatible GPU
+        is visible when either NVML reports free VRAM or torch reports CUDA
+        availability. The latter includes ROCm, whose torch API is CUDA-
+        shaped even though NVML is unavailable.
         """
-        return self.memory_probe.gpu_free_gb() is not None
+        gpu_free = self.memory_probe.gpu_free_gb()
+        if gpu_free is not None:
+            return True
+        return resolve_memory_pool(
+            "auto",
+            gpu_free_gb=gpu_free,
+            cuda_available=self._cuda_runtime_available(),
+        ) == "cuda"
+
+    def _cuda_runtime_available(self) -> bool:
+        """Call the injected runtime detector without trusting loose mocks."""
+        if self.cuda_available_fn is None:
+            return False
+        try:
+            return bool(self.cuda_available_fn())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("CUDA runtime availability check failed: %s", exc)
+            return False
 
     def _resolve_pool_device(self, device: str) -> str:
         """Map a declared device to the concrete memory POOL it draws from.
@@ -1209,44 +1898,130 @@ class LoadDirector:
         against host RAM here but keeps its own "mps" bucket in
         _record_observed_peak (matching what `muse models probe` writes).
         """
-        if device in ("cuda", "gpu"):
-            return "cuda"
-        if device in ("auto", ""):
-            return "cuda" if self._auto_resolves_to_cuda() else "cpu"
-        # mps and anything else account against host RAM.
-        return "cpu"
+        normalized = str(device or "auto").lower()
+        if normalized not in ("auto", ""):
+            return resolve_memory_pool(
+                normalized, gpu_free_gb=None, cuda_available=False,
+            )
+        return "cuda" if self._auto_resolves_to_cuda() else "cpu"
+
+    def _resident_for_pool(self, pool: str) -> float:
+        """Accounted resident or shutting-down memory for a budget pool."""
+        with self.lock:
+            resident_gb = sum(
+                entry.memory_gb
+                for entry in self.loaded.values()
+                if entry.pool == pool
+            )
+            evicting_gb = sum(
+                self._evicting_memory_gb.get(model_id, 0.0)
+                for model_id, evicting_pool in self._evicting_pools.items()
+                if evicting_pool == pool
+            )
+            return resident_gb + evicting_gb
+
+    def _optional_total_gb(self, pool: str) -> float | None:
+        """Read an optional physical-capacity method from the probe.
+
+        Descriptor inspection avoids treating ``MagicMock``'s fabricated
+        child attributes as real probe APIs. Invalid optional values mean
+        "unknown" rather than becoming an accidental zero-capacity stamp.
+        """
+        method_name = "gpu_total_gb" if pool == "cuda" else "cpu_total_gb"
+        descriptor = getattr(type(self.memory_probe), method_name, None)
+        if not callable(descriptor):
+            return None
+        method = getattr(self.memory_probe, method_name, None)
+        if not callable(method):
+            return None
+        try:
+            value = method()
+            if value is None or isinstance(value, bool):
+                return None
+            result = float(value)
+            if not math.isfinite(result) or result < 0.0:
+                return None
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("optional %s probe failed: %s", method_name, exc)
+            return None
+
+    def _hard_capacity_for_device(self, device: str) -> float | None:
+        """Empty-working-set capacity after configured headroom.
+
+        Unlike admission, this uses physical total capacity (when the probe
+        exposes it) and never current free memory. A configured budget caps
+        that ceiling and also serves as the static fallback.
+        """
+        pool = self._resolve_pool_device(device)
+        total_gb = self._optional_total_gb(pool)
+        if pool == "cuda":
+            budget_gb = self.gpu_budget_gb
+            headroom_gb = self.gpu_headroom_gb
+        else:
+            budget_gb = self.cpu_budget_gb
+            headroom_gb = self.cpu_headroom_gb
+        if total_gb is None and budget_gb is None:
+            return None
+        ceiling_gb = (
+            float(budget_gb)
+            if total_gb is None
+            else total_gb
+            if budget_gb is None
+            else min(total_gb, float(budget_gb))
+        )
+        return max(0.0, ceiling_gb - float(headroom_gb))
 
     def _free_for_device(self, device: str) -> float:
         """Live free memory in GB for the relevant device.
 
-        For CPU: cpu_free_gb. For CUDA: gpu_free_gb (which may return
-        None if pynvml is unavailable; caller treats None as 0.0 so we
-        don't accidentally classify GPU loads as fitting under unknown
-        conditions). "auto"/"" resolve to the pool the model actually
-        loads on (see _resolve_pool_device).
+        For CPU, use live host RAM. For CUDA, prefer live NVML free VRAM.
+        If NVML is unavailable and a GPU budget is configured, treat that
+        budget as total capacity and debit director-owned resident models.
+        Without either source, return zero so unknown explicit GPU loads do
+        not fit accidentally.
         """
-        if self._resolve_pool_device(device) == "cuda":
+        pool = self._resolve_pool_device(device)
+        if pool == "cuda":
             free = self.memory_probe.gpu_free_gb()
-            return float(free) if free is not None else 0.0
+            if free is not None:
+                return float(free)
+            if self.gpu_budget_gb is None:
+                return 0.0
+            return max(
+                0.0,
+                float(self.gpu_budget_gb) - self._resident_for_pool(pool),
+            )
         return float(self.memory_probe.cpu_free_gb())
 
     def _available_for_device(self, device: str) -> tuple[float, float]:
         """Return (free_before_gb, available_gb).
 
-        available_gb = min(free, declared_budget) - headroom. Negative
-        values are clamped to 0 so a request for a 0-byte model on a
-        completely-loaded host still gets a sane fit-check.
+        available_gb = min(live_free, remaining_budget) - headroom. A
+        configured budget is a total Muse working-set cap, so same-pool
+        residents are debited before admission; in-flight reservations are
+        debited by the decision caller. Negative values are clamped to 0.
         """
         free = self._free_for_device(device)
-        if self._resolve_pool_device(device) == "cuda":
+        pool = self._resolve_pool_device(device)
+        if pool == "cuda":
             budget = self.gpu_budget_gb
             headroom = self.gpu_headroom_gb
         else:
             budget = self.cpu_budget_gb
             headroom = self.cpu_headroom_gb
 
-        usable = free if budget is None else min(free, budget)
-        available = usable - headroom
-        if available < 0.0:
-            available = 0.0
-        return free, available
+        remaining_budget = None
+        if budget is not None:
+            remaining_budget = max(
+                0.0, float(budget) - self._resident_for_pool(pool),
+            )
+
+        available = available_capacity_gb(
+            live_free_gb=free,
+            budget_gb=remaining_budget,
+            headroom_gb=headroom,
+        )
+        # `_free_for_device` always returns a numeric conservative fallback,
+        # so the shared helper cannot return None here.
+        return free, float(available or 0.0)

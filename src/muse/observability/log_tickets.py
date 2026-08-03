@@ -25,8 +25,11 @@ import-light so it can be constructed without pulling in fastapi.
 from __future__ import annotations
 
 import secrets
+import math
 import threading
 import time
+
+DEFAULT_MAX_TICKETS = 4096
 
 
 class LogTicketStore:
@@ -38,16 +41,47 @@ class LogTicketStore:
     than running a background sweep thread.
     """
 
-    def __init__(self, ttl_seconds: float) -> None:
-        self._ttl_seconds = ttl_seconds
+    def __init__(
+        self,
+        ttl_seconds: float,
+        *,
+        max_tickets: int = DEFAULT_MAX_TICKETS,
+    ) -> None:
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(ttl_seconds)
+            or ttl_seconds < 0
+        ):
+            raise ValueError("ttl_seconds must be a finite non-negative number")
+        if (
+            isinstance(max_tickets, bool)
+            or not isinstance(max_tickets, int)
+            or max_tickets <= 0
+        ):
+            raise ValueError("max_tickets must be a positive integer")
+        self._ttl_seconds = float(ttl_seconds)
+        self._max_tickets = max_tickets
         self._tickets: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    def _prune_expired_locked(self, now: float) -> None:
+        expired = [t for t, expiry in self._tickets.items() if expiry <= now]
+        for ticket in expired:
+            del self._tickets[ticket]
 
     def mint(self) -> tuple[str, int]:
         """Create a new ticket. Returns (ticket, expires_in_seconds)."""
         ticket = secrets.token_urlsafe(32)
-        expiry = time.monotonic() + self._ttl_seconds
+        now = time.monotonic()
+        expiry = now + self._ttl_seconds
         with self._lock:
+            self._prune_expired_locked(now)
+            while len(self._tickets) >= self._max_tickets:
+                # Dicts preserve insertion order; discard the oldest ticket
+                # rather than allowing authenticated mint-only traffic to
+                # grow process memory without bound.
+                self._tickets.pop(next(iter(self._tickets)))
             self._tickets[ticket] = expiry
         return ticket, int(self._ttl_seconds)
 
@@ -66,9 +100,7 @@ class LogTicketStore:
             return False
         now = time.monotonic()
         with self._lock:
-            expired = [t for t, expiry in self._tickets.items() if expiry <= now]
-            for t in expired:
-                del self._tickets[t]
+            self._prune_expired_locked(now)
             expiry = self._tickets.get(ticket)
             if expiry is None:
                 return False

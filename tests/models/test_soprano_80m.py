@@ -67,6 +67,42 @@ def test_soprano_falls_back_to_hf_repo_when_no_local_dir():
         assert call_kwargs["model_path"] == "ekwek/Soprano-1.1-80M"
 
 
+def test_narro_forwards_selected_source_to_encoder_and_decoder():
+    """The managed source must not be swallowed by encoder ``**kwargs``."""
+    with (
+        patch(
+            "muse.modalities.audio_speech.backends.transformers.TransformersModel"
+        ) as mock_transformers,
+        patch("muse.modalities.audio_speech.decode_only.load_decoder") as mock_decoder,
+        patch("muse.modalities.audio_speech.tts.torch.set_num_threads"),
+        patch("muse.modalities.audio_speech.tts.torch.set_num_interop_threads"),
+        patch("muse.modalities.audio_speech.tts.torch.set_float32_matmul_precision"),
+    ):
+        mock_decoder.return_value.parameters.return_value = iter(())
+
+        from muse.modalities.audio_speech.tts import Narro
+
+        Narro(
+            model_path="/managed/soprano-snapshot",
+            compile=False,
+            quantize=False,
+            num_threads=1,
+            device="cpu",
+        )
+
+    mock_transformers.assert_called_once_with(
+        local_dir="/managed/soprano-snapshot",
+        compile=False,
+        quantize=False,
+        device="cpu",
+    )
+    mock_decoder.assert_called_once_with(
+        model_path="/managed/soprano-snapshot",
+        compile=False,
+        device="cpu",
+    )
+
+
 def test_manifest_has_required_fields():
     from muse.models.soprano_80m import MANIFEST
     assert MANIFEST["model_id"] == "soprano-80m"

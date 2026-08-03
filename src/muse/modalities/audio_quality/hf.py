@@ -13,7 +13,12 @@ from typing import Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, ResolverError, SearchResult
+from muse.core.resolvers import (
+    ResolvedModel,
+    ResolverError,
+    SearchResult,
+    hf_commit_revision,
+)
 
 
 _UTMOS_RUNTIME = "muse.modalities.audio_quality.runtimes.utmos:UTMOSRuntime"
@@ -121,6 +126,7 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         raise ResolverError(
             f"unsupported audio-quality checkpoint shape for {repo_id!r}"
         )
+    revision = hf_commit_revision(info)
     manifest = {
         "model_id": _model_id(repo_id),
         "modality": "audio/quality",
@@ -138,12 +144,15 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             "supports_reference_text": False,
         },
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         return Path(snapshot_download(
             repo_id=repo_id,
             allow_patterns=list(family.allow_patterns),
             cache_dir=str(cache_root) if cache_root else None,
+            revision=revision,
         ))
 
     return ResolvedModel(

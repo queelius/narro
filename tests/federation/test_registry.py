@@ -1,5 +1,35 @@
+import asyncio
+
+import httpx
+
 from muse.federation.nodes import NodeSpec
-from muse.federation.registry import NodeRegistry
+from muse.federation.registry import NodeRegistry, _get_json
+
+
+async def test_get_json_rejects_declared_oversized_body(monkeypatch):
+    monkeypatch.setattr("muse.federation.registry._MAX_FETCH_BODY_BYTES", 8)
+
+    async def handler(_request):
+        return httpx.Response(200, content=b'{"data": []}')
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert await _get_json(client, "http://node/v1/models") is None
+
+
+async def test_get_json_parses_body_within_limit(monkeypatch):
+    monkeypatch.setattr("muse.federation.registry._MAX_FETCH_BODY_BYTES", 64)
+
+    async def handler(_request):
+        return httpx.Response(200, json={"status": "ok"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert await _get_json(client, "http://node/health") == {
+            "status": "ok",
+        }
 
 
 async def test_refresh_once_builds_snapshot():
@@ -96,3 +126,176 @@ def test_injected_fetch_is_used_as_is():
 def test_federation_poll_timeout_config_default():
     from muse.core import config
     assert config.get("federation.poll_timeout_seconds") == 10.0
+
+
+async def test_start_is_idempotent_and_close_releases_the_only_task():
+    calls = 0
+    fetched = asyncio.Event()
+
+    async def fake_fetch(url, token):
+        nonlocal calls
+        calls += 1
+        fetched.set()
+        return ({"data": []}, {"status": "ok"}, None)
+
+    reg = NodeRegistry(
+        [NodeSpec(url="http://a:8000", name="a")],
+        refresh_interval=999,
+        fetch=fake_fetch,
+    )
+
+    assert reg.start() is True
+    first = reg._task
+    assert first is not None
+    assert reg.start() is True
+    assert reg._task is first
+    await asyncio.wait_for(fetched.wait(), timeout=1)
+
+    await reg.aclose()
+
+    assert calls == 1
+    assert first.done()
+    assert reg._task is None
+
+
+async def test_start_returns_false_while_close_is_in_progress():
+    reg = NodeRegistry(
+        [NodeSpec(url="http://a:8000", name="a")],
+        refresh_interval=999,
+        fetch=lambda *_args: None,
+    )
+    cancelling = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_cancel() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            await release.wait()
+            raise
+
+    owned_task = asyncio.create_task(slow_cancel())
+    reg._task = owned_task
+
+    close_task = asyncio.create_task(reg.aclose())
+    await cancelling.wait()
+
+    assert reg._closing is True
+    assert reg.start() is False
+
+    release.set()
+    await close_task
+    assert owned_task.done()
+    assert reg._task is None
+
+
+async def test_concurrent_close_callers_wait_for_same_teardown():
+    reg = NodeRegistry(
+        [NodeSpec(url="http://a:8000", name="a")],
+        refresh_interval=999,
+        fetch=lambda *_args: None,
+    )
+    cancelling = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_cancel() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            await release.wait()
+            raise
+
+    owned_task = asyncio.create_task(slow_cancel())
+    reg._task = owned_task
+
+    first = asyncio.create_task(reg.aclose())
+    await cancelling.wait()
+    shared_close = reg._close_task
+    second = asyncio.create_task(reg.aclose())
+    await asyncio.sleep(0)
+
+    assert shared_close is not None
+    assert reg._close_task is shared_close
+    assert not first.done()
+    assert not second.done()
+
+    release.set()
+    await asyncio.gather(first, second)
+    assert owned_task.done()
+    assert reg._task is None
+    assert reg._close_task is None
+    assert reg._closing is False
+
+
+async def test_cancelled_close_waiter_does_not_cancel_shared_teardown():
+    reg = NodeRegistry(
+        [NodeSpec(url="http://a:8000", name="a")],
+        refresh_interval=999,
+        fetch=lambda *_args: None,
+    )
+    cancelling = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_cancel() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            await release.wait()
+            raise
+
+    owned_task = asyncio.create_task(slow_cancel())
+    reg._task = owned_task
+    cancelled_waiter = asyncio.create_task(reg.aclose())
+    await cancelling.wait()
+    surviving_waiter = asyncio.create_task(reg.aclose())
+    await asyncio.sleep(0)
+
+    cancelled_waiter.cancel("caller stopped waiting")
+    result = await asyncio.gather(cancelled_waiter, return_exceptions=True)
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert reg._closing is True
+    assert reg._close_task is not None
+    assert not surviving_waiter.done()
+
+    release.set()
+    await surviving_waiter
+    assert owned_task.done()
+    assert reg._task is None
+    assert reg._close_task is None
+    assert reg._closing is False
+
+
+async def test_close_failure_reaches_every_waiter_and_resets_lifecycle_state():
+    reg = NodeRegistry(
+        [NodeSpec(url="http://a:8000", name="a")],
+        refresh_interval=999,
+        fetch=lambda *_args: None,
+    )
+    cancelling = asyncio.Event()
+    release = asyncio.Event()
+    failure = RuntimeError("refresh teardown failed")
+
+    async def failed_cancel() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            await release.wait()
+            raise failure
+
+    owned_task = asyncio.create_task(failed_cancel())
+    reg._task = owned_task
+    first = asyncio.create_task(reg.aclose())
+    await cancelling.wait()
+    second = asyncio.create_task(reg.aclose())
+    await asyncio.sleep(0)
+
+    release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert results == [failure, failure]
+    assert reg._task is None
+    assert reg._close_task is None
+    assert reg._closing is False

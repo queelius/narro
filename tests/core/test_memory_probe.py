@@ -1,9 +1,11 @@
 """MemoryProbe: pynvml + psutil wrappers, mocked-dep tests.
 
-The module exposes three pure functions:
+The module exposes capacity and availability probes:
 
 - ``gpu_free_gb(device_id) -> float | None``
+- ``gpu_total_gb(device_id) -> float | None``
 - ``cpu_free_gb() -> float``
+- ``cpu_total_gb() -> float``
 - ``init_pynvml() -> bool`` (idempotent)
 
 ``pynvml`` is a soft dep, kept behind a deferred-import sentinel so muse
@@ -13,6 +15,7 @@ CI). Tests patch the sentinels directly, mirroring the pattern used by
 """
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -52,6 +55,16 @@ def test_cpu_free_gb_uses_psutil_virtual_memory():
     # module directly.
     with patch("psutil.virtual_memory", return_value=fake_vm):
         assert mod.cpu_free_gb() == pytest.approx(8.0)
+
+
+def test_cpu_total_gb_uses_physical_total_not_available():
+    """Permanent fit uses physical capacity, not transient free RAM."""
+    import muse.core.memory_probe as mod
+    fake_vm = MagicMock()
+    fake_vm.available = 3 * (1024 ** 3)
+    fake_vm.total = 16 * (1024 ** 3)
+    with patch("psutil.virtual_memory", return_value=fake_vm):
+        assert mod.cpu_total_gb() == pytest.approx(16.0)
 
 
 # ---------- init_pynvml ----------------------------------------------------
@@ -111,6 +124,49 @@ def test_init_pynvml_is_idempotent_on_failure():
     assert fake_pynvml.nvmlInit.call_count == 1
 
 
+def test_init_pynvml_waits_for_concurrent_initialization_to_publish():
+    """A second caller must not observe the initial false sentinel state."""
+    import muse.core.memory_probe as mod
+
+    started = threading.Event()
+    release = threading.Event()
+    second_started = threading.Event()
+    second_done = threading.Event()
+    results: list[bool] = []
+    fake_pynvml = MagicMock()
+
+    def blocking_init():
+        started.set()
+        assert release.wait(timeout=1.0)
+
+    fake_pynvml.nvmlInit.side_effect = blocking_init
+
+    def initialize(*, second: bool = False):
+        if second:
+            second_started.set()
+        results.append(mod.init_pynvml())
+        if second:
+            second_done.set()
+
+    with patch.dict("sys.modules", {"pynvml": fake_pynvml}):
+        first = threading.Thread(target=initialize)
+        second = threading.Thread(target=initialize, kwargs={"second": True})
+        first.start()
+        assert started.wait(timeout=1.0)
+        second.start()
+        assert second_started.wait(timeout=1.0)
+        assert not second_done.wait(timeout=0.02)
+        release.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == [True, True]
+    assert fake_pynvml.nvmlInit.call_count == 1
+    assert mod.pynvml is fake_pynvml
+
+
 # ---------- gpu_free_gb ----------------------------------------------------
 
 def test_gpu_free_gb_returns_float_when_pynvml_available():
@@ -129,6 +185,25 @@ def test_gpu_free_gb_returns_float_when_pynvml_available():
 
     free = mod.gpu_free_gb(0)
     assert free == pytest.approx(4.0)
+    fake_pynvml.nvmlDeviceGetHandleByIndex.assert_called_once_with(0)
+    fake_pynvml.nvmlDeviceGetMemoryInfo.assert_called_once_with(handle)
+
+
+def test_gpu_total_gb_uses_physical_total_not_free():
+    """Permanent fit must not hard-stamp a model merely because VRAM is busy."""
+    import muse.core.memory_probe as mod
+    fake_pynvml = MagicMock()
+    handle = MagicMock()
+    fake_pynvml.nvmlDeviceGetHandleByIndex.return_value = handle
+    mem_info = MagicMock()
+    mem_info.free = 2 * (1024 ** 3)
+    mem_info.total = 12 * (1024 ** 3)
+    fake_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem_info
+    mod.pynvml = fake_pynvml
+    mod._init_attempted = True
+    mod._init_ok = True
+
+    assert mod.gpu_total_gb(0) == pytest.approx(12.0)
     fake_pynvml.nvmlDeviceGetHandleByIndex.assert_called_once_with(0)
     fake_pynvml.nvmlDeviceGetMemoryInfo.assert_called_once_with(handle)
 
@@ -183,3 +258,42 @@ def test_gpu_free_gb_default_device_id_is_zero():
     import muse.core.memory_probe as mod
     sig = inspect.signature(mod.gpu_free_gb)
     assert sig.parameters["device_id"].default == 0
+
+
+# ---------- shared capacity policy ----------------------------------------
+
+def test_cuda_runtime_available_accepts_rocm_torch_cuda_shape():
+    """ROCm deliberately exposes its devices through torch.cuda."""
+    from types import SimpleNamespace
+    import muse.core.memory_probe as mod
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True),
+        version=SimpleNamespace(hip="6.2"),
+    )
+    assert mod.cuda_runtime_available(fake_torch) is True
+
+
+def test_resolve_auto_pool_uses_cuda_runtime_without_nvml():
+    import muse.core.memory_probe as mod
+
+    assert mod.resolve_memory_pool(
+        "auto", gpu_free_gb=None, cuda_available=True,
+    ) == "cuda"
+
+
+def test_available_capacity_uses_budget_when_live_measurement_missing():
+    import muse.core.memory_probe as mod
+
+    assert mod.available_capacity_gb(
+        live_free_gb=None, budget_gb=8.0, headroom_gb=1.0,
+    ) == 7.0
+
+
+def test_available_capacity_preserves_live_nvidia_precedence():
+    import muse.core.memory_probe as mod
+
+    # Live free is authoritative, with the budget acting only as a cap.
+    assert mod.available_capacity_gb(
+        live_free_gb=6.0, budget_gb=8.0, headroom_gb=1.0,
+    ) == 5.0

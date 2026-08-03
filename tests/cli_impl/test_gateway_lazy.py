@@ -29,6 +29,22 @@ from starlette.requests import ClientDisconnect
 
 from muse.cli_impl.gateway import build_gateway
 from muse.cli_impl.supervisor import SupervisorState
+
+
+@pytest.fixture(autouse=True)
+def _isolate_catalog(tmp_path, monkeypatch):
+    """Gateway unit tests must never read the operator's real catalog."""
+    from muse.core.catalog import (
+        _reset_known_models_cache,
+        _reset_read_catalog_cache,
+    )
+
+    monkeypatch.setenv("MUSE_CATALOG_DIR", str(tmp_path))
+    _reset_known_models_cache()
+    _reset_read_catalog_cache()
+    yield
+    _reset_known_models_cache()
+    _reset_read_catalog_cache()
 from muse.core.catalog import CatalogError
 
 
@@ -242,8 +258,9 @@ class TestAcquireRelease:
                 json={"input": "hi", "model": "fake-model"},
             )
 
-        # The forward raised; FastAPI surfaces 500.
-        assert r.status_code == 500
+        # The transport failure is normalized after release runs.
+        assert r.status_code == 502
+        assert r.json()["error"]["code"] == "worker_unavailable"
         # Despite the exception, release ran via the finally clause.
         state.director.release.assert_called_once_with("fake-model")
         # Director acquire was called too.
@@ -287,8 +304,9 @@ class TestAcquireRelease:
                 json={"input": "hi", "model": "fake-model"},
             )
 
-        # The forward raised; FastAPI surfaces 500.
-        assert r.status_code == 500
+        # Cleanup failure cannot mask the original normalized transport error.
+        assert r.status_code == 502
+        assert r.json()["error"]["code"] == "worker_unavailable"
         # The cascading failure must NOT have stolen the release call.
         state.director.release.assert_called_once_with("fake-model")
         state.director.acquire.assert_called_once()
@@ -496,6 +514,24 @@ class TestCatalogErrorOnGetManifest:
 
         state.director.acquire.assert_not_called()
         state.director.release.assert_not_called()
+
+    def test_backfill_catalog_race_returns_same_clean_503(self):
+        state = _make_state_with_director()
+        app = build_gateway(state=state)
+        client = TestClient(app)
+
+        with _patch_get_manifest(), patch(
+            "muse.cli_impl.gateway.backfill_manifest_memory",
+            side_effect=CatalogError("catalog changed during request"),
+        ):
+            r = client.post(
+                "/v1/audio/speech",
+                json={"input": "hi", "model": "fake-model"},
+            )
+
+        assert r.status_code == 503
+        assert r.json()["error"]["code"] == "catalog_unavailable"
+        state.director.acquire.assert_not_called()
 
 
 # =============================================================================
@@ -769,6 +805,115 @@ class TestStaleUnservableRevalidation:
 
         assert r.status_code == 503
         assert r.json()["error"]["code"] == "model_unservable"
+        state.director.acquire.assert_not_called()
+
+
+class TestColdModelServability:
+    class _BusyHostProbe:
+        def cpu_free_gb(self):
+            return 1.0
+
+        def cpu_total_gb(self):
+            return 16.0
+
+        def gpu_free_gb(self):
+            return None
+
+    @staticmethod
+    def _mark_real_director_shape(state):
+        # Production LoadDirector exposes a concrete loaded dict + RLock.
+        # The gateway intentionally ignores loose MagicMock.loaded children.
+        state.director.loaded = {}
+        state.director.lock = threading.RLock()
+
+    def test_newly_pulled_oversized_model_is_rejected_before_eviction(self):
+        """A post-boot model has no stamp, but still needs a hard-fit check."""
+        state = _make_state_with_director()
+        self._mark_real_director_shape(state)
+        app = build_gateway(state=state)
+        client = TestClient(app)
+        manifest = {
+            "model_id": "fake-model",
+            "capabilities": {"memory_gb": 20.0, "device": "cpu"},
+        }
+        fresh_catalog = {
+            "fake-model": {
+                "enabled": True,
+                "python_path": "/v/bin/python",
+                "manifest": manifest,
+            },
+        }
+
+        with patch(
+            "muse.cli_impl.supervisor._read_catalog", return_value=fresh_catalog,
+        ), patch(
+            "muse.cli_impl.supervisor._MemoryProbeAdapter",
+            return_value=self._BusyHostProbe(),
+        ), _patch_get_manifest(manifest):
+            r = client.post(
+                "/v1/audio/speech",
+                json={"input": "hi", "model": "fake-model"},
+            )
+
+        assert r.status_code == 503
+        assert r.json()["error"]["code"] == "model_unservable"
+        assert "exceeds device capacity" in r.json()["error"]["message"]
+        state.director.acquire.assert_not_called()
+
+    def test_transient_low_free_memory_proceeds_to_director(self):
+        """A cold model that fits total capacity may evict/wait downstream."""
+        state = _make_state_with_director(acquire_port=9001)
+        self._mark_real_director_shape(state)
+        app = build_gateway(state=state)
+        client = TestClient(app)
+        manifest = {
+            "model_id": "fake-model",
+            "capabilities": {"memory_gb": 6.0, "device": "cpu"},
+        }
+        fresh_catalog = {
+            "fake-model": {
+                "enabled": True,
+                "python_path": "/v/bin/python",
+                "manifest": manifest,
+            },
+        }
+
+        with patch(
+            "muse.cli_impl.supervisor._read_catalog", return_value=fresh_catalog,
+        ), patch(
+            "muse.cli_impl.supervisor._MemoryProbeAdapter",
+            return_value=self._BusyHostProbe(),
+        ), _patch_get_manifest(manifest), patch(
+            "muse.cli_impl.gateway.httpx.AsyncClient",
+        ) as mock_cls:
+            _wire_async_client_json(mock_cls)
+            r = client.post(
+                "/v1/audio/speech",
+                json={"input": "hi", "model": "fake-model"},
+            )
+
+        assert r.status_code == 200
+        state.director.acquire.assert_called_once()
+
+    def test_cold_validation_catalog_error_is_clean_503(self):
+        from muse.core.catalog import CatalogError
+
+        state = _make_state_with_director()
+        self._mark_real_director_shape(state)
+        app = build_gateway(state=state)
+        client = TestClient(app)
+
+        with patch(
+            "muse.cli_impl.supervisor._read_catalog",
+            side_effect=CatalogError("unsafe catalog"),
+        ):
+            r = client.post(
+                "/v1/audio/speech",
+                json={"input": "hi", "model": "fake-model"},
+            )
+
+        assert r.status_code == 503
+        assert r.json()["error"]["code"] == "catalog_unavailable"
         state.director.acquire.assert_not_called()
 
 
@@ -1312,6 +1457,28 @@ class TestAcquireOffEventLoop:
 
         assert not forward_called  # forward never reached (cancelled first)
         state.director.release.assert_called_once_with("fake-model")
+
+    async def test_shutdown_cancellation_returns_clean_503(self):
+        """Uvicorn marks stop_event before cancelling overdue handlers.
+
+        That cancellation is expected shutdown control flow, not an ASGI
+        application error: return a stable 503 instead of re-raising into
+        Uvicorn's traceback/500 path.
+        """
+        from muse.cli_impl.gateway import _route_via_director
+
+        state = _make_state_with_director()
+        state.stop_event.set()
+        with _patch_get_manifest(), patch(
+            "muse.cli_impl.gateway._acquire_with_capacity_wait",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            response = await _route_via_director(
+                MagicMock(), "v1/audio/speech", "fake-model", state, 1.0,
+            )
+
+        assert response.status_code == 503
+        assert b'"code":"server_shutting_down"' in response.body
 
     async def test_forward_release_fires_on_cancellation_during_stream_open(self):
         """A CancelledError while opening the worker connection (client

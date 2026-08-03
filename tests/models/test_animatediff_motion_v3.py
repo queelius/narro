@@ -24,8 +24,17 @@ def test_manifest_shape():
     assert caps["default_frames"] == 16
     assert caps["default_fps"] == 8
     assert caps["device"] == "cuda"
-    # Base model is referenced
-    assert "base_model" in caps
+    assert caps["adapter_model_subdir"] == "motion_adapter"
+    assert caps["base_model_subdir"] == "base_model"
+    assert MANIFEST["revision"] == "2e8139b1d1269fd8a21deb96ad19455e187692eb"
+    assert len(MANIFEST["hf_artifacts"]) == 2
+    assert MANIFEST["hf_artifacts"][0]["required_patterns"] == [
+        "config.json",
+        "*.safetensors",
+    ]
+    assert "unet/*.safetensors" in (
+        MANIFEST["hf_artifacts"][1]["required_patterns"]
+    )
 
 
 def _patched_pipe():
@@ -36,7 +45,7 @@ def _patched_pipe():
     return fake_pipe
 
 
-def test_construction_loads_adapter_and_base():
+def test_construction_loads_adapter_and_base_from_bundle(tmp_path):
     fake_pipe_class = MagicMock()
     fake_pipe_class.from_pretrained.return_value = _patched_pipe()
     fake_adapter_class = MagicMock()
@@ -53,17 +62,69 @@ def test_construction_loads_adapter_and_base():
         MagicMock(),
     ):
         from muse.models.animatediff_motion_v3 import MANIFEST, Model
+        adapter_dir = tmp_path / "motion_adapter"
+        base_dir = tmp_path / "base_model"
+        adapter_dir.mkdir()
+        base_dir.mkdir()
         m = Model(
             hf_repo="guoyww/animatediff-motion-adapter-v1-5-3",
-            local_dir="/fake/adapter",
+            local_dir=str(tmp_path),
+            adapter_model_subdir="motion_adapter",
+            base_model_subdir="base_model",
             device="cpu",
         )
     fake_adapter_class.from_pretrained.assert_called_once()
     fake_pipe_class.from_pretrained.assert_called_once()
-    # The pipe is loaded with base_model from MANIFEST capabilities
+    assert fake_adapter_class.from_pretrained.call_args.args[0] == str(adapter_dir)
     pipe_call = fake_pipe_class.from_pretrained.call_args
-    assert pipe_call.args[0] == MANIFEST["capabilities"]["base_model"]
+    assert pipe_call.args[0] == str(base_dir)
     assert m.model_id == MANIFEST["model_id"]
+
+
+def test_device_move_keeps_the_created_pipeline():
+    fake_pipe = _patched_pipe()
+    fake_pipe.to.return_value = MagicMock(name="unrelated-fluent-result")
+    fake_pipe_class = MagicMock()
+    fake_pipe_class.from_pretrained.return_value = fake_pipe
+    fake_adapter_class = MagicMock()
+    fake_adapter_class.from_pretrained.return_value = MagicMock()
+
+    with patch(
+        "muse.models.animatediff_motion_v3.AnimateDiffPipeline",
+        fake_pipe_class,
+    ), patch(
+        "muse.models.animatediff_motion_v3.MotionAdapter",
+        fake_adapter_class,
+    ), patch(
+        "muse.models.animatediff_motion_v3.torch",
+        MagicMock(),
+    ):
+        from muse.models.animatediff_motion_v3 import Model
+
+        runtime = Model(hf_repo="org/adapter", local_dir=None, device="cuda")
+
+    assert runtime._pipe is fake_pipe
+    fake_pipe.to.assert_called_once_with("cuda")
+
+
+def test_legacy_local_entry_refuses_hidden_base_download():
+    fake_pipe_class = MagicMock()
+    fake_adapter_class = MagicMock()
+    with patch(
+        "muse.models.animatediff_motion_v3.AnimateDiffPipeline",
+        fake_pipe_class,
+    ), patch(
+        "muse.models.animatediff_motion_v3.MotionAdapter",
+        fake_adapter_class,
+    ), patch(
+        "muse.models.animatediff_motion_v3.torch",
+        MagicMock(),
+    ):
+        from muse.models.animatediff_motion_v3 import Model
+        with pytest.raises(RuntimeError, match="re-pull"):
+            Model(hf_repo="org/adapter", local_dir="/legacy", device="cpu")
+    fake_adapter_class.from_pretrained.assert_not_called()
+    fake_pipe_class.from_pretrained.assert_not_called()
 
 
 def test_generate_returns_animation_result():
@@ -86,7 +147,7 @@ def test_generate_returns_animation_result():
         MagicMock(),
     ):
         from muse.models.animatediff_motion_v3 import MANIFEST, Model
-        m = Model(hf_repo="x", local_dir="/fake", device="cpu")
+        m = Model(hf_repo="x", local_dir=None, device="cpu")
         r = m.generate("a cat")
 
     assert isinstance(r, AnimationResult)

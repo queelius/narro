@@ -1,4 +1,7 @@
 import threading
+from unittest.mock import MagicMock
+
+import pytest
 
 from muse.observability.sampler import Sampler
 
@@ -53,4 +56,87 @@ def test_no_arg_construction_still_works():
 
     s.start()
     s.stop()
+    assert s._thread is None
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("inf"), float("nan")])
+def test_rejects_busy_loop_or_unbounded_interval(interval):
+    with pytest.raises(ValueError, match="interval"):
+        Sampler(
+            interval=interval,
+            loaded_fn=lambda: {},
+            inflight_fn=lambda: 0,
+        )
+
+
+def test_start_never_clears_an_external_shutdown_event():
+    shared = threading.Event()
+    shared.set()
+    s = Sampler(
+        interval=1,
+        loaded_fn=lambda: {},
+        inflight_fn=lambda: 0,
+        stop_event=shared,
+    )
+
+    assert s.start() is False
+    assert shared.is_set()
+    assert s._thread is None
+
+
+def test_private_sampler_can_restart_after_stop():
+    s = Sampler(
+        interval=0.01,
+        loaded_fn=lambda: {},
+        inflight_fn=lambda: 0,
+    )
+
+    assert s.start() is True
+    assert s.stop() is True
+    assert s.start() is True
+    assert s.stop() is True
+
+
+def test_stop_retains_thread_handle_when_bounded_join_times_out():
+    s = Sampler(
+        interval=1,
+        loaded_fn=lambda: {},
+        inflight_fn=lambda: 0,
+        stop_timeout=0.01,
+    )
+    wedged = MagicMock()
+    wedged.is_alive.return_value = True
+    s._thread = wedged
+
+    assert s.stop() is False
+    assert s._thread is wedged
+    wedged.join.assert_called_once_with(timeout=0.01)
+
+
+def test_start_does_not_claim_restart_while_timed_out_stop_is_unwinding():
+    s = Sampler(
+        interval=1,
+        loaded_fn=lambda: {},
+        inflight_fn=lambda: 0,
+        stop_timeout=0.01,
+    )
+    wedged = MagicMock()
+    wedged.is_alive.return_value = True
+    s._thread = wedged
+
+    assert s.stop() is False
+    assert s._stop.is_set()
+    assert s.start() is False
+    assert s._thread is wedged
+
+
+def test_stop_clears_an_inert_thread_whose_start_never_completed():
+    s = Sampler(
+        interval=1,
+        loaded_fn=lambda: {},
+        inflight_fn=lambda: 0,
+    )
+    s._thread = threading.Thread(target=lambda: None)
+
+    assert s.stop() is True
     assert s._thread is None

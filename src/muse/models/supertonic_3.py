@@ -37,6 +37,7 @@ MANIFEST = {
     "model_id": "supertonic-3",
     "modality": "audio/speech",
     "hf_repo": "Supertone/supertonic-3",
+    "revision": "3cadd1ee6394adea1bd021217a0e650ede09a323",
     "description": "Supertonic 3: lightweight on-device TTS, 31 languages, ONNX (CPU)",
     "license": "OpenRAIL",
     "pip_extras": (
@@ -85,12 +86,11 @@ class Model:
     ) -> None:
         from supertonic import TTS  # deferred: keep top-level imports ML-free
 
-        # ONNX CPU engine. The SDK auto-downloads assets to its own cache
-        # (~/.cache/supertonic3/) when auto_download=True. Passing local_dir
-        # as model_dir lets muse pull pre-populate the assets directory so
-        # that workers start offline without re-downloading.
+        # A Muse worker always receives its pulled local directory and must
+        # fail closed if that snapshot is incomplete. Keep SDK auto-download
+        # only for explicit direct construction without Muse-managed assets.
         logger.info("Loading Supertonic 3 (device=cpu, local_dir=%s)", local_dir)
-        self._tts = TTS(model_dir=local_dir, auto_download=True)
+        self._tts = TTS(model_dir=local_dir, auto_download=local_dir is None)
         self._device = "cpu"
 
     @property

@@ -21,7 +21,12 @@ from typing import Any, Iterable
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 from muse.core.chat_formats import lookup_chat_format
-from muse.core.resolvers import ResolvedModel, ResolverError, SearchResult
+from muse.core.resolvers import (
+    ResolvedModel,
+    ResolverError,
+    SearchResult,
+    hf_commit_revision,
+)
 
 
 _VARIANT_RE = re.compile(
@@ -76,9 +81,16 @@ def _sniff_supports_tools(chat_template: str | None) -> bool:
     return bool(re.search(r"(\bif\s+tools\b|\{\{\s*tools|tool_calls)", chat_template))
 
 
-def _try_sniff_tools_from_repo(repo_id: str) -> bool | None:
+def _try_sniff_tools_from_repo(
+    repo_id: str,
+    revision: str | None = None,
+) -> bool | None:
     try:
-        path = hf_hub_download(repo_id=repo_id, filename="tokenizer_config.json")
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename="tokenizer_config.json",
+            revision=revision,
+        )
     except Exception:
         return None
     try:
@@ -88,9 +100,16 @@ def _try_sniff_tools_from_repo(repo_id: str) -> bool | None:
     return _sniff_supports_tools(cfg.get("chat_template"))
 
 
-def _try_sniff_context_length_from_repo(repo_id: str) -> int | None:
+def _try_sniff_context_length_from_repo(
+    repo_id: str,
+    revision: str | None = None,
+) -> int | None:
     try:
-        path = hf_hub_download(repo_id=repo_id, filename="config.json")
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename="config.json",
+            revision=revision,
+        )
         cfg = json.loads(Path(path).read_text())
         return int(cfg.get("max_position_embeddings") or 0) or None
     except Exception:
@@ -123,6 +142,7 @@ def _sniff(info) -> bool:
 
 
 def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
+    revision = hf_commit_revision(info)
     is_vlm, multi_image = _is_vlm(info)
     if is_vlm:
         license_str = _repo_license(info)
@@ -139,11 +159,14 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
                 "supports_tools": False,
             },
         }
+        if revision is not None:
+            manifest["revision"] = revision
 
         def _download(cache_dir: Path) -> Path:
             return Path(snapshot_download(
                 repo_id=repo_id,
                 cache_dir=str(cache_dir) if cache_dir else None,
+                revision=revision,
             ))
 
         return ResolvedModel(
@@ -168,8 +191,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             f"variant {variant!r} not found in {repo_id}; available: {variants}"
         )
 
-    supports_tools = _try_sniff_tools_from_repo(repo_id)
-    ctx_length = _try_sniff_context_length_from_repo(repo_id)
+    supports_tools = _try_sniff_tools_from_repo(repo_id, revision=revision)
+    ctx_length = _try_sniff_context_length_from_repo(repo_id, revision=revision)
 
     hints = lookup_chat_format(repo_id) or {}
 
@@ -193,12 +216,15 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         allow_patterns = [matched, "tokenizer*", "config.json", "*.md"]
         return Path(snapshot_download(
             repo_id=repo_id, allow_patterns=allow_patterns,
             cache_dir=str(cache_root) if cache_root else None,
+            revision=revision,
         ))
 
     return ResolvedModel(

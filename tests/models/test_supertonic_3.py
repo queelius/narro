@@ -1,5 +1,6 @@
 """Tests for muse.models.supertonic_3: Supertonic ONNX TTS adapter (SDK mocked)."""
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -123,3 +124,30 @@ def test_manifest_required_fields():
     assert "supertonic" in MANIFEST["pip_extras"]
     assert MANIFEST["capabilities"]["device"] == "cpu"
     assert len(MANIFEST["capabilities"]["languages"]) == 31
+
+
+def test_muse_managed_local_assets_disable_sdk_auto_download():
+    from muse.models.supertonic_3 import Model
+
+    factory = MagicMock()
+    with patch.dict("sys.modules", {
+        "supertonic": SimpleNamespace(TTS=factory),
+    }):
+        Model(local_dir="/muse/pulled/supertonic", device="cpu")
+
+    factory.assert_called_once_with(
+        model_dir="/muse/pulled/supertonic",
+        auto_download=False,
+    )
+
+
+def test_direct_construction_retains_explicit_sdk_download_fallback():
+    from muse.models.supertonic_3 import Model
+
+    factory = MagicMock()
+    with patch.dict("sys.modules", {
+        "supertonic": SimpleNamespace(TTS=factory),
+    }):
+        Model(local_dir=None, device="cpu")
+
+    factory.assert_called_once_with(model_dir=None, auto_download=True)

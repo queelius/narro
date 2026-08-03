@@ -27,6 +27,7 @@ MANIFEST = {
     "model_id": "triposr",
     "modality": "3d/generation",
     "hf_repo": "stabilityai/TripoSR",
+    "revision": "5b521936b01fbe1890f6f9baed0254ab6351c04a",
     "description": (
         "TripoSR: single-image to 3D mesh, ~120MB, MIT. Image input "
         "should be foreground-isolated (transparent or white "

@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from muse.admin.operations import OperationError
 from muse.cli_impl.load_director import (
     DecisionLogEntry,
+    InFlightLoad,
     LoadDirector,
     LoadEntry,
 )
@@ -175,6 +176,47 @@ class TestColdAcquireFits:
         )
         port = director.acquire("fake-model", manifest=_manifest())
         assert port == 9001
+
+
+class TestCapacityInputValidation:
+    @pytest.mark.parametrize(
+        "memory_gb", [-1.0, float("nan"), float("inf"), "bad", True],
+    )
+    def test_invalid_manifest_memory_never_reaches_worker_or_eviction(
+        self, memory_gb,
+    ):
+        enable = MagicMock(return_value=9001)
+        disable = MagicMock()
+        director = LoadDirector(
+            enable_fn=enable, disable_fn=disable, memory_probe=_make_probe(),
+        )
+
+        with pytest.raises(OperationError) as exc_info:
+            director.acquire(
+                "invalid", manifest=_manifest(memory_gb=memory_gb),
+            )
+
+        assert exc_info.value.code == "invalid_model_manifest"
+        assert exc_info.value.retryable is False
+        enable.assert_not_called()
+        disable.assert_not_called()
+        assert director.in_flight_loads == {}
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"gpu_budget_gb": -1.0},
+            {"cpu_budget_gb": float("nan")},
+            {"gpu_headroom_gb": float("inf")},
+            {"cpu_headroom_gb": True},
+        ],
+    )
+    def test_invalid_capacity_knobs_fail_at_construction(self, kwargs):
+        with pytest.raises(ValueError, match="finite non-negative"):
+            LoadDirector(
+                enable_fn=MagicMock(), disable_fn=MagicMock(),
+                memory_probe=_make_probe(), **kwargs,
+            )
 
 
 # ----------------------------------------------------------------------
@@ -987,6 +1029,33 @@ class TestDecisionLog:
 # ----------------------------------------------------------------------
 
 class TestEnableFnException:
+    def test_preload_probe_failure_aborts_claim_before_enable(self):
+        failure = RuntimeError("memory probe temporarily unavailable")
+        probe = _make_probe()
+        reads = iter((64.0, failure, 64.0, 64.0, 64.0))
+
+        def cpu_free():
+            value = next(reads)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        probe.cpu_free_gb.side_effect = cpu_free
+        enable = MagicMock(return_value=9001)
+        director = LoadDirector(
+            enable_fn=enable,
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+        )
+
+        with pytest.raises(OperationError, match="memory probe") as caught:
+            director.acquire("fake-model", manifest=_manifest())
+
+        assert caught.value.__cause__ is failure
+        assert director.in_flight_loads == {}
+        enable.assert_not_called()
+        assert director.acquire("fake-model", manifest=_manifest()) == 9001
+
     def test_exception_propagates_in_flight_cleared(self):
         boom = RuntimeError("worker spawn died")
 
@@ -1011,6 +1080,40 @@ class TestEnableFnException:
         assert director.in_flight_loads == {}
         # And no LoadEntry was inserted on failure.
         assert "fake-model" not in director.status()
+
+    def test_failed_rollback_stays_blocked_and_accounted_until_disable(self):
+        cleanup_failure = RuntimeError("worker teardown uncertain")
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=0),
+            disable_fn=MagicMock(side_effect=cleanup_failure),
+            memory_probe=_make_probe(),
+        )
+
+        with pytest.raises(OperationError, match="invalid worker port"):
+            director.acquire("fake-model", manifest=_manifest(memory_gb=2.0))
+
+        assert director.in_flight_loads == {}
+        stranded = director.loaded["fake-model"]
+        assert stranded.worker_port == 0
+        assert stranded.refcount == 0
+        assert stranded.memory_gb == 2.0
+        assert "fake-model" in director._blocked_models
+        assert "fake-model" in director._failed_rollbacks
+
+        with pytest.raises(OperationError) as caught:
+            director.acquire("fake-model", manifest=_manifest(memory_gb=2.0))
+        assert caught.value.code == "model_disabled"
+        with pytest.raises(OperationError) as caught:
+            director.allow_model("fake-model")
+        assert caught.value.code == "model_cleanup_required"
+
+        claim = director.begin_model_disable("fake-model")
+        assert claim.entry is stranded
+        assert director.finish_eviction(claim, success=True)
+        assert "fake-model" not in director.loaded
+        assert "fake-model" not in director._failed_rollbacks
+        director.allow_model("fake-model")
+        assert "fake-model" not in director._blocked_models
 
     def test_concurrent_waiter_wakes_and_reattempts(self):
         # Two threads racing on a cold acquire: the winner's enable_fn
@@ -1079,6 +1182,134 @@ class TestEnableFnException:
         assert attempt_count["n"] == 2
 
 
+class TestInFlightLeaseRecovery:
+    def test_abandoned_claim_is_reclaimed_after_bounded_wait(self):
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=MagicMock(),
+            memory_probe=_make_probe(),
+        )
+        abandoned = InFlightLoad(
+            event=threading.Event(),
+            memory_gb=0.5,
+            pool="cpu",
+            claimed_at=time.monotonic() - 10.0,
+            owner_thread=None,
+        )
+        director.in_flight_loads["fake-model"] = abandoned
+
+        with patch(
+            "muse.cli_impl.load_director._INFLIGHT_WAIT_TIMEOUT_SECONDS",
+            0.0,
+        ):
+            assert director.acquire("fake-model", manifest=_manifest()) == 9001
+
+        assert abandoned.event.is_set()
+        assert director.in_flight_loads == {}
+        director.enable_fn.assert_called_once_with("fake-model")
+
+    def test_live_owner_timeout_is_retryable_and_never_duplicates_load(self):
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=MagicMock(),
+            memory_probe=_make_probe(),
+        )
+        active = InFlightLoad(
+            event=threading.Event(),
+            memory_gb=0.5,
+            pool="cpu",
+            claimed_at=time.monotonic() - 10.0,
+            owner_thread=threading.current_thread(),
+        )
+        director.in_flight_loads["fake-model"] = active
+
+        with patch(
+            "muse.cli_impl.load_director._INFLIGHT_WAIT_TIMEOUT_SECONDS",
+            0.0,
+        ), pytest.raises(OperationError) as exc:
+            director.acquire("fake-model", manifest=_manifest())
+
+        assert exc.value.code == "model_load_timeout"
+        assert exc.value.retryable is True
+        assert director.in_flight_loads["fake-model"] is active
+        director.enable_fn.assert_not_called()
+
+
+class TestPostEnableSettlement:
+    def test_observation_failure_keeps_successful_load_usable(self):
+        probe = _make_probe()
+        probe.cpu_free_gb.side_effect = [64.0, 64.0, RuntimeError("probe lost")]
+        disable = MagicMock()
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=disable,
+            memory_probe=probe,
+        )
+
+        assert director.acquire("fake-model", manifest=_manifest()) == 9001
+
+        assert director.loaded["fake-model"].worker_port == 9001
+        assert director.in_flight_loads == {}
+        assert director.recent_decisions[-1].free_after_gb is None
+        disable.assert_not_called()
+
+    def test_commit_failure_rolls_back_enabled_worker_and_claim(self):
+        class ExplodingDecisions:
+            def append(self, _entry):
+                raise RuntimeError("decision sink failed")
+
+        disable = MagicMock()
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=disable,
+            memory_probe=_make_probe(),
+        )
+        director.recent_decisions = ExplodingDecisions()
+
+        with pytest.raises(OperationError, match="decision sink failed"):
+            director.acquire("fake-model", manifest=_manifest())
+
+        disable.assert_called_once_with("fake-model")
+        assert director.in_flight_loads == {}
+        assert "fake-model" not in director.loaded
+
+    @pytest.mark.parametrize("bad_port", [None, True, 0, 65536, "9001"])
+    def test_invalid_enable_port_rolls_back(self, bad_port):
+        disable = MagicMock()
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=bad_port),
+            disable_fn=disable,
+            memory_probe=_make_probe(),
+        )
+
+        with pytest.raises(OperationError, match="invalid worker port"):
+            director.acquire("fake-model", manifest=_manifest())
+
+        disable.assert_called_once_with("fake-model")
+        assert director.in_flight_loads == {}
+        assert director.loaded == {}
+
+    def test_writeback_thread_start_failure_does_not_fail_loaded_request(self):
+        probe = _make_probe()
+        probe.cpu_free_gb.side_effect = [64.0, 64.0, 63.0]
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+        )
+        fake_thread = MagicMock()
+        fake_thread.start.side_effect = RuntimeError("no thread capacity")
+
+        with patch(
+            "muse.cli_impl.load_director.threading.Thread",
+            return_value=fake_thread,
+        ):
+            assert director.acquire("fake-model", manifest=_manifest()) == 9001
+
+        assert director.loaded["fake-model"].worker_port == 9001
+        assert director.in_flight_loads == {}
+
+
 # ----------------------------------------------------------------------
 # LoadEntry shape sanity (the dataclass is part of the public API)
 # ----------------------------------------------------------------------
@@ -1121,6 +1352,53 @@ class TestDecisionLogEntryShape:
 # ----------------------------------------------------------------------
 # Task D: observed-peak writeback
 # ----------------------------------------------------------------------
+
+
+def test_observed_peak_coalesces_while_single_drain_thread_is_busy():
+    director = LoadDirector(
+        enable_fn=MagicMock(return_value=9001),
+        disable_fn=MagicMock(),
+        memory_probe=_make_probe(),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[tuple[str, int, str]] = []
+
+    def blocked_writeback(model_id, observed_peak_bytes, device_key):
+        calls.append((model_id, observed_peak_bytes, device_key))
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(timeout=5.0)
+
+    director._observed_peak_writeback = blocked_writeback
+    thread = director.observed_peak(
+        "fake-model",
+        observed_peak_bytes=1,
+        device="cpu",
+    )
+    assert thread is not None
+    assert entered.wait(timeout=5.0)
+
+    returned = [
+        director.observed_peak(
+            "fake-model",
+            observed_peak_bytes=value,
+            device="cpu",
+        )
+        for value in range(2, 102)
+    ]
+    assert all(candidate is thread for candidate in returned)
+    assert len(director._pending_writebacks) == 1
+
+    release.set()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert calls == [
+        ("fake-model", 1, "cpu"),
+        ("fake-model", 101, "cpu"),
+    ]
+    assert director._pending_writebacks == {}
+    assert director._writeback_thread is None
 
 @pytest.fixture
 def catalog_dir(tmp_path, monkeypatch):
@@ -1699,6 +1977,277 @@ class TestAutoDevicePoolSelection:
         # GPU headroom (1.0) must apply, NOT CPU headroom (2.0).
         assert available == 6.0
 
+    def test_explicit_cuda_uses_budget_when_nvml_is_unavailable(self):
+        probe = MagicMock()
+        probe.gpu_free_gb.return_value = None
+        probe.cpu_free_gb.return_value = 512.0
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+        )
+
+        assert director._available_for_device("cuda") == (8.0, 7.0)
+
+    def test_rocm_like_auto_uses_static_gpu_budget(self):
+        probe = MagicMock()
+        probe.gpu_free_gb.return_value = None
+        probe.cpu_free_gb.return_value = 512.0
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+            cuda_available_fn=lambda: True,
+        )
+
+        assert director._resolve_pool_device("auto") == "cuda"
+        assert director._available_for_device("auto") == (8.0, 7.0)
+
+    def test_static_gpu_budget_debits_resident_models(self):
+        probe = MagicMock()
+        probe.gpu_free_gb.return_value = None
+        probe.cpu_free_gb.return_value = 512.0
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+        )
+        now = time.monotonic()
+        director.loaded["resident"] = LoadEntry(
+            model_id="resident",
+            worker_port=9001,
+            memory_gb=4.0,
+            refcount=0,
+            last_touched_at=now,
+            loaded_at=now,
+            pool="cuda",
+        )
+
+        assert director._available_for_device("cuda") == (4.0, 3.0)
+
+        # A 4 GB newcomer needs the resident evicted. Static accounting
+        # observes the declared 4 GB release without NVML polling data.
+        assert director.acquire(
+            "newcomer", manifest=_manifest(memory_gb=4.0, device="cuda"),
+        ) == 9002
+        director.disable_fn.assert_called_once_with("resident")
+
+    def test_static_budget_stays_reserved_until_disable_finishes(self):
+        """The pop-before-shutdown window must not over-admit another load."""
+        probe = MagicMock()
+        probe.gpu_free_gb.return_value = None
+        probe.cpu_free_gb.return_value = 512.0
+        observed: list[tuple[float, float]] = []
+        raced_decisions: list[tuple] = []
+        holder = {}
+
+        def disable(_model_id):
+            director = holder["director"]
+            observed.append(director._available_for_device("cuda"))
+            raced_decisions.append(director._decide(
+                "racer",
+                manifest=_manifest(memory_gb=4.0, device="cuda"),
+            ))
+
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002),
+            disable_fn=disable,
+            memory_probe=probe,
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+        )
+        holder["director"] = director
+        now = time.monotonic()
+        director.loaded["resident"] = LoadEntry(
+            model_id="resident", worker_port=9001, memory_gb=4.0,
+            refcount=0, last_touched_at=now, loaded_at=now, pool="cuda",
+        )
+
+        assert director.acquire(
+            "newcomer", manifest=_manifest(memory_gb=4.0, device="cuda"),
+        ) == 9002
+
+        assert observed == [(4.0, 3.0)]
+        assert raced_decisions[0][0] == "evict_and_retry"
+        assert "racer" not in director.in_flight_loads
+        assert director._evicting_memory_gb == {}
+
+    def test_live_cpu_budget_debits_resident_models(self):
+        """A CPU budget caps the whole Muse working set, not each load."""
+        probe = _make_probe(gpu_free=None, cpu_free=512.0)
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+            cpu_budget_gb=8.0,
+            cpu_headroom_gb=1.0,
+        )
+        now = time.monotonic()
+        director.loaded["resident"] = LoadEntry(
+            model_id="resident", worker_port=9001, memory_gb=4.0,
+            refcount=0, last_touched_at=now, loaded_at=now, pool="cpu",
+        )
+
+        # min(512 GiB live, 8 - 4 GiB remaining budget) - 1 headroom.
+        assert director._available_for_device("cpu") == (512.0, 3.0)
+
+        # The budget-bound eviction does not wait for psutil's noisy host
+        # counter to increase: disable completion plus updated bookkeeping is
+        # sufficient, and the newcomer then fits the emptied 7 GiB pool.
+        director._wait_for_memory_release = MagicMock(
+            side_effect=AssertionError("physical poll should be unnecessary"),
+        )
+        assert director.acquire(
+            "newcomer", manifest=_manifest(memory_gb=4.0, device="cpu"),
+        ) == 9002
+        director.disable_fn.assert_called_once_with("resident")
+        director._wait_for_memory_release.assert_not_called()
+
+    def test_live_gpu_budget_debits_resident_models(self):
+        probe = _make_probe(gpu_free=100.0, cpu_free=512.0)
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+        )
+        now = time.monotonic()
+        director.loaded["resident"] = LoadEntry(
+            model_id="resident", worker_port=9001, memory_gb=4.0,
+            refcount=0, last_touched_at=now, loaded_at=now, pool="cuda",
+        )
+
+        assert director._available_for_device("cuda") == (100.0, 3.0)
+
+    def test_eviction_never_sacrifices_an_unrelated_pool(self):
+        probe = _make_probe(gpu_free=1.0, cpu_free=512.0)
+        disable = MagicMock()
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002),
+            disable_fn=disable,
+            memory_probe=probe,
+            gpu_headroom_gb=0.0,
+        )
+        now = time.monotonic()
+        director.loaded["cpu-worker"] = LoadEntry(
+            model_id="cpu-worker", worker_port=9001, memory_gb=20.0,
+            refcount=0, last_touched_at=now, loaded_at=now, pool="cpu",
+        )
+
+        with pytest.raises(OperationError) as exc_info:
+            director.acquire(
+                "gpu-newcomer",
+                manifest=_manifest(memory_gb=4.0, device="cuda"),
+            )
+
+        assert exc_info.value.retryable is False
+        disable.assert_not_called()
+        assert "cpu-worker" in director.loaded
+
+
+class TestHardCapacityBackstop:
+    class _GpuProbe:
+        def __init__(self, free_gb=2.0, total_gb=8.0):
+            self.free_gb = free_gb
+            self.total_gb = total_gb
+
+        def gpu_free_gb(self):
+            return self.free_gb
+
+        def gpu_total_gb(self):
+            return self.total_gb
+
+        def cpu_free_gb(self):
+            return 64.0
+
+        def cpu_total_gb(self):
+            return 64.0
+
+    def _idle_victim(self):
+        now = time.monotonic()
+        return LoadEntry(
+            model_id="victim", worker_port=9001, memory_gb=5.0,
+            refcount=0, last_touched_at=now, loaded_at=now, pool="cuda",
+        )
+
+    def test_oversized_model_never_evicts_before_failing(self):
+        probe = self._GpuProbe(free_gb=2.0, total_gb=8.0)
+        disable = MagicMock()
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002), disable_fn=disable,
+            memory_probe=probe, gpu_headroom_gb=1.0,
+        )
+        director.loaded["victim"] = self._idle_victim()
+
+        with pytest.raises(OperationError) as exc_info:
+            director.acquire(
+                "impossible", manifest=_manifest(memory_gb=10.0, device="cuda"),
+            )
+
+        assert exc_info.value.retryable is False
+        assert "exceeds 7.00 GB capacity" in exc_info.value.message
+        disable.assert_not_called()
+        assert "victim" in director.loaded
+
+    def test_transient_pressure_still_evicts_when_model_fits_total(self):
+        probe = self._GpuProbe(free_gb=2.0, total_gb=8.0)
+
+        def disable(_model_id):
+            probe.free_gb = 8.0
+
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002), disable_fn=disable,
+            memory_probe=probe, gpu_headroom_gb=1.0,
+        )
+        director.loaded["victim"] = self._idle_victim()
+
+        assert director.acquire(
+            "fits-empty", manifest=_manifest(memory_gb=6.0, device="cuda"),
+        ) == 9002
+        assert "victim" not in director.loaded
+
+    def test_static_budget_is_also_a_hard_ceiling(self):
+        probe = MagicMock()
+        probe.gpu_free_gb.return_value = None
+        probe.cpu_free_gb.return_value = 64.0
+        disable = MagicMock()
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9002), disable_fn=disable,
+            memory_probe=probe, gpu_budget_gb=8.0, gpu_headroom_gb=1.0,
+        )
+        director.loaded["victim"] = self._idle_victim()
+
+        with pytest.raises(OperationError):
+            director.warmup(
+                "impossible", manifest=_manifest(memory_gb=8.0, device="cuda"),
+            )
+
+        disable.assert_not_called()
+
+
+class TestAutoDeviceLiveAccounting:
+    def test_live_nvidia_reading_remains_authoritative(self):
+        probe = _make_probe(gpu_free=6.0, cpu_free=512.0)
+        cuda_checker = MagicMock(return_value=False)
+        director = LoadDirector(
+            enable_fn=MagicMock(return_value=9001),
+            disable_fn=MagicMock(),
+            memory_probe=probe,
+            gpu_budget_gb=8.0,
+            gpu_headroom_gb=1.0,
+            cuda_available_fn=cuda_checker,
+        )
+
+        assert director._available_for_device("auto") == (6.0, 5.0)
+        cuda_checker.assert_not_called()
+
     def test_auto_model_evicts_idle_gpu_victim_to_fit_vram(self, catalog_dir):
         # GPU host. A 6 GB idle "auto" victim is resident; loading it drops
         # the GPU to 2 GB free. A 5 GB "auto" newcomer cannot fit live VRAM
@@ -1849,6 +2398,88 @@ class TestLoadFailureSurfacesAsOperationError:
 # Spec 2026-07-08: retryable flag + capacity_listener hooks
 # ----------------------------------------------------------------------
 
+
+def test_same_pool_pressure_serializes_and_avoids_second_eviction():
+    first_disable_started = threading.Event()
+    release_first_disable = threading.Event()
+    disabled: list[str] = []
+
+    def disable(model_id):
+        disabled.append(model_id)
+        if len(disabled) == 1:
+            first_disable_started.set()
+            assert release_first_disable.wait(timeout=5.0)
+
+    director = LoadDirector(
+        enable_fn=MagicMock(return_value=9001),
+        disable_fn=disable,
+        memory_probe=_make_probe(cpu_free=100.0),
+        cpu_budget_gb=10.0,
+        cpu_headroom_gb=0.0,
+    )
+    now = time.monotonic()
+    director.loaded = {
+        "a": LoadEntry("a", 9001, 4.0, 0, now - 2, now - 2, "cpu"),
+        "b": LoadEntry("b", 9002, 4.0, 0, now - 1, now - 1, "cpu"),
+    }
+    errors: list[BaseException] = []
+
+    def evict_for(model_id):
+        try:
+            director._evict_lru_until_fits(
+                model_id=model_id,
+                shortfall_gb=4.0,
+                device="cpu",
+                required_gb=6.0,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    first = threading.Thread(target=evict_for, args=("incoming-a",))
+    second = threading.Thread(target=evict_for, args=("incoming-b",))
+    first.start()
+    assert first_disable_started.wait(timeout=5.0)
+    second.start()
+    time.sleep(0.05)
+    assert disabled == ["a"]
+
+    release_first_disable.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert disabled == ["a"]
+    assert set(director.loaded) == {"b"}
+
+
+def test_partial_eviction_notifies_only_after_releasing_director_lock():
+    director = LoadDirector(
+        enable_fn=MagicMock(return_value=9001),
+        disable_fn=MagicMock(),
+        memory_probe=_make_probe(cpu_free=100.0),
+        cpu_budget_gb=8.0,
+        cpu_headroom_gb=0.0,
+    )
+    now = time.monotonic()
+    director.loaded["victim"] = LoadEntry(
+        "victim", 9001, 2.0, 0, now, now, "cpu",
+    )
+    director._wait_for_memory_release = MagicMock(return_value=2.0)
+    ownership: list[bool] = []
+    director.capacity_listener = lambda: ownership.append(
+        director.lock._is_owned()
+    )
+
+    with pytest.raises(OperationError, match="no evictable"):
+        director._evict_lru_until_fits(
+            model_id="too-large",
+            shortfall_gb=4.0,
+            device="cpu",
+            required_gb=10.0,
+        )
+
+    assert ownership == [False]
+
 class TestCapacitySignal:
     """Spec 2026-07-08: retryable flag + capacity_listener hooks."""
 
@@ -1863,12 +2494,13 @@ class TestCapacitySignal:
             })(),
         )
 
-    def _entry(self, model_id, refcount):
+    def _entry(self, model_id, refcount, *, pool="cuda"):
         import time
         from muse.cli_impl.load_director import LoadEntry
         now = time.monotonic()
         return LoadEntry(model_id=model_id, worker_port=9001, memory_gb=4.0,
-                         refcount=refcount, last_touched_at=now, loaded_at=now)
+                         refcount=refcount, last_touched_at=now, loaded_at=now,
+                         pool=pool)
 
     def test_release_to_zero_fires_listener(self):
         d = self._director()
@@ -1915,6 +2547,56 @@ class TestCapacitySignal:
             )
         assert exc.value.retryable is False
 
+    def test_no_candidate_eviction_preserves_another_load_claim_on_503(self):
+        import threading
+
+        from muse.admin.operations import OperationError
+        from muse.cli_impl.load_director import InFlightLoad
+
+        d = self._director(gpu_free=1.0)
+        claim = InFlightLoad(
+            event=threading.Event(), memory_gb=8.0, pool="cuda",
+        )
+        d.in_flight_loads["new"] = claim
+
+        with pytest.raises(OperationError):
+            d._evict_lru_until_fits(
+                model_id="new", shortfall_gb=7.0, device="cuda",
+                required_gb=8.0,
+            )
+
+        assert d.in_flight_loads["new"] is claim
+        assert not claim.event.is_set()
+
+    def test_no_candidate_fit_recheck_preserves_another_load_claim(self):
+        import threading
+
+        from muse.cli_impl.load_director import InFlightLoad
+
+        available = iter((2.0, 10.0))
+        probe = type("P", (), {
+            "gpu_free_gb": staticmethod(lambda: None),
+            "cpu_free_gb": staticmethod(lambda: next(available)),
+        })()
+        d = LoadDirector(
+            enable_fn=lambda mid: 9001,
+            disable_fn=lambda mid: None,
+            memory_probe=probe,
+            cpu_headroom_gb=1.0,
+        )
+        claim = InFlightLoad(
+            event=threading.Event(), memory_gb=4.0, pool="cpu",
+        )
+        d.in_flight_loads["new"] = claim
+
+        d._evict_lru_until_fits(
+            model_id="new", shortfall_gb=3.0, device="cpu",
+            required_gb=4.0,
+        )
+
+        assert d.in_flight_loads["new"] is claim
+        assert not claim.event.is_set()
+
     def test_operation_error_default_not_retryable(self):
         from muse.admin.operations import OperationError
         assert OperationError("x", "y").retryable is False
@@ -1936,7 +2618,9 @@ class TestCapacitySignal:
         d = LoadDirector(enable_fn=lambda mid: 9001, disable_fn=disable,
                          memory_probe=probe, cpu_headroom_gb=1.0)
         d.capacity_listener = lambda: fired.append(1)
-        d.loaded["victim"] = self._entry("victim", refcount=0)  # evictable
+        d.loaded["victim"] = self._entry(
+            "victim", refcount=0, pool="cpu",
+        )  # evictable
 
         d._evict_lru_until_fits(
             model_id="new", shortfall_gb=4.0, device="cpu", required_gb=6.0,
@@ -2114,6 +2798,7 @@ class TestEvictionWindowRetryable:
         d.loaded["victim"] = LoadEntry(
             model_id="victim", worker_port=9001, memory_gb=8.0,
             refcount=0, last_touched_at=now, loaded_at=now,
+            pool="cuda",
         )
         port = d.acquire(
             "new", manifest={"capabilities": {"memory_gb": 6.0, "device": "cuda"}},
@@ -2146,6 +2831,7 @@ class TestEvictionWindowRetryable:
         d.loaded["victim"] = LoadEntry(
             model_id="victim", worker_port=9001, memory_gb=8.0,
             refcount=0, last_touched_at=now, loaded_at=now,
+            pool="cuda",
         )
         with pytest.raises(RuntimeError, match="probe hiccup"):
             d.acquire(
@@ -2179,6 +2865,7 @@ class TestEvictionWindowRetryable:
         d.loaded["victim"] = LoadEntry(
             model_id="victim", worker_port=9001, memory_gb=4.0,
             refcount=0, last_touched_at=now, loaded_at=now,
+            pool="cuda",
         )
         with pytest.raises(OperationError):
             d.acquire(
@@ -2203,6 +2890,7 @@ class TestEvictionWindowRetryable:
         d.loaded["victim"] = LoadEntry(
             model_id="victim", worker_port=9001, memory_gb=8.0,
             refcount=0, last_touched_at=now, loaded_at=now,
+            pool="cuda",
         )
         with pytest.raises(OperationError):
             d.acquire(

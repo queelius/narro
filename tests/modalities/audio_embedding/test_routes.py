@@ -187,6 +187,40 @@ def test_embeddings_payload_too_large(monkeypatch):
     assert body["error"]["code"] == "payload_too_large"
 
 
+def test_embeddings_rejects_too_many_files(monkeypatch):
+    monkeypatch.setattr(
+        "muse.modalities.audio_embedding.routes._MAX_FILES", 2,
+    )
+    backend = _fake_backend(_fake_result(n_clips=3))
+    client = _make_client(backend)
+    r = client.post(
+        "/v1/audio/embeddings",
+        files=[
+            ("file", (f"{i}.wav", b"AUDIO", "audio/wav"))
+            for i in range(3)
+        ],
+    )
+    assert r.status_code == 413
+    backend.embed.assert_not_called()
+
+
+def test_embeddings_rejects_aggregate_bytes(monkeypatch):
+    monkeypatch.setattr(
+        "muse.modalities.audio_embedding.routes._MAX_TOTAL_UPLOAD_BYTES", 5,
+    )
+    backend = _fake_backend(_fake_result(n_clips=2))
+    client = _make_client(backend)
+    r = client.post(
+        "/v1/audio/embeddings",
+        files=[
+            ("file", ("a.wav", b"AAA", "audio/wav")),
+            ("file", ("b.wav", b"BBB", "audio/wav")),
+        ],
+    )
+    assert r.status_code == 413
+    backend.embed.assert_not_called()
+
+
 def test_embeddings_decoder_error_returns_415():
     """A backend exception matching the decoder-error pattern returns 415."""
     backend = MagicMock()

@@ -1,8 +1,13 @@
 """Tests for /v1/audio/speech FastAPI router."""
+import asyncio
+import json
+import threading
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from muse.modalities.audio_speech import routes as routes_mod
 from muse.modalities.audio_speech.protocol import AudioChunk, AudioResult
 from muse.modalities.audio_speech.routes import build_router
 from muse.core.registry import ModalityRegistry
@@ -161,3 +166,132 @@ def test_encoding_failure_returns_openai_error_envelope(monkeypatch):
     # 5xx statuses carry type "server_error" (L10: error_type is derived
     # from the status code, not hardcoded to invalid_request_error).
     assert err["type"] == "server_error"
+
+
+class _FastStreamingTTS:
+    model_id = "fast-streaming-tts"
+    sample_rate = 16_000
+
+    def __init__(self) -> None:
+        self._inference_lock = threading.Lock()
+        self.produced = 0
+        self.closed = threading.Event()
+
+    def synthesize_stream(self, text, **kwargs):
+        try:
+            for _ in range(1_000):
+                self.produced += 1
+                yield AudioChunk(
+                    audio=np.zeros(8, dtype=np.float32),
+                    sample_rate=self.sample_rate,
+                )
+        finally:
+            self.closed.set()
+
+
+@pytest.mark.asyncio
+async def test_stream_backpressure_is_bounded_and_early_close_releases_model():
+    model = _FastStreamingTTS()
+    response = await routes_mod._stream(
+        model,
+        routes_mod.SpeechRequest(input="hello", stream=True),
+    )
+    events = response.body_iterator
+
+    first = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert "data" in first
+
+    # Stop consuming while the native producer runs. It may have yielded
+    # the consumed item, one item waiting for a slot, and at most one item
+    # per bounded queue slot; it must not run through all 1,000 chunks.
+    await asyncio.sleep(0.15)
+    assert model.produced <= routes_mod._STREAM_QUEUE_DEPTH + 2
+
+    await events.aclose()
+    assert model.closed.is_set()
+    assert model._inference_lock.acquire(blocking=False)
+    model._inference_lock.release()
+
+
+class _LockWaitingTTS:
+    model_id = "lock-waiting-tts"
+
+    def __init__(self) -> None:
+        self._inference_lock = threading.Lock()
+        self.called = threading.Event()
+
+    def synthesize_stream(self, text, **kwargs):
+        self.called.set()
+        yield AudioChunk(audio=np.zeros(8, dtype=np.float32), sample_rate=16_000)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_stops_waiting_for_inference_lock():
+    model = _LockWaitingTTS()
+    model._inference_lock.acquire()
+    try:
+        response = await routes_mod._stream(
+            model,
+            routes_mod.SpeechRequest(input="hello", stream=True),
+        )
+        events = response.body_iterator
+        pending = asyncio.create_task(events.__anext__())
+        await asyncio.sleep(0.1)
+
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        assert not model.called.is_set()
+        assert model._inference_lock.locked()
+    finally:
+        model._inference_lock.release()
+
+
+class _FailingStreamingTTS:
+    model_id = "failing-streaming-tts"
+
+    def __init__(self) -> None:
+        self._inference_lock = threading.Lock()
+
+    def synthesize_stream(self, text, **kwargs):
+        raise RuntimeError("secret backend path: /srv/private/model.bin")
+        yield  # pragma: no cover - makes this an iterator
+
+
+@pytest.mark.asyncio
+async def test_stream_backend_error_is_structured_and_sanitized():
+    response = await routes_mod._stream(
+        _FailingStreamingTTS(),
+        routes_mod.SpeechRequest(input="hello", stream=True),
+    )
+    events = [event async for event in response.body_iterator]
+
+    assert [event.get("event") for event in events] == ["error", "done"]
+    payload = json.loads(events[0]["data"])
+    assert payload["error"]["code"] == "streaming_failed"
+    assert payload["error"]["type"] == "server_error"
+    assert "secret" not in events[0]["data"]
+    assert "/srv/private" not in events[0]["data"]
+
+
+@pytest.mark.asyncio
+async def test_stream_encoding_error_is_structured_and_sanitized(monkeypatch):
+    def _fail_encoding(audio):
+        raise ValueError("secret encoder state: /tmp/audio.raw")
+
+    monkeypatch.setattr(routes_mod, "float_to_pcm16", _fail_encoding)
+    model = _FastStreamingTTS()
+    response = await routes_mod._stream(
+        model,
+        routes_mod.SpeechRequest(input="hello", stream=True),
+    )
+    events = [event async for event in response.body_iterator]
+
+    assert [event.get("event") for event in events] == ["error", "done"]
+    payload = json.loads(events[0]["data"])
+    assert payload["error"]["message"] == (
+        "audio streaming backend failed; see server logs"
+    )
+    assert "secret encoder state" not in events[0]["data"]
+    assert model.closed.is_set()

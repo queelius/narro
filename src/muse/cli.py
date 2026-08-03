@@ -113,6 +113,14 @@ config_app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(config_app, name="config")
+doctor_app = typer.Typer(
+    name="doctor",
+    help="diagnose local muse state and owned runtime resources",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(doctor_app, name="doctor")
 
 
 @app.callback()
@@ -129,6 +137,34 @@ def _root(
 
 
 # Top-level subcommands ------------------------------------------------------
+
+
+@doctor_app.command("resources")
+def doctor_resources(
+    repair: Annotated[
+        bool,
+        typer.Option(
+            "--repair",
+            help=(
+                "remove stale records and terminate only identity-verified "
+                "orphan Muse process leaders (supervisors, workers, and "
+                "admin jobs)"
+            ),
+        ),
+    ] = False,
+    grace: Annotated[
+        float,
+        typer.Option(
+            "--grace",
+            min=0.0,
+            help="seconds to wait before force-killing a verified orphan",
+        ),
+    ] = 5.0,
+) -> None:
+    """Inspect Muse's registry without scanning unrelated host processes."""
+    from muse.cli_impl.resource_doctor import run_resource_doctor
+
+    raise typer.Exit(run_resource_doctor(repair=repair, grace=grace))
 
 
 def _resolve_serve_device(cli_device: "Device | None") -> str:
@@ -223,7 +259,7 @@ def pull(
     supervisor flags the model as unservable. `--no-probe` opts out
     for cross-device scenarios.
     """
-    from muse.core.catalog import _read_catalog, pull as _pull
+    from muse.core.catalog import ModelInUseError, _read_catalog, pull as _pull
     from muse.core.venv import install_output_mode
     # Always register the HF resolver before dispatching. The arg may
     # be a URI directly, OR a curated alias that expands to a URI
@@ -246,6 +282,9 @@ def pull(
         try:
             _pull(identifier, base_override=base)
         except KeyError as e:
+            typer.echo(f"error: {e}", err=True)
+            raise typer.Exit(2)
+        except ModelInUseError as e:
             typer.echo(f"error: {e}", err=True)
             raise typer.Exit(2)
         except Exception as e:  # noqa: BLE001
@@ -568,8 +607,12 @@ def models_remove(
     ] = False,
 ) -> None:
     """Unregister a model from the catalog."""
-    from muse.core.catalog import remove
-    remove(model_id, purge=purge)
+    from muse.core.catalog import ModelInUseError, remove
+    try:
+        remove(model_id, purge=purge)
+    except ModelInUseError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2)
     suffix = " (purged venv)" if purge else ""
     typer.echo(f"removed {model_id} from catalog{suffix}")
 

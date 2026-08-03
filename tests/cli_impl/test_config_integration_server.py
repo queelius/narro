@@ -20,7 +20,9 @@ from muse.core import config as cfg
 
 
 @pytest.fixture(autouse=True)
-def _reset():
+def _reset(monkeypatch, tmp_path):
+    monkeypatch.setenv("MUSE_CATALOG_DIR", str(tmp_path))
+    monkeypatch.delenv("MUSE_CONFIG", raising=False)
     cfg.reset_config()
     yield
     cfg.reset_config()

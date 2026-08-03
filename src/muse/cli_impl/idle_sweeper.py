@@ -4,10 +4,9 @@ Background sweeper that unloads loaded models which have been idle (no
 requests) for longer than the model's declared `idle_timeout_seconds`,
 freeing memory without waiting for traffic-driven LRU eviction.
 
-The sweeper is a CLIENT of LoadDirector's public surface
-(`director.lock`, `director.loaded`, `director.disable_fn`,
-`director.memory_probe`, `director.recent_decisions`); no source-side
-changes to LoadDirector itself.
+The sweeper is a CLIENT of LoadDirector's eviction-claim surface.  The
+director owns accounting and transient exclusion while the slow worker
+shutdown runs; the sweeper owns only timeout selection and scheduling.
 
 Lock discipline mirrors the on-demand LRU eviction path:
 
@@ -17,14 +16,13 @@ Lock discipline mirrors the on-demand LRU eviction path:
      - `entry.refcount > 0` (in-flight).
      - `time.monotonic() - entry.last_touched_at < idle_timeout`.
      - catalog_lookup raises (KeyError = model removed mid-tick): skip.
-  3. For each candidate that passed all three checks: re-check under
-     `director.lock` (refcount may have changed); pop from
-     `director.loaded`; capture `free_before`; drop lock.
-  4. Run `director.disable_fn(candidate.model_id)` OUTSIDE the lock.
-     - On exception: re-insert the LoadEntry preserving its original
-       `last_touched_at` + `refcount`, log warning, continue.
-  5. Capture `free_after`, append a DecisionLogEntry with
-     `reason=f"idle_timeout:{int(idle_timeout)}s"` under the lock.
+  3. Atomically ask the director to re-check identity/refcount/freshness and
+     claim the entry.  The claim publishes the same evicting reservation used
+     by traffic-driven eviction before removing it from ``loaded``.
+  4. Run `director.disable_fn(candidate.model_id)` OUTSIDE the lock, then
+     settle the exact claim.  Settlement restores accounting on failure,
+     clears every transient marker, records the decision, and wakes capacity
+     waiters outside the director lock.
 
 Thread loop: `while not stop_event.is_set(): self.tick();
 stop_event.wait(self.interval_seconds)`. The wait()-based sleep allows
@@ -39,12 +37,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable
 
-from muse.cli_impl.load_director import DecisionLogEntry
-
 if TYPE_CHECKING:
     from muse.cli_impl.load_director import LoadDirector, LoadEntry
-
-from muse.core.memory_probe import declared_device
 
 logger = logging.getLogger(__name__)
 
@@ -190,11 +184,9 @@ class IdleSweeper:
     def _evict_candidate(
         self, candidate: "LoadEntry", idle_timeout_f: float,
     ) -> str | None:
-        """Re-check, pop, disable_fn, log. Returns model_id if evicted."""
-        device = declared_device(None)
+        """Claim, unload, and settle one exact idle entry generation."""
         try:
-            manifest = self.catalog_lookup(candidate.model_id)
-            device = declared_device(manifest.get("capabilities"))
+            self.catalog_lookup(candidate.model_id)
         except KeyError:
             # Removed between snapshot and now: skip silently.
             return None
@@ -205,87 +197,39 @@ class IdleSweeper:
             )
             return None
 
-        # Re-check under lock; the refcount may have changed since the
-        # snapshot. If it did, the model has live traffic and must not
-        # be evicted on this tick.
-        with self.director.lock:
-            current = self.director.loaded.get(candidate.model_id)
-            if current is None:
-                # Already evicted by a concurrent path (e.g. on-demand
-                # LRU eviction from a cold acquire). Nothing to do.
-                return None
-            if current.refcount > 0:
-                # Mid-flight request grabbed the model since snapshot;
-                # try again on the next tick.
-                return None
-
-            # L8: re-validate freshness under the lock, not just refcount.
-            # A request that arrived AND completed during the
-            # snapshot->lock window bumps the LIVE entry's last_touched_at
-            # (via release) while leaving refcount back at 0, so the
-            # refcount check above passes. Evicting here would idle-evict a
-            # model that was just used -- one spurious cold reload on the
-            # next request. Check the live entry's timestamp (current), not
-            # the stale snapshot's (candidate).
-            if time.monotonic() - current.last_touched_at < idle_timeout_f:
-                return None
-
-            # Capture free_before under the lock to keep the measurement
-            # tightly bound to the eviction commitment.
-            free_before_gb = self._free_for_device(device)
-
-            # Pop now so other threads see the eviction commitment
-            # immediately. If disable_fn raises we'll re-insert THIS
-            # popped value (not the stale snapshot reference) so the
-            # restored entry matches the live worker that disable_fn
-            # tried to terminate. Concretely: the model could have been
-            # evicted and re-loaded by another path between snapshot
-            # and re-check, in which case `current` has a fresh
-            # worker_port + loaded_at + memory_gb and `candidate`
-            # (the snapshot ref) is stale.
-            popped = self.director.loaded.pop(candidate.model_id, None)
-            if popped is None:
-                # Should not happen given the re-check above, but be
-                # defensive: if some race squeezed a pop in between
-                # the re-check and pop, treat as "already evicted".
-                return None
+        claim = self.director.begin_idle_eviction(
+            candidate.model_id,
+            expected_entry=candidate,
+            idle_before=time.monotonic() - idle_timeout_f,
+            reason=f"idle_timeout:{int(idle_timeout_f)}s",
+        )
+        if claim is None:
+            return None
 
         # ---- lock released: slow disable_fn step ----
         try:
-            self.director.disable_fn(popped.model_id)
-        except Exception as exc:  # noqa: BLE001
-            # Same remediation as on-demand LRU eviction's failed-victim
-            # path: re-insert the popped LoadEntry so accounting matches
-            # the still-alive worker. Use the popped (live) reference so
-            # we restore the right worker_port; preserve its
-            # last_touched_at + refcount verbatim so LRU ordering and
-            # idle-timeout arithmetic remain coherent next tick.
+            self.director.disable_fn(claim.model_id)
+        except BaseException as exc:
+            # Settle even for KeyboardInterrupt/SystemExit so a transient
+            # marker can never outlive the worker teardown attempt. Preserve
+            # those control-flow exceptions after restoring accounting.
+            self.director.finish_eviction(claim, success=False, error=exc)
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             logger.warning(
-                "idle sweeper: disable_fn(%r) raised: %s; re-inserted into loaded set",
-                popped.model_id, exc,
+                "idle sweeper: disable_fn(%r) raised: %s; accounting restored",
+                claim.model_id, exc,
                 exc_info=True,
             )
-            with self.director.lock:
-                self.director.loaded[popped.model_id] = popped
             return None
 
-        # 5. Append DecisionLogEntry under lock. Use the popped (live)
-        # reference for memory_gb so the log records what was actually
-        # evicted, not the snapshot's stale value.
-        free_after_gb = self._free_for_device(device)
-        with self.director.lock:
-            self.director.recent_decisions.append(DecisionLogEntry(
-                timestamp=time.time(),
-                model_id=popped.model_id,
-                action="evict",
-                memory_gb=popped.memory_gb,
-                free_before_gb=free_before_gb,
-                free_after_gb=free_after_gb,
-                reason=f"idle_timeout:{int(idle_timeout_f)}s",
-                evicted=[popped.model_id],
-            ))
-
-        return popped.model_id
+        if not self.director.finish_eviction(claim, success=True):
+            logger.error(
+                "idle sweeper: eviction claim for %r was replaced before settlement",
+                claim.model_id,
+            )
+            return None
+        return claim.model_id
 
     def _free_for_device(self, device: str) -> float:
         """Live free memory in GB for the relevant device.

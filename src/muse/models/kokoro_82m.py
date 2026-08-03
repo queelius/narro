@@ -9,6 +9,7 @@ Requires: ``pip install kokoro soundfile`` and system ``espeak-ng``.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
@@ -46,6 +47,7 @@ MANIFEST = {
     "model_id": "kokoro-82m",
     "modality": "audio/speech",
     "hf_repo": "hexgrad/Kokoro-82M",
+    "revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
     "description": "Lightweight TTS, 54 voices, 24kHz",
     "license": "Apache 2.0",
     # kokoro pulls torch + numpy transitively; declared explicitly so
@@ -53,9 +55,13 @@ MANIFEST = {
     "pip_extras": (
         "torch>=2.1.0",
         "numpy",
-        "kokoro",
+        "kokoro==0.9.4",
         "soundfile",
-        "misaki[en]",
+    ),
+    "allow_patterns": (
+        "config.json",
+        "kokoro-v1_0.pth",
+        "voices/*.pt",
     ),
     "system_packages": ("espeak-ng",),
     "capabilities": {
@@ -75,7 +81,8 @@ class Model:
 
     Args:
         hf_repo: HuggingFace repo id (used when local_dir is not set).
-        local_dir: Accepted for catalog-loader compatibility; NOT forwarded.
+        local_dir: Pulled snapshot root. When supplied, all model and voice
+            artifacts are loaded exclusively from this directory.
         device: ``'auto'``, ``'cpu'``, or ``'cuda'``.
         lang_code: Default language code (``'a'`` = US English).
     """
@@ -97,26 +104,80 @@ class Model:
         lang_code: str = "a",
         **_: Any,
     ) -> None:
+        local_artifacts = (
+            self._validate_local_artifacts(local_dir)
+            if local_dir is not None
+            else None
+        )
+
         import torch
-        from kokoro import KPipeline
+        from kokoro import KModel, KPipeline
 
         from muse.core.runtime_helpers import select_device
 
         device = select_device(device, torch_module=torch)
 
-        # `local_dir` is accepted for catalog-loader compatibility but
-        # NOT forwarded to KPipeline. Kokoro's KPipeline validates
-        # `repo_id` as an HF-style "namespace/name" string and rejects
-        # filesystem paths. Since `muse pull` already populates the HF
-        # cache via snapshot_download, passing the repo_id here still
-        # resolves from the local cache without re-downloading.
         logger.info("Loading Kokoro (lang=%s, device=%s)", lang_code, device)
-        self._pipeline = KPipeline(
-            lang_code=lang_code,
-            repo_id=hf_repo,
-            device=device,
-        )
+        if local_artifacts is None:
+            self._pipeline = KPipeline(
+                lang_code=lang_code,
+                repo_id=hf_repo,
+                device=device,
+            )
+            self._local_voice_paths: dict[str, str] | None = None
+        else:
+            config_path, weights_path, voice_paths = local_artifacts
+            local_model = KModel(
+                config=str(config_path),
+                model=str(weights_path),
+            )
+            self._pipeline = KPipeline(
+                lang_code=lang_code,
+                model=local_model,
+                device=device,
+            )
+            self._local_voice_paths = {
+                voice: str(path) for voice, path in voice_paths.items()
+            }
         self._device = device
+
+    @staticmethod
+    def _validate_local_artifacts(
+        local_dir: str,
+    ) -> tuple[Path, Path, dict[str, Path]]:
+        """Return a complete local Kokoro bundle or fail before construction."""
+        root = Path(local_dir).expanduser().resolve()
+        config_path = root / "config.json"
+        weights_path = root / "kokoro-v1_0.pth"
+        voice_paths = {
+            voice: root / "voices" / f"{voice}.pt" for voice in KOKORO_VOICES
+        }
+        required_paths = (config_path, weights_path, *voice_paths.values())
+        missing = [path for path in required_paths if not path.is_file()]
+        if missing:
+            missing_list = ", ".join(str(path) for path in missing)
+            raise FileNotFoundError(
+                f"Kokoro snapshot {root} is incomplete; missing required "
+                f"artifact(s): {missing_list}. Re-run `muse pull kokoro-82m` "
+                "to repair the local model bundle."
+            )
+        # Keep the snapshot-relative filenames even when they are Hugging Face
+        # cache symlinks. Kokoro recognizes local voices by the `.pt` suffix;
+        # resolving a symlink to its extensionless blob would trigger repo lookup.
+        return config_path, weights_path, voice_paths
+
+    def _pipeline_voice(self, voice: str) -> str:
+        """Resolve a logical voice name without allowing local-mode downloads."""
+        local_voice_paths = getattr(self, "_local_voice_paths", None)
+        if local_voice_paths is None:
+            return voice
+        try:
+            return local_voice_paths[voice]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown bundled Kokoro voice {voice!r}; choose one of "
+                f"{', '.join(self.VOICES)}"
+            ) from exc
 
     @property
     def model_id(self) -> str:
@@ -135,9 +196,10 @@ class Model:
         """
         voice = kwargs.get("voice") or "af_heart"
         speed = kwargs.get("speed", 1.0)
+        pipeline_voice = self._pipeline_voice(voice)
 
         chunks = []
-        for result in self._pipeline(text, voice=voice, speed=speed):
+        for result in self._pipeline(text, voice=pipeline_voice, speed=speed):
             if result.audio is not None:
                 chunks.append(result.audio.numpy())
 
@@ -156,8 +218,9 @@ class Model:
         """Sentence-level streaming: yields one chunk per sentence."""
         voice = kwargs.get("voice") or "af_heart"
         speed = kwargs.get("speed", 1.0)
+        pipeline_voice = self._pipeline_voice(voice)
 
-        for result in self._pipeline(text, voice=voice, speed=speed):
+        for result in self._pipeline(text, voice=pipeline_voice, speed=speed):
             if result.audio is not None:
                 audio = result.audio.numpy().astype(np.float32)
                 yield AudioChunk(audio=audio, sample_rate=KOKORO_SAMPLE_RATE)

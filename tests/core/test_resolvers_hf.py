@@ -1,10 +1,18 @@
 """Tests for HFResolver (huggingface_hub mocked; no network)."""
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from muse.core.resolvers import ResolverError, _reset_registry_for_tests
+from muse.core.resolvers import (
+    ResolvedModel,
+    ResolverError,
+    _reset_registry_for_tests,
+)
+
+
+_FAKE_REVISION = "1" * 40
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +29,157 @@ def _fake_repo_info(siblings=(), tags=()):
     info.tags = list(tags)
     info.card_data = MagicMock(license="apache-2.0")
     info.downloads = 123
+    info.sha = _FAKE_REVISION
     return info
+
+
+def _fake_resolved(repo_id="org/repo", revision=_FAKE_REVISION, **manifest_values):
+    manifest = {
+        "model_id": repo_id.split("/", 1)[-1],
+        "modality": "embedding/text",
+        "hf_repo": repo_id,
+        "revision": revision,
+        **manifest_values,
+    }
+    return ResolvedModel(
+        manifest=manifest,
+        backend_path="muse.fake:Model",
+        download=lambda cache: Path(cache) / "model",
+    )
+
+
+def test_resolve_threads_reviewed_revision_to_hub_metadata():
+    from muse.core.resolvers_hf import HFResolver
+
+    plugin = {
+        "sniff": lambda info: True,
+        "resolve": lambda repo_id, variant, info: _fake_resolved(
+            repo_id, info.sha,
+        ),
+    }
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi:
+        MockApi.return_value.repo_info.return_value = _fake_repo_info()
+        resolver = HFResolver(plugins=[plugin])
+        resolver.resolve("hf://org/repo", revision=_FAKE_REVISION)
+
+    MockApi.return_value.repo_info.assert_called_once_with(
+        "org/repo", revision=_FAKE_REVISION,
+    )
+
+
+def test_resolve_rejects_plugin_that_drops_metadata_commit():
+    from muse.core.resolvers_hf import HFResolver
+
+    plugin = {
+        "sniff": lambda info: True,
+        "resolve": lambda repo_id, variant, info: _fake_resolved(
+            repo_id, revision=None,
+        ),
+    }
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi:
+        MockApi.return_value.repo_info.return_value = _fake_repo_info()
+        resolver = HFResolver(plugins=[plugin])
+
+        with pytest.raises(ResolverError, match="did not preserve.*commit"):
+            resolver.resolve("hf://org/repo")
+
+
+def test_resolve_adds_primary_immutable_artifact_receipt():
+    from muse.core.resolvers_hf import HFResolver
+
+    plugin = {
+        "sniff": lambda info: True,
+        "resolve": lambda repo_id, variant, info: _fake_resolved(
+            repo_id, info.sha,
+        ),
+    }
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi:
+        MockApi.return_value.repo_info.return_value = _fake_repo_info()
+        resolved = HFResolver(plugins=[plugin]).resolve("hf://org/repo")
+
+    assert resolved.artifact_provenance == ({
+        "repo_id": "org/repo",
+        "revision": _FAKE_REVISION,
+        "subdir": ".",
+    },)
+
+
+def test_resolve_preserves_required_artifact_patterns():
+    from muse.core.resolvers_hf import HFResolver
+
+    receipt = ({
+        "repo_id": "org/repo",
+        "revision": _FAKE_REVISION,
+        "subdir": "adapter",
+        "allow_patterns": ("*.json", "*.safetensors"),
+        "required_patterns": ("model_index.json", "*.safetensors"),
+    },)
+    resolved = ResolvedModel(
+        manifest={
+            "model_id": "repo",
+            "modality": "image/animation",
+            "hf_repo": "org/repo",
+            "revision": _FAKE_REVISION,
+        },
+        backend_path="muse.fake:Model",
+        download=lambda cache: Path(cache) / "model",
+        artifact_provenance=receipt,
+    )
+    plugin = {
+        "sniff": lambda info: True,
+        "resolve": lambda repo_id, variant, info: resolved,
+    }
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi:
+        MockApi.return_value.repo_info.return_value = _fake_repo_info()
+        result = HFResolver(plugins=[plugin]).resolve("hf://org/repo")
+
+    assert result.artifact_provenance[0]["allow_patterns"] == [
+        "*.json",
+        "*.safetensors",
+    ]
+    assert result.artifact_provenance[0]["required_patterns"] == [
+        "model_index.json",
+        "*.safetensors",
+    ]
+
+
+def test_resolve_rejects_hub_revision_mismatch():
+    from muse.core.resolvers_hf import HFResolver
+
+    plugin = {"sniff": lambda info: True, "resolve": MagicMock()}
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi:
+        info = _fake_repo_info()
+        info.sha = "2" * 40
+        MockApi.return_value.repo_info.return_value = info
+        resolver = HFResolver(plugins=[plugin])
+        with pytest.raises(ResolverError, match="unexpected commit"):
+            resolver.resolve("hf://org/repo", revision=_FAKE_REVISION)
+
+
+@pytest.mark.parametrize("via_modality", [False, True])
+def test_resolve_rejects_missing_immutable_hub_commit(via_modality):
+    from muse.core.resolvers_hf import HFResolver
+
+    plugin = {
+        "modality": "embedding/text",
+        "sniff": lambda info: True,
+        "resolve": MagicMock(),
+    }
+    with patch("muse.core.resolvers_hf.HfApi") as MockApi:
+        info = _fake_repo_info()
+        info.sha = None
+        MockApi.return_value.repo_info.return_value = info
+        resolver = HFResolver(plugins=[plugin])
+        with pytest.raises(ResolverError, match="immutable 40-character commit"):
+            if via_modality:
+                resolver.resolve_via_modality(
+                    "hf://org/repo",
+                    "embedding/text",
+                )
+            else:
+                resolver.resolve("hf://org/repo")
+
+    plugin["resolve"].assert_not_called()
 
 
 def test_resolve_gguf_requires_variant():
@@ -219,6 +377,7 @@ def test_resolve_faster_whisper_synthesizes_manifest():
         siblings=_fake_ct2_whisper_siblings(),
         tags=["automatic-speech-recognition"],
         card_data=SimpleNamespace(license="mit"),
+        sha=_FAKE_REVISION,
     )
     with patch.object(resolver._api, "repo_info", return_value=info):
         resolved = resolver.resolve("hf://Systran/faster-whisper-tiny")
@@ -262,6 +421,7 @@ def test_resolve_text_classification_synthesizes_manifest():
         ],
         tags=["text-classification"],
         card_data=SimpleNamespace(license="apache-2.0"),
+        sha=_FAKE_REVISION,
     )
     with patch.object(resolver._api, "repo_info", return_value=info):
         resolved = resolver.resolve("hf://KoalaAI/Text-Moderation")
@@ -298,6 +458,7 @@ def test_resolve_unknown_error_message_includes_repo_diagnostics():
     info = SimpleNamespace(
         siblings=[SimpleNamespace(rfilename="random.bin")],
         tags=["something-unknown"],
+        sha=_FAKE_REVISION,
     )
     with patch.object(resolver._api, "repo_info", return_value=info):
         try:
@@ -320,7 +481,10 @@ def test_resolve_via_modality_picks_named_plugin_not_priority_winner():
     """
     from muse.core.resolvers_hf import HFResolver
 
-    rerank_plugin_resolved = MagicMock(name="rerank-resolved")
+    rerank_plugin_resolved = _fake_resolved(
+        "BAAI/bge-reranker-base",
+        modality="text/rerank",
+    )
     embedding_plugin = {
         "modality": "embedding/text",
         "sniff": MagicMock(return_value=True),  # would win on sniff
@@ -333,13 +497,15 @@ def test_resolve_via_modality_picks_named_plugin_not_priority_winner():
     }
     resolver = HFResolver(plugins=[embedding_plugin, rerank_plugin])
 
-    info = SimpleNamespace(siblings=[], tags=[], id="BAAI/bge-reranker-base")
+    info = SimpleNamespace(
+        siblings=[], tags=[], id="BAAI/bge-reranker-base", sha=_FAKE_REVISION,
+    )
     with patch.object(resolver._api, "repo_info", return_value=info):
         out = resolver.resolve_via_modality(
             "hf://BAAI/bge-reranker-base", "text/rerank",
         )
 
-    assert out is rerank_plugin_resolved
+    assert out.manifest["modality"] == "text/rerank"
     rerank_plugin["resolve"].assert_called_once()
     # The embedding plugin must NOT have been consulted, even though
     # its sniff would have returned True under priority dispatch.
@@ -355,7 +521,7 @@ def test_resolve_forwards_base_override_when_plugin_resolve_accepts_it():
     from muse.core.resolvers_hf import HFResolver
 
     def _lora_resolve(repo_id, variant, info, base_override=None):
-        return MagicMock(name="lora-resolved", base_override=base_override)
+        return _fake_resolved(repo_id, info.sha, base_override=base_override)
 
     lora_plugin = {
         "modality": "image/generation",
@@ -363,12 +529,14 @@ def test_resolve_forwards_base_override_when_plugin_resolve_accepts_it():
         "resolve": _lora_resolve,
     }
     resolver = HFResolver(plugins=[lora_plugin])
-    info = SimpleNamespace(siblings=[], tags=[], id="nerijs/pixel-art-xl")
+    info = SimpleNamespace(
+        siblings=[], tags=[], id="nerijs/pixel-art-xl", sha=_FAKE_REVISION,
+    )
     with patch.object(resolver._api, "repo_info", return_value=info):
         out = resolver.resolve(
             "hf://nerijs/pixel-art-xl", base_override="sdxl-turbo",
         )
-    assert out.base_override == "sdxl-turbo"
+    assert out.manifest["base_override"] == "sdxl-turbo"
 
 
 def test_resolve_does_not_forward_base_override_to_plain_plugin_resolve():
@@ -384,7 +552,7 @@ def test_resolve_does_not_forward_base_override_to_plain_plugin_resolve():
 
     def plain_resolve(repo_id, variant, info):
         calls.append((repo_id, variant, info))
-        return "plain-resolved"
+        return _fake_resolved(repo_id, info.sha)
 
     plain_plugin = {
         "modality": "audio/speech",
@@ -392,10 +560,12 @@ def test_resolve_does_not_forward_base_override_to_plain_plugin_resolve():
         "resolve": plain_resolve,
     }
     resolver = HFResolver(plugins=[plain_plugin])
-    info = SimpleNamespace(siblings=[], tags=[], id="org/repo")
+    info = SimpleNamespace(
+        siblings=[], tags=[], id="org/repo", sha=_FAKE_REVISION,
+    )
     with patch.object(resolver._api, "repo_info", return_value=info):
         out = resolver.resolve("hf://org/repo", base_override="sdxl-turbo")
-    assert out == "plain-resolved"
+    assert out.manifest["hf_repo"] == "org/repo"
     assert calls == [("org/repo", None, info)]
 
 
@@ -403,7 +573,7 @@ def test_resolve_via_modality_forwards_base_override_when_accepted():
     from muse.core.resolvers_hf import HFResolver
 
     def _lora_resolve(repo_id, variant, info, base_override=None):
-        return MagicMock(name="lora-resolved-via-modality", base_override=base_override)
+        return _fake_resolved(repo_id, info.sha, base_override=base_override)
 
     lora_plugin = {
         "modality": "image/generation",
@@ -411,13 +581,15 @@ def test_resolve_via_modality_forwards_base_override_when_accepted():
         "resolve": _lora_resolve,
     }
     resolver = HFResolver(plugins=[lora_plugin])
-    info = SimpleNamespace(siblings=[], tags=[], id="nerijs/pixel-art-xl")
+    info = SimpleNamespace(
+        siblings=[], tags=[], id="nerijs/pixel-art-xl", sha=_FAKE_REVISION,
+    )
     with patch.object(resolver._api, "repo_info", return_value=info):
         out = resolver.resolve_via_modality(
             "hf://nerijs/pixel-art-xl", "image/generation",
             base_override="flux-schnell",
         )
-    assert out.base_override == "flux-schnell"
+    assert out.manifest["base_override"] == "flux-schnell"
 
 
 def test_resolve_via_modality_raises_when_no_plugin_for_modality():

@@ -20,7 +20,12 @@ from typing import Any, Iterable
 
 from huggingface_hub import HfApi, snapshot_download
 
-from muse.core.resolvers import ResolvedModel, SearchResult
+from muse.core.resolvers import (
+    ResolvedModel,
+    ResolverError,
+    SearchResult,
+    hf_commit_revision,
+)
 
 
 _RUNTIME_PATH = (
@@ -120,6 +125,12 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "max_duration_seconds": 60.0,
     }
     capabilities.update(defaults)
+    revision = hf_commit_revision(info)
+    if capabilities.get("trust_remote_code") and revision is None:
+        raise ResolverError(
+            f"refusing to enable trust_remote_code for {repo_id!r} without "
+            "an immutable Hugging Face commit"
+        )
 
     manifest = {
         "model_id": _model_id(repo_id),
@@ -131,6 +142,8 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
         "system_packages": [],
         "capabilities": capabilities,
     }
+    if revision is not None:
+        manifest["revision"] = revision
 
     def _download(cache_root: Path) -> Path:
         # Prefer safetensors. Pull preprocessor_config.json (mandatory
@@ -149,11 +162,14 @@ def _resolve(repo_id: str, variant: str | None, info) -> ResolvedModel:
             "*.py",
             "tokenizer*", "vocab*", "merges*", "spiece.model",
         ])
-        return Path(snapshot_download(
-            repo_id=repo_id,
-            allow_patterns=allow_patterns,
-            cache_dir=str(cache_root) if cache_root else None,
-        ))
+        download_kwargs = {
+            "repo_id": repo_id,
+            "allow_patterns": allow_patterns,
+            "cache_dir": str(cache_root) if cache_root else None,
+        }
+        if revision is not None:
+            download_kwargs["revision"] = revision
+        return Path(snapshot_download(**download_kwargs))
 
     return ResolvedModel(
         manifest=manifest,

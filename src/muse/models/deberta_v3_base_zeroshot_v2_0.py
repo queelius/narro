@@ -17,6 +17,7 @@ MANIFEST = {
     "model_id": "deberta-v3-base-zeroshot-v2.0",
     "modality": "text/classification",
     "hf_repo": "MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+    "revision": "8e7e5af5983a0ddb1a5b45a38b129ab69e2258e8",
     "description": (
         "DeBERTa v3 base zero-shot NLI (184M, MIT). English. "
         "Pass candidate_labels at request time; the model scores each "

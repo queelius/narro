@@ -26,12 +26,18 @@ def test_resolve_first_matching_plugin_wins():
     p_high = _make_plugin(
         "b/second", priority=200, sniff_returns=True,
         resolve_returns=ResolvedModel(
-            manifest={"model_id": "x"}, backend_path="a:B",
+            manifest={
+                "model_id": "x",
+                "hf_repo": "org/repo",
+                "revision": "a" * 40,
+            },
+            backend_path="a:B",
             download=lambda root: root,
         ),
     )
     resolver = HFResolver(plugins=[p_low, p_high])
     fake_info = MagicMock()
+    fake_info.sha = "a" * 40
     with patch.object(resolver._api, "repo_info", return_value=fake_info):
         result = resolver.resolve("hf://org/repo")
     assert result.manifest["model_id"] == "x"
@@ -43,7 +49,7 @@ def test_resolve_first_matching_plugin_wins():
 def test_resolve_no_plugin_matches_raises_clean_error():
     p1 = _make_plugin("x/y", sniff_returns=False)
     resolver = HFResolver(plugins=[p1])
-    fake_info = MagicMock(siblings=[], tags=["random"])
+    fake_info = MagicMock(siblings=[], tags=["random"], sha="a" * 40)
     with patch.object(resolver._api, "repo_info", return_value=fake_info):
         with pytest.raises(ResolverError, match="no HF plugin matched"):
             resolver.resolve("hf://org/repo")
@@ -54,13 +60,22 @@ def test_resolve_short_circuits_on_first_match():
     p_first = _make_plugin(
         "a/x", priority=100, sniff_returns=True,
         resolve_returns=ResolvedModel(
-            manifest={"model_id": "a"}, backend_path="a:B",
+            manifest={
+                "model_id": "a",
+                "hf_repo": "org/repo",
+                "revision": "a" * 40,
+            },
+            backend_path="a:B",
             download=lambda root: root,
         ),
     )
     p_second = _make_plugin("b/y", priority=200, sniff_returns=True)
     resolver = HFResolver(plugins=[p_first, p_second])
-    with patch.object(resolver._api, "repo_info", return_value=MagicMock()):
+    with patch.object(
+        resolver._api,
+        "repo_info",
+        return_value=MagicMock(sha="a" * 40),
+    ):
         resolver.resolve("hf://org/repo")
     p_first["sniff"].assert_called_once()
     p_second["sniff"].assert_not_called()

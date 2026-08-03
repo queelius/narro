@@ -80,6 +80,10 @@ class TestH3MonitorSnapshot:
         # Build two specs; one will be removed mid-tick.
         spec_a = WorkerSpec(models=["a"], python_path="/pa", port=9001, status="running")
         spec_b = WorkerSpec(models=["b"], python_path="/pb", port=9002, status="running")
+        spec_a.process = MagicMock()
+        spec_a.process.poll.return_value = None
+        spec_b.process = MagicMock()
+        spec_b.process.poll.return_value = None
         workers = [spec_a, spec_b]
 
         # Barrier: 2 parties (monitor inner loop + removal thread).
@@ -160,34 +164,47 @@ class TestH3MonitorSnapshot:
 
         spec_a = WorkerSpec(models=["a"], python_path="/pa", port=9001, status="running")
         spec_b = WorkerSpec(models=["b"], python_path="/pb", port=9002, status="running")
+        spec_a.process = MagicMock()
+        spec_a.process.pid = 9101
+        spec_a.process.poll.return_value = None
+        spec_b.process = MagicMock()
+        spec_b.process.pid = 9102
+        spec_b.process.poll.return_value = None
         workers = [spec_a, spec_b]
 
         stop_event = threading.Event()
-        barrier = threading.Barrier(2, timeout=5)
+        first_health_started = threading.Event()
         removal_done = threading.Event()
         monitor_errors = []
 
         health_call = [0]
 
-        def patched_health(*, port, timeout=2.0):
+        def patched_health(*, port, timeout=2.0, expected_nonce=None):
             health_call[0] += 1
             if health_call[0] == 1:
-                # First call (spec_a): synchronise with removal thread.
-                barrier.wait()
-                removal_done.wait(timeout=2.0)
+                # First call (spec_a): let the remover mutate the live list
+                # while the monitor is walking its snapshot.
+                first_health_started.set()
+                assert removal_done.wait(timeout=2.0)
             # Stop the monitor after 2 calls to avoid a second loop.
             if health_call[0] >= 2:
                 stop_event.set()
             return True
 
         def removal_thread():
-            barrier.wait()
+            assert first_health_started.wait(timeout=2.0)
             workers.remove(spec_b)
             removal_done.set()
 
         def monitor_thread():
             try:
-                with patch("muse.cli_impl.supervisor.check_worker_health", patched_health):
+                with patch(
+                    "muse.cli_impl.supervisor.check_worker_health",
+                    patched_health,
+                ), patch(
+                    "muse.cli_impl.supervisor._attempt_restart",
+                    side_effect=AssertionError("healthy fakes must not restart"),
+                ):
                     _monitor_workers(workers, stop_event, interval=0.01)
             except Exception as exc:
                 monitor_errors.append(exc)

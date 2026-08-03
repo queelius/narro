@@ -54,6 +54,26 @@ def test_runtime_falls_back_to_hf_repo_when_no_local_dir():
     assert args[0] == "org/repo"
 
 
+def test_runtime_forwards_remote_code_security_arguments():
+    fake_ce_class = MagicMock(return_value=MagicMock())
+    code_revision = "2" * 40
+    with patch.object(ce_mod, "CrossEncoder", fake_ce_class), \
+            patch.object(ce_mod, "torch", MagicMock()):
+        CrossEncoderRuntime(
+            model_id="jina",
+            hf_repo="jinaai/jina-reranker-v2-base-multilingual",
+            local_dir="/fake",
+            device="cpu",
+            trust_remote_code=True,
+            code_revision=code_revision,
+        )
+
+    kwargs = fake_ce_class.call_args.kwargs
+    assert kwargs["trust_remote_code"] is True
+    assert kwargs["model_kwargs"]["code_revision"] == code_revision
+    assert kwargs["config_kwargs"]["code_revision"] == code_revision
+
+
 def test_rerank_returns_descending_score_order():
     rt, fake_ce, _ = _patched_runtime([0.1, 0.9, 0.4])
     out = rt.rerank("q", ["a", "b", "c"])

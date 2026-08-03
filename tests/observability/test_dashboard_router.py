@@ -16,6 +16,15 @@ from muse.observability.logs import LogHub
 from muse.observability.store import TelemetryStore
 
 
+@pytest.fixture(autouse=True)
+def _isolate_operator_config(tmp_path, monkeypatch):
+    """Dashboard tests must not inherit the developer's real Muse token."""
+    monkeypatch.setenv("MUSE_CONFIG", str(tmp_path / "absent-config.yaml"))
+    config.reset_config()
+    yield
+    config.reset_config()
+
+
 class _FakeDirector:
     def __init__(self):
         self.loaded = {}
@@ -76,6 +85,86 @@ def test_summary_ok_with_token(client_with_token):
     assert body["loaded"] == []
     assert body["in_flight"] == 0
     assert body["dropped_events"] == 0
+
+
+def test_summary_snapshots_director_state_under_its_lock(client_with_token):
+    state = client_with_token.state_ref
+
+    class TrackingLock:
+        entered = False
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, *_args):
+            self.entered = False
+
+    lock = TrackingLock()
+
+    class LockedMapping(dict):
+        def items(self):
+            assert lock.entered
+            return super().items()
+
+    state.director.lock = lock
+    state.director.loaded = LockedMapping()
+    state.director.in_flight_loads = LockedMapping()
+
+    r = client_with_token.get(
+        "/v1/telemetry/summary", headers={"Authorization": "Bearer t"}
+    )
+    assert r.status_code == 200
+
+
+def test_summary_projects_mutable_entry_fields_while_director_is_locked(
+    client_with_token,
+):
+    state = client_with_token.state_ref
+
+    class TrackingLock:
+        entered = False
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, *_args):
+            self.entered = False
+
+    lock = TrackingLock()
+
+    class LockCheckedEntry:
+        @property
+        def pool(self):
+            assert lock.entered
+            return "cpu"
+
+        @property
+        def memory_gb(self):
+            assert lock.entered
+            return 1.25
+
+        @property
+        def last_touched_at(self):
+            assert lock.entered
+            return 12.0
+
+    state.director.lock = lock
+    state.director.loaded = {"m": LockCheckedEntry()}
+
+    response = client_with_token.get(
+        "/v1/telemetry/summary", headers={"Authorization": "Bearer t"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["loaded"] == [{
+        "model_id": "m",
+        "pool": "cpu",
+        "gb": 1.25,
+        "last_used": 12.0,
+        "queue_depth": 0,
+    }]
 
 
 def test_summary_includes_queue_depth(client_with_token):
@@ -173,6 +262,18 @@ def test_series_unknown_metric_returns_400(client_with_token):
     # No unwrap handler installed on this bare test app, so FastAPI's
     # default HTTPException handler double-wraps under "detail".
     assert body["detail"]["error"]["code"] == "invalid_metric"
+
+
+@pytest.mark.parametrize("window", ["0", "-1", "nan", "inf"])
+def test_series_rejects_nonpositive_or_nonfinite_window(
+    client_with_token, window,
+):
+    r = client_with_token.get(
+        f"/v1/telemetry/series?metric=request_rate&window={window}",
+        headers={"Authorization": "Bearer t"},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"]["code"] == "invalid_window"
 
 
 def test_series_requires_token(client_no_token):

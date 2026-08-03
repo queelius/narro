@@ -17,7 +17,7 @@ import logging
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from muse.core import config
 from muse.core.errors import ModelNotFoundError, error_response
@@ -33,6 +33,10 @@ from muse.modalities.video_generation.codec import (
 MODALITY = "video/generation"
 
 logger = logging.getLogger(__name__)
+
+_MAX_SIDE = 2048
+_MAX_PIXELS_PER_FRAME = 2_097_152
+_MAX_REQUEST_PIXEL_FRAMES = 256 * 1024 * 1024
 
 # frames_b64 inlines every frame as a base64 PNG in one JSON body. At the
 # request caps (duration<=30s, fps<=60) that can reach ~1800 frames, i.e. a
@@ -62,6 +66,37 @@ class VideoGenerationRequest(BaseModel):
         default="mp4", pattern="^(mp4|webm|frames_b64)$",
     )
     n: int = Field(default=1, ge=1, le=2)
+
+    @field_validator("size")
+    @classmethod
+    def _bounded_size(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        width, height = map(int, value.split("x"))
+        if width < 1 or height < 1:
+            raise ValueError("size dimensions must be positive")
+        if width > _MAX_SIDE or height > _MAX_SIDE:
+            raise ValueError(f"size dimensions must not exceed {_MAX_SIDE}")
+        if width * height > _MAX_PIXELS_PER_FRAME:
+            raise ValueError(
+                f"size must not exceed {_MAX_PIXELS_PER_FRAME} pixels per frame"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _bounded_workload(self):
+        if self.size is None:
+            return self
+        width, height = map(int, self.size.split("x"))
+        duration = self.duration_seconds if self.duration_seconds is not None else 5.0
+        fps = self.fps if self.fps is not None else 8
+        pixel_frames = width * height * duration * fps * self.n
+        if pixel_frames > _MAX_REQUEST_PIXEL_FRAMES:
+            raise ValueError(
+                "requested n × duration × fps × width × height exceeds the video "
+                f"budget of {_MAX_REQUEST_PIXEL_FRAMES} pixel-frames"
+            )
+        return self
 
 
 def build_router(registry: ModalityRegistry) -> APIRouter:

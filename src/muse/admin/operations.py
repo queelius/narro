@@ -16,20 +16,32 @@ import logging
 import subprocess
 import sys
 import threading
-from typing import Any, Callable
+import time
+from dataclasses import dataclass
+from typing import Any, BinaryIO, Callable
 
-from muse.admin.jobs import Job, JobStore
+from muse.admin.jobs import (
+    Job,
+    JobStore,
+    JobStoreFullError,
+    JobStoreShuttingDownError,
+)
 from muse.cli_impl.supervisor import (
     SupervisorState,
+    WorkerOperation,
+    WorkerShutdownResult,
     WorkerSpec,
     _shutdown_workers,
     backfill_manifest_memory,
+    claim_worker_operation,
+    finish_worker_operation,
     spawn_worker,
     wait_for_ready,
 )
 from muse.core.catalog import (
     _read_catalog,
     get_manifest,
+    is_enabled,
     is_pulled,
     known_models,
     remove as catalog_remove,
@@ -38,40 +50,6 @@ from muse.core.catalog import (
 from muse.core.venv import find_free_port
 
 logger = logging.getLogger(__name__)
-
-
-# Worker statuses that cannot serve traffic and will not recover on their
-# own: a "dead" worker exhausted its restart budget (or failed its initial
-# spawn); an "unhealthy" one is failing health checks. Both linger in
-# state.workers with job_id=None (the monitor never removes dead specs), so
-# the "already running / already loaded" fast paths in enable_model and
-# load_model_into_worker must NOT treat them as serviceable: they are
-# dropped so the caller falls through to a fresh spawn (H1).
-_UNSERVICEABLE_STATUSES = ("dead", "unhealthy")
-
-
-def _drop_unserviceable(
-    state: SupervisorState, model_id: str,
-) -> tuple[WorkerSpec | None, WorkerSpec | None]:
-    """Resolve the spec listing model_id into (serviceable, dropped).
-
-    If the matching spec is dead/unhealthy, remove it from state.workers and
-    return it as `dropped` (with `serviceable=None`) so the caller respawns
-    instead of claiming a stale port. A dropped spec may still own a LIVE
-    subprocess (an 'unhealthy' spec is one whose spawn succeeded but whose
-    wait_for_ready timed out, so its worker is alive and holding VRAM); the
-    caller MUST _shutdown_workers([dropped]) OUTSIDE state.lock to reap it,
-    else it orphans and leaks memory. Shutdown is not done here because this
-    runs under state.lock and SIGTERM+grace would block the lock for up to
-    5s. Must be called while holding state.lock.
-    """
-    existing = next(
-        (s for s in state.workers if model_id in s.models), None,
-    )
-    if existing is not None and existing.status in _UNSERVICEABLE_STATUSES:
-        state.workers.remove(existing)
-        return None, existing
-    return existing, None
 
 
 def _pick_free_port(
@@ -140,186 +118,285 @@ def find_worker_for_model(state: SupervisorState, model_id: str) -> WorkerSpec |
     return None
 
 
-def enable_model(
+def _director_method(state: SupervisorState, name: str) -> Callable[..., Any] | None:
+    """Return one real director API without triggering MagicMock attributes."""
+    director = getattr(state, "director", None)
+    descriptor = getattr(type(director), name, None)
+    if director is None or not callable(descriptor):
+        return None
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        return descriptor(director, *args, **kwargs)
+
+    return call
+
+
+def _allow_director_model(state: SupervisorState, model_id: str) -> None:
+    allow = _director_method(state, "allow_model")
+    if allow is not None:
+        allow(model_id)
+
+
+def _require_model_python_path(model_id: str) -> str:
+    """Return a pulled model's interpreter path or a user-facing error."""
+    if model_id not in known_models():
+        raise OperationError(
+            "model_not_found", f"unknown model {model_id!r}", status=404,
+        )
+    if not is_pulled(model_id):
+        raise OperationError(
+            "model_not_pulled",
+            f"model {model_id!r} not pulled; run pull first",
+            status=409,
+        )
+    entry = _read_catalog().get(model_id)
+    python_path = entry.get("python_path") if isinstance(entry, dict) else None
+    if not python_path:
+        raise OperationError(
+            "missing_venv",
+            f"model {model_id!r} has no per-model venv on record",
+            status=409,
+        )
+    return str(python_path)
+
+
+def _wait_for_worker_operation(
+    state: SupervisorState, operation: WorkerOperation,
+) -> None:
+    """Wait outside the state lock, remaining interruptible by shutdown."""
+    while not operation.done.wait(0.1):
+        _ensure_server_running(state)
+    _ensure_server_running(state)
+
+
+def _reinsert_retained_workers(
+    state: SupervisorState,
+    positioned_specs: list[tuple[int, WorkerSpec]],
+) -> None:
+    """Keep incompletely released process generations supervisor-owned."""
+    with state.lock:
+        for former_index, spec in sorted(positioned_specs, key=lambda item: item[0]):
+            spec.status = "dead"
+            spec.job_id = None
+            if any(candidate is spec for candidate in state.workers):
+                continue
+            state.workers.insert(
+                min(max(0, former_index), len(state.workers)),
+                spec,
+            )
+
+
+@dataclass(frozen=True)
+class _LoadOutcome:
+    port: int
+    spawned_new: bool
+    coalesced_owner: str | None = None
+
+
+def _load_model_with_ownership(
     model_id: str,
     *,
     state: SupervisorState,
-    store: JobStore,
-    job: Job,
-) -> None:
-    """Async operation: ensure `model_id` is loaded in some worker.
+    owner: str,
+    enable_in_catalog: bool,
+) -> _LoadOutcome:
+    """Load a model while exclusively owning its shared venv transition.
 
-    Plan-then-execute: state.lock is held only across state.workers
-    mutations + planning. The slow steps (spawn_worker + wait_for_ready,
-    or _restart_worker_inplace) run outside the lock so other admin
-    endpoints don't block for the full 120s readiness window.
-
-    Concurrent enables for the same model coalesce onto the first
-    caller's job_id: the second caller observes the existing pending
-    spec and returns its job_id rather than spawning a duplicate
-    worker. Both poll the same JobStore entry as the first caller's
-    spawn drives.
-
-    Terminal paths:
-      1. already_running: model is hosted in a worker with status="running"
-         (or status="pending" but no job_id, the legacy / test shape).
-         Result: loaded=True, spawned_new=False.
-      2. coalesce: model is in an in-flight pending spec with a job_id.
-         Result: loaded=False, spawned_new=False, coalesced_job_id set.
-      3. restart_sibling: a venv-group sibling exists and is running;
-         join it via restart-in-place. Slow step runs outside the lock.
-      4. spawn_new: brand-new worker for this model's python_path.
-         Slow step runs outside the lock.
+    A waiter never edits the current owner's WorkerSpec.  It waits for the
+    generation's completion, re-reads catalog + worker state, and either
+    observes the requested model running or owns a later generation.  This
+    intentionally permits two serialized restarts for concurrent requests
+    for different models in one venv; mutating the first restart's model
+    list after it constructed its command could otherwise report a model as
+    loaded even though that command never included it.
     """
-    store.update(job.job_id, state="running")
-    try:
+    coalesced_owner: str | None = None
+
+    while True:
         _ensure_server_running(state)
-        catalog_known = known_models()
-        if model_id not in catalog_known:
-            raise OperationError(
-                "model_not_found", f"unknown model {model_id!r}", status=404,
-            )
-        if not is_pulled(model_id):
-            raise OperationError(
-                "model_not_pulled",
-                f"model {model_id!r} not pulled; run pull first",
-                status=409,
-            )
+        python_path = _require_model_python_path(model_id)
+        operation, claimed = claim_worker_operation(
+            state, python_path=python_path, owner=owner,
+        )
+        if not claimed:
+            if coalesced_owner is None:
+                coalesced_owner = operation.owner
+            _wait_for_worker_operation(state, operation)
+            continue
 
-        catalog = _read_catalog()
-        python_path = catalog[model_id].get("python_path")
-        if not python_path:
-            raise OperationError(
-                "missing_venv",
-                f"model {model_id!r} has no per-model venv on record",
-                status=409,
-            )
+        try:
+            # Removal or repull may have won immediately before our claim.
+            # Revalidate only after ownership; never spawn from the stale
+            # catalog snapshot used to discover the coordination key.
+            current_python_path = _require_model_python_path(model_id)
+            if current_python_path != python_path:
+                continue
 
-        # Phase 1: plan + claim under a brief lock.
-        plan: str | None = None
-        spec_ref: WorkerSpec | None = None
-        coalesced_job_id: str | None = None
-        dropped: WorkerSpec | None = None
+            plan: str
+            spec_ref: WorkerSpec
+            planned_models: tuple[str, ...] | None = None
+            dropped: list[WorkerSpec] = []
+            dropped_positions: dict[int, int] = {}
+            sibling_rollback: tuple[
+                WorkerSpec, list[str], str, str | None,
+            ] | None = None
+            new_spec: WorkerSpec | None = None
 
-        with state.lock:
-            set_enabled(model_id, True)
+            if enable_in_catalog:
+                # Catalog flock/fsync may block. The per-venv operation claim
+                # already serializes this model transition, so do not hold the
+                # central routing lock across filesystem I/O.
+                set_enabled(model_id, True)
+                # Explicit enable is the only transition that clears a
+                # persistent director block installed by admin disable.
+                _allow_director_model(state, model_id)
+            else:
+                # Re-check after owning the venv generation. A catalog disable
+                # can race the gateway's initial check; a stale request must
+                # not resurrect the worker after that disable committed.
+                current_entry = _read_catalog().get(model_id)
+                if (
+                    isinstance(current_entry, dict)
+                    and not bool(current_entry.get("enabled", True))
+                ):
+                    raise OperationError(
+                        "model_disabled",
+                        f"model {model_id!r} is disabled",
+                        status=409,
+                    )
 
-            existing, dropped = _drop_unserviceable(state, model_id)
-            if existing is not None:
-                if existing.status == "running" or existing.job_id is None:
-                    # Either truly running, or a legacy / test-built spec
-                    # without a job_id. Both treated as "already loaded".
+            with state.lock:
+                worker_positions = {
+                    id(worker): index
+                    for index, worker in enumerate(state.workers)
+                }
+                existing = next(
+                    (s for s in state.workers if model_id in s.models), None,
+                )
+                if existing is not None and existing.status == "running":
                     plan = "already_running"
                     spec_ref = existing
                 else:
-                    # In-flight on someone else's job: coalesce.
-                    plan = "coalesce"
-                    spec_ref = existing
-                    coalesced_job_id = existing.job_id
-            else:
-                sibling = next(
-                    (s for s in state.workers if s.python_path == python_path),
-                    None,
-                )
-                if sibling is not None and (
-                    sibling.status == "running" or sibling.job_id is None
-                ):
-                    # Restart-in-place candidate: either truly running,
-                    # or a legacy / test-built spec with no in-flight
-                    # job. Claim it.
-                    sibling.models = sorted(set(sibling.models) | {model_id})
-                    sibling.status = "restarting"
-                    sibling.job_id = job.job_id
-                    plan = "restart_sibling"
-                    spec_ref = sibling
-                elif sibling is not None and sibling.job_id is not None:
-                    # Sibling already mid-restart for someone else: append
-                    # our model so the in-flight restart picks it up,
-                    # then coalesce onto that job.
-                    sibling.models = sorted(set(sibling.models) | {model_id})
-                    plan = "coalesce"
-                    spec_ref = sibling
-                    coalesced_job_id = sibling.job_id
-                else:
-                    new_port = _pick_free_port(state)
-                    new_spec = WorkerSpec(
-                        models=[model_id],
-                        python_path=python_path,
-                        port=new_port,
-                        device=state.device,
+                    # A pending/restarting spec without the matching active
+                    # operation is stale.  Remove it from routing ownership
+                    # and reap its possible process before replacement.
+                    if existing is not None:
+                        dropped_positions[id(existing)] = worker_positions[id(existing)]
+                        state.workers.remove(existing)
+                        dropped.append(existing)
+
+                    sibling = next(
+                        (
+                            s for s in state.workers
+                            if s.python_path == python_path
+                            and s.status == "running"
+                        ),
+                        None,
                     )
-                    new_spec.status = "pending"
-                    new_spec.job_id = job.job_id
-                    state.workers.append(new_spec)
-                    plan = "spawn_new"
-                    spec_ref = new_spec
+                    if sibling is not None:
+                        sibling_rollback = (
+                            sibling,
+                            list(sibling.models),
+                            sibling.status,
+                            sibling.job_id,
+                        )
+                        planned_models = tuple(
+                            sorted(set(sibling.models) | {model_id}),
+                        )
+                        sibling.models = list(planned_models)
+                        sibling.status = "restarting"
+                        sibling.job_id = operation.token
+                        plan = "restart_sibling"
+                        spec_ref = sibling
+                    else:
+                        # Reap any stale same-venv records before adding the
+                        # sole replacement spec. This also heals historical
+                        # duplicate pending records deterministically.
+                        stale_siblings = [
+                            s for s in state.workers
+                            if s.python_path == python_path
+                        ]
+                        for stale in stale_siblings:
+                            dropped_positions[id(stale)] = worker_positions[id(stale)]
+                            state.workers.remove(stale)
+                            dropped.append(stale)
+                        new_spec = WorkerSpec(
+                            models=[model_id],
+                            python_path=python_path,
+                            port=_pick_free_port(state),
+                            device=state.device,
+                        )
+                        new_spec.status = "pending"
+                        new_spec.job_id = operation.token
+                        state.workers.append(new_spec)
+                        planned_models = (model_id,)
+                        plan = "spawn_new"
+                        spec_ref = new_spec
 
-        # Phase 2: execute outside the lock. The slow steps (spawn,
-        # wait_for_ready, restart-in-place) run here so other admin
-        # endpoints don't block. Status flips happen under brief
-        # reacquisitions of state.lock.
-        #
-        # Reap a dropped dead/unhealthy worker first (outside the lock): it
-        # may still own a live subprocess holding VRAM, so terminate it
-        # before spawning the replacement (H1 follow-up). No-op when its
-        # process already exited or was never set.
-        if dropped is not None:
-            _shutdown_workers([dropped])
-
-        assert spec_ref is not None and plan is not None  # for type checker
-
-        if plan == "already_running":
-            store.update(
-                job.job_id, state="done",
-                result={
-                    "model_id": model_id,
-                    "worker_port": spec_ref.port,
-                    "loaded": True,
-                    "spawned_new": False,
-                },
-            )
-            return
-
-        if plan == "coalesce":
-            store.update(
-                job.job_id, state="done",
-                result={
-                    "model_id": model_id,
-                    "worker_port": spec_ref.port,
-                    "loaded": False,
-                    "spawned_new": False,
-                    "coalesced_job_id": coalesced_job_id,
-                },
-            )
-            return
-
-        if plan == "restart_sibling":
-            try:
-                _restart_worker_inplace(
-                    spec_ref,
-                    device=state.device,
-                    log_hub=getattr(state, "log_hub", None),
-                    stop_event=state.stop_event,
+            if dropped:
+                shutdown_result = _shutdown_workers(dropped)
+                retained = (
+                    list(shutdown_result.retained)
+                    if isinstance(shutdown_result, WorkerShutdownResult)
+                    else []
                 )
-            except Exception:
-                with state.lock:
-                    spec_ref.status = "dead"
-                    spec_ref.job_id = None
-                raise
-            with state.lock:
-                spec_ref.job_id = None
-            store.update(
-                job.job_id, state="done",
-                result={
-                    "model_id": model_id,
-                    "worker_port": spec_ref.port,
-                    "loaded": True,
-                    "spawned_new": False,
-                },
-            )
-            return
+                if retained:
+                    with state.lock:
+                        if sibling_rollback is not None:
+                            sibling, models, status, job_id = sibling_rollback
+                            if any(candidate is sibling for candidate in state.workers):
+                                sibling.models = models
+                                sibling.status = status
+                                sibling.job_id = job_id
+                        if new_spec is not None:
+                            try:
+                                state.workers.remove(new_spec)
+                            except ValueError:
+                                pass
+                    _reinsert_retained_workers(
+                        state,
+                        [
+                            (dropped_positions[id(spec)], spec)
+                            for spec in retained
+                        ],
+                    )
+                    raise OperationError(
+                        "worker_shutdown_incomplete",
+                        "a stale worker process could not be fully released",
+                        status=503,
+                    )
 
-        if plan == "spawn_new":
+            if plan == "already_running":
+                return _LoadOutcome(
+                    port=spec_ref.port,
+                    spawned_new=False,
+                    coalesced_owner=coalesced_owner,
+                )
+
+            if plan == "restart_sibling":
+                assert planned_models is not None
+                try:
+                    _restart_worker_inplace(
+                        spec_ref,
+                        models=planned_models,
+                        device=state.device,
+                        log_hub=getattr(state, "log_hub", None),
+                        stop_event=state.stop_event,
+                    )
+                except Exception:
+                    with state.lock:
+                        spec_ref.status = "dead"
+                        spec_ref.job_id = None
+                    raise
+                with state.lock:
+                    spec_ref.job_id = None
+                return _LoadOutcome(
+                    port=spec_ref.port,
+                    spawned_new=False,
+                    coalesced_owner=coalesced_owner,
+                )
+
+            assert plan == "spawn_new"
             try:
                 _ensure_server_running(state)
                 spawn_worker(
@@ -331,6 +408,8 @@ def enable_model(
                     port=spec_ref.port,
                     timeout=120.0,
                     stop_event=state.stop_event,
+                    expected_nonce=spec_ref.worker_nonce,
+                    worker=spec_ref,
                 )
             except Exception:
                 _shutdown_workers([spec_ref])
@@ -342,16 +421,40 @@ def enable_model(
             with state.lock:
                 spec_ref.status = "running"
                 spec_ref.job_id = None
-            store.update(
-                job.job_id, state="done",
-                result={
-                    "model_id": model_id,
-                    "worker_port": spec_ref.port,
-                    "loaded": True,
-                    "spawned_new": True,
-                },
+            return _LoadOutcome(
+                port=spec_ref.port,
+                spawned_new=True,
+                coalesced_owner=coalesced_owner,
             )
-            return
+        finally:
+            finish_worker_operation(state, operation)
+
+
+def enable_model(
+    model_id: str,
+    *,
+    state: SupervisorState,
+    store: JobStore,
+    job: Job,
+) -> None:
+    """Async operation: load ``model_id`` or await its current owner."""
+    store.update(job.job_id, state="running")
+    try:
+        outcome = _load_model_with_ownership(
+            model_id,
+            state=state,
+            owner=job.job_id,
+            enable_in_catalog=True,
+        )
+        result: dict[str, Any] = {
+            "model_id": model_id,
+            "worker_port": outcome.port,
+            "loaded": True,
+            "spawned_new": outcome.spawned_new,
+        }
+        if outcome.coalesced_owner is not None:
+            result["coalesced_job_id"] = outcome.coalesced_owner
+        store.update(job.job_id, state="done", result=result)
     except OperationError as e:
         store.update(job.job_id, state="failed", error=e.message)
     except Exception as e:  # noqa: BLE001
@@ -383,140 +486,23 @@ def load_model_into_worker(model_id: str, *, state: SupervisorState) -> int:
          the existing `_restart_worker_inplace` path joins it.
       3. spawn_new: brand-new worker for this model's python_path.
 
-    Concurrency contract (mirrors `enable_model`): the in-flight
-    pending spec is stamped with `spec.job_id = "director-load-<id>"`
-    before the slow spawn / restart phase, and cleared on success.
-    The auto-restart monitor skips specs whose `job_id` is non-None,
-    so it cannot race the director-driven cold load (which can take
-    10-60s for real models, far longer than the monitor's 5s tick).
+    Concurrency contract (mirrors `enable_model`): one generation-numbered
+    operation owns each shared ``python_path``. A concurrent admin/director
+    caller waits for that generation, then revalidates the catalog and
+    running model list. The owner also stamps its opaque token on the spec,
+    so the auto-restart monitor cannot race the slow transition.
 
     Raises OperationError on user-facing failures (model not found,
     not pulled, no venv on record). Other exceptions propagate to the
     director, which cleans up its in-flight Event and re-raises.
     """
-    _ensure_server_running(state)
-    catalog_known = known_models()
-    if model_id not in catalog_known:
-        raise OperationError(
-            "model_not_found", f"unknown model {model_id!r}", status=404,
-        )
-    if not is_pulled(model_id):
-        raise OperationError(
-            "model_not_pulled",
-            f"model {model_id!r} not pulled; run pull first",
-            status=409,
-        )
-
-    catalog = _read_catalog()
-    python_path = catalog[model_id].get("python_path")
-    if not python_path:
-        raise OperationError(
-            "missing_venv",
-            f"model {model_id!r} has no per-model venv on record",
-            status=409,
-        )
-
-    # Sentinel that marks the spec as "owned by a director-driven load
-    # in flight." The monitor skips specs with non-None job_id, so this
-    # protects the slow spawn window from a duplicate restart attempt.
-    job_sentinel = f"director-load-{model_id}"
-
-    # Phase 1: plan + claim under a brief lock.
-    plan: str | None = None
-    spec_ref: WorkerSpec | None = None
-    dropped: WorkerSpec | None = None
-
-    with state.lock:
-        existing, dropped = _drop_unserviceable(state, model_id)
-        if existing is not None and (
-            existing.status == "running" or existing.job_id is None
-        ):
-            # Already loaded; return the existing port.
-            plan = "already_running"
-            spec_ref = existing
-        else:
-            sibling = next(
-                (s for s in state.workers
-                 if s.python_path == python_path and s.status == "running"),
-                None,
-            )
-            if sibling is not None:
-                # Join the sibling's venv group via restart-in-place.
-                sibling.models = sorted(set(sibling.models) | {model_id})
-                sibling.status = "restarting"
-                sibling.job_id = job_sentinel
-                plan = "restart_sibling"
-                spec_ref = sibling
-            else:
-                new_port = _pick_free_port(state)
-                new_spec = WorkerSpec(
-                    models=[model_id],
-                    python_path=python_path,
-                    port=new_port,
-                    device=state.device,
-                )
-                new_spec.status = "pending"
-                new_spec.job_id = job_sentinel
-                state.workers.append(new_spec)
-                plan = "spawn_new"
-                spec_ref = new_spec
-
-    # Phase 2: execute outside the lock (the slow path).
-    # Reap a dropped dead/unhealthy worker first: it may still own a live
-    # subprocess holding VRAM, so terminate it before spawning the
-    # replacement (H1 follow-up). No-op if its process already exited.
-    if dropped is not None:
-        _shutdown_workers([dropped])
-
-    assert spec_ref is not None and plan is not None  # type checker
-
-    if plan == "already_running":
-        return spec_ref.port
-
-    if plan == "restart_sibling":
-        try:
-            _restart_worker_inplace(
-                spec_ref,
-                device=state.device,
-                log_hub=getattr(state, "log_hub", None),
-                stop_event=state.stop_event,
-            )
-        except Exception:
-            with state.lock:
-                spec_ref.status = "dead"
-                spec_ref.job_id = None
-            raise
-        with state.lock:
-            spec_ref.job_id = None
-        return spec_ref.port
-
-    if plan == "spawn_new":
-        try:
-            _ensure_server_running(state)
-            spawn_worker(
-                spec_ref,
-                device=state.device,
-                log_hub=getattr(state, "log_hub", None),
-            )
-            wait_for_ready(
-                port=spec_ref.port,
-                timeout=120.0,
-                stop_event=state.stop_event,
-            )
-        except Exception:
-            _shutdown_workers([spec_ref])
-            with state.lock:
-                spec_ref.status = "dead"
-                spec_ref.job_id = None
-            _ensure_server_running(state)
-            raise
-        with state.lock:
-            spec_ref.status = "running"
-            spec_ref.job_id = None
-        return spec_ref.port
-
-    # Unreachable; the assert above guarantees plan is set.
-    raise OperationError("unreachable", "load_model_into_worker fell through")
+    outcome = _load_model_with_ownership(
+        model_id,
+        state=state,
+        owner=f"director-load-{model_id}",
+        enable_in_catalog=False,
+    )
+    return outcome.port
 
 
 def unload_model_from_worker(model_id: str, *, state: SupervisorState) -> None:
@@ -527,19 +513,18 @@ def unload_model_from_worker(model_id: str, *, state: SupervisorState) -> None:
     service"; this just frees the memory slot so the director can
     load another model.
 
-    Plan-then-execute (mirrors `enable_model`): under state.lock we
-    pop the spec / mutate the model list and stamp `job_id` so the
-    monitor leaves the spec alone during the slow phase. The slow
-    steps (`_shutdown_workers` or `_restart_worker_inplace`, each a
-    multi-second subprocess wait or spawn cycle) run OUTSIDE the lock
-    so concurrent admin reads / hot-acquires never block on us.
+    Plan-then-execute (mirrors `enable_model`): first own the shared venv
+    generation, then under state.lock pop the spec or install an immutable
+    reduced-model plan and stamp the operation token. The slow steps
+    (`_shutdown_workers` or `_restart_worker_inplace`) run outside the lock,
+    while a competing worker transition waits on the generation event.
 
     Three paths:
       1. model_id not loaded in any worker: no-op.
       2. model_id is the only model in a worker: pop the spec, then
          terminate the worker (lock released for SIGTERM + grace).
       3. model_id is one of several in a worker (venv-group sibling):
-         claim the spec via job_id, then restart-in-place with the
+         claim the spec via the operation token, then restart-in-place with the
          reduced model list (lock released for spawn + readiness wait).
 
     On path (2), state.workers is mutated in place via
@@ -547,62 +532,144 @@ def unload_model_from_worker(model_id: str, *, state: SupervisorState) -> None:
     desynchronize the auto-restart monitor thread, which captured the
     original list reference at supervisor boot.
     """
-    spec_to_shutdown: WorkerSpec | None = None
-    spec_to_restart: WorkerSpec | None = None
-
-    # Phase 1: plan + claim under a brief lock.
-    with state.lock:
-        spec = find_worker_for_model(state, model_id)
-        if spec is None:
-            return
-
-        spec.models = [m for m in spec.models if m != model_id]
-        if not spec.models:
-            # Stamp job_id BEFORE popping so a monitor tick that
-            # snapshotted this spec earlier (see _monitor_workers'
-            # `list(specs)` snapshot) skips it via the `job_id is not
-            # None` guard instead of racing the outside-lock shutdown
-            # below: without this, the monitor could see the SIGTERMed
-            # process exit, ratchet failure_count to threshold, and
-            # _attempt_restart would spawn a brand-new subprocess on
-            # this port that is never tracked in state.workers again
-            # (orphan, leaked VRAM).
-            spec.job_id = f"director-unload-{model_id}"
-            # Pop the spec NOW so concurrent admin reads see the
-            # eviction commitment immediately. In-place mutation
-            # keeps the monitor's captured list reference live.
-            state.workers.remove(spec)
-            spec_to_shutdown = spec
-        else:
-            # Sibling models still live; claim the spec for restart-in-place
-            # via job_id so the monitor doesn't race us during the
-            # _restart_worker_inplace window.
-            spec.job_id = f"director-unload-{model_id}"
-            spec_to_restart = spec
-
-    # Phase 2: slow steps run OUTSIDE the lock.
-    if spec_to_shutdown is not None:
-        _shutdown_workers([spec_to_shutdown])
-        return
-
-    assert spec_to_restart is not None
-    try:
-        _restart_worker_inplace(
-            spec_to_restart,
-            device=state.device,
-            log_hub=getattr(state, "log_hub", None),
-            stop_event=state.stop_event,
-        )
-    except Exception:
+    while True:
         with state.lock:
-            spec_to_restart.status = "dead"
-            spec_to_restart.job_id = None
-        raise
-    with state.lock:
-        spec_to_restart.job_id = None
+            initial = next(
+                (s for s in state.workers if model_id in s.models), None,
+            )
+            if initial is None:
+                return
+            python_path = initial.python_path
+
+        operation, claimed = claim_worker_operation(
+            state,
+            python_path=python_path,
+            owner=f"director-unload-{model_id}",
+        )
+        if not claimed:
+            _wait_for_worker_operation(state, operation)
+            continue
+
+        try:
+            spec_to_shutdown: WorkerSpec | None = None
+            shutdown_index: int | None = None
+            spec_to_restart: WorkerSpec | None = None
+            planned_models: tuple[str, ...] = ()
+            retry = False
+
+            with state.lock:
+                spec = next(
+                    (s for s in state.workers if model_id in s.models), None,
+                )
+                if spec is None:
+                    return
+                if spec.python_path != python_path:
+                    retry = True
+                else:
+                    planned_models = tuple(
+                        m for m in spec.models if m != model_id
+                    )
+                    spec.job_id = operation.token
+                    if not planned_models:
+                        # Remove before shutdown so routing no longer sees
+                        # the eviction target. The token remains on stale
+                        # monitor snapshots until that process is reaped.
+                        shutdown_index = state.workers.index(spec)
+                        state.workers.remove(spec)
+                        spec_to_shutdown = spec
+                    else:
+                        spec.models = list(planned_models)
+                        spec.status = "restarting"
+                        spec_to_restart = spec
+
+            if retry:
+                continue
+            if spec_to_shutdown is not None:
+                shutdown_result = _shutdown_workers([spec_to_shutdown])
+                if (
+                    isinstance(shutdown_result, WorkerShutdownResult)
+                    and shutdown_result.retained_spec(spec_to_shutdown)
+                ):
+                    with state.lock:
+                        spec_to_shutdown.status = "dead"
+                        spec_to_shutdown.job_id = None
+                        if not any(
+                            candidate is spec_to_shutdown
+                            for candidate in state.workers
+                        ):
+                            index = min(
+                                shutdown_index
+                                if shutdown_index is not None
+                                else len(state.workers),
+                                len(state.workers),
+                            )
+                            state.workers.insert(index, spec_to_shutdown)
+                    raise OperationError(
+                        "worker_shutdown_incomplete",
+                        f"worker on port {spec_to_shutdown.port} could not "
+                        "be fully released",
+                        status=503,
+                    )
+                return
+
+            assert spec_to_restart is not None
+            try:
+                _restart_worker_inplace(
+                    spec_to_restart,
+                    models=planned_models,
+                    device=state.device,
+                    log_hub=getattr(state, "log_hub", None),
+                    stop_event=state.stop_event,
+                )
+            except Exception:
+                with state.lock:
+                    spec_to_restart.status = "dead"
+                    spec_to_restart.job_id = None
+                raise
+            with state.lock:
+                spec_to_restart.job_id = None
+            return
+        finally:
+            finish_worker_operation(state, operation)
 
 
 def disable_model(model_id: str, *, state: SupervisorState) -> dict:
+    """Disable through one director-owned teardown generation when available."""
+    if model_id not in known_models():
+        raise OperationError(
+            "model_not_found", f"unknown model {model_id!r}", status=404,
+        )
+
+    begin = _director_method(state, "begin_model_disable")
+    finish = _director_method(state, "finish_eviction")
+    claim = begin(model_id) if begin is not None else None
+    try:
+        result = _disable_model_worker(model_id, state=state)
+    except BaseException as exc:
+        if claim is not None and finish is not None:
+            finish(claim, success=False, error=exc)
+            # A failure before catalog commit restores the prior allow state.
+            # Once the catalog is disabled, remain fail-closed until explicit
+            # enable even if the worker teardown itself was incomplete.
+            try:
+                catalog_disabled = not is_enabled(model_id)
+            except Exception:  # noqa: BLE001
+                catalog_disabled = True
+            if not catalog_disabled and not bool(getattr(claim, "was_blocked", False)):
+                _allow_director_model(state, model_id)
+        raise
+
+    if claim is not None and finish is not None:
+        if finish(claim, success=True) is not True:
+            raise OperationError(
+                "director_state_changed",
+                f"disable ownership for model {model_id!r} changed unexpectedly",
+                status=503,
+            )
+    return result
+
+
+def _disable_model_worker(model_id: str, *, state: SupervisorState) -> dict:
     """Sync operation: catalog flip + worker unload.
 
     Plan-then-execute (mirrors `enable_model` and
@@ -630,124 +697,193 @@ def disable_model(model_id: str, *, state: SupervisorState) -> dict:
             "model_not_found", f"unknown model {model_id!r}", status=404,
         )
 
-    spec_to_shutdown: WorkerSpec | None = None
-    spec_to_restart: WorkerSpec | None = None
-    result_unloaded: dict | None = None
+    while True:
+        catalog_entry = _read_catalog().get(model_id)
+        with state.lock:
+            initial = next(
+                (s for s in state.workers if model_id in s.models), None,
+            )
+        python_path = (
+            initial.python_path
+            if initial is not None
+            else (
+                str(catalog_entry.get("python_path"))
+                if isinstance(catalog_entry, dict)
+                and catalog_entry.get("python_path")
+                else None
+            )
+        )
 
-    # Phase 1: plan + claim under a brief lock.
-    with state.lock:
-        spec = find_worker_for_model(state, model_id)
-        try:
-            set_enabled(model_id, False)
-        except KeyError:
-            # Model is in known_models() but not in catalog.json (e.g.
-            # bundled-but-not-pulled). Still report a coherent shape.
-            pass
-
-        if spec is None:
-            result_unloaded = {
+        # Bundled-but-unpulled models have no venv and therefore no worker
+        # transition with which to race. Preserve the coherent no-op shape.
+        if python_path is None:
+            try:
+                set_enabled(model_id, False)
+            except KeyError:
+                pass
+            return {
                 "model_id": model_id,
                 "loaded": False,
                 "worker_terminated": False,
                 "remaining_models_in_worker": [],
             }
-        else:
-            spec.models = [m for m in spec.models if m != model_id]
-            if not spec.models:
-                # Stamp job_id BEFORE popping so a monitor tick that
-                # snapshotted this spec earlier skips it via the
-                # `job_id is not None` guard rather than racing the
-                # outside-lock shutdown below and respawning an orphan
-                # worker on the freed port (see unload_model_from_worker
-                # for the full race description).
-                spec.job_id = f"admin-disable-{model_id}"
-                # Pop the spec NOW. In-place mutation keeps the monitor's
-                # captured list reference live.
-                state.workers.remove(spec)
-                spec_to_shutdown = spec
-            else:
-                # Claim the spec for restart-in-place via job_id so the
-                # monitor doesn't race us during _restart_worker_inplace.
-                spec.job_id = f"admin-disable-{model_id}"
-                spec_to_restart = spec
 
-    # Early-out path: no worker to touch.
-    if result_unloaded is not None:
-        return result_unloaded
-
-    # Phase 2: slow steps run OUTSIDE the lock.
-    if spec_to_shutdown is not None:
-        _shutdown_workers([spec_to_shutdown])
-        return {
-            "model_id": model_id,
-            "loaded": False,
-            "worker_terminated": True,
-            "worker_port": spec_to_shutdown.port,
-            "remaining_models_in_worker": [],
-        }
-
-    assert spec_to_restart is not None
-    try:
-        _restart_worker_inplace(
-            spec_to_restart,
-            device=state.device,
-            log_hub=getattr(state, "log_hub", None),
-            stop_event=state.stop_event,
+        operation, claimed = claim_worker_operation(
+            state,
+            python_path=python_path,
+            owner=f"admin-disable-{model_id}",
         )
-    except Exception:
-        # M12: invariant on restart failure in the disable path.
-        #
-        # At this point:
-        #   - model_id has already been removed from spec_to_restart.models
-        #     (done in Phase 1, under the lock).
-        #   - The catalog `enabled` flag for model_id is already False
-        #     (set_enabled called in Phase 1).
-        #   - _restart_worker_inplace tried to SIGTERM the worker process
-        #     and respawn it. If the restart failed, the worker may be in
-        #     an unknown state: it could be dead, partially started, or
-        #     (if SIGTERM was not delivered) still serving the OLD model
-        #     list that includes model_id.
-        #
-        # INTENT of disable is "stop serving model_id." On restart failure
-        # we cannot guarantee the new process will not serve the stale
-        # model, so we adopt the defensive invariant:
-        #   REMOVE the worker from state.workers and terminate the process.
-        # This ensures model_id is NOT reachable via any gateway route
-        # (state.workers is the routing source of truth) even if the OS
-        # process is still alive for a moment.
-        #
-        # After this, the operator must re-enable the remaining sibling
-        # models explicitly if they want them served again. The dead spec
-        # is removed from state.workers (no zombie entry); the monitor
-        # will not try to restart it because it's gone from the list.
-        with state.lock:
-            # Remove from the live worker list so the gateway cannot route
-            # to this worker. The spec may or may not still be in
-            # state.workers (a concurrent eviction could have removed it);
-            # discard() is safe either way.
-            try:
-                state.workers.remove(spec_to_restart)
-            except ValueError:
-                pass  # already removed by a concurrent operation
-            spec_to_restart.status = "dead"
-            spec_to_restart.job_id = None
-        # Best-effort SIGTERM: the process may already be dead from the
-        # failed restart attempt, but terminate it to be safe. Errors
-        # are swallowed; the process state is "best effort" at this point.
+        if not claimed:
+            _wait_for_worker_operation(state, operation)
+            continue
+
         try:
-            _shutdown_workers([spec_to_restart])
-        except Exception:  # noqa: BLE001
-            pass
-        raise
-    with state.lock:
-        spec_to_restart.job_id = None
-    return {
-        "model_id": model_id,
-        "loaded": False,
-        "worker_terminated": False,
-        "worker_port": spec_to_restart.port,
-        "remaining_models_in_worker": list(spec_to_restart.models),
-    }
+            spec_to_shutdown: WorkerSpec | None = None
+            shutdown_index: int | None = None
+            spec_to_restart: WorkerSpec | None = None
+            result_unloaded: dict | None = None
+            planned_models: tuple[str, ...] = ()
+            retry = False
+
+            current_entry = _read_catalog().get(model_id)
+            current_python_path = (
+                str(current_entry.get("python_path"))
+                if isinstance(current_entry, dict)
+                and current_entry.get("python_path")
+                else None
+            )
+            if current_python_path is not None and current_python_path != python_path:
+                continue
+
+            try:
+                set_enabled(model_id, False)
+            except KeyError:
+                pass
+
+            with state.lock:
+                spec = next(
+                    (s for s in state.workers if model_id in s.models), None,
+                )
+                if spec is not None and spec.python_path != python_path:
+                    retry = True
+                else:
+                    if spec is None:
+                        result_unloaded = {
+                            "model_id": model_id,
+                            "loaded": False,
+                            "worker_terminated": False,
+                            "remaining_models_in_worker": [],
+                        }
+                    else:
+                        planned_models = tuple(
+                            m for m in spec.models if m != model_id
+                        )
+                        spec.job_id = operation.token
+                        if not planned_models:
+                            shutdown_index = state.workers.index(spec)
+                            state.workers.remove(spec)
+                            spec_to_shutdown = spec
+                        else:
+                            spec.models = list(planned_models)
+                            spec.status = "restarting"
+                            spec_to_restart = spec
+
+            if retry:
+                continue
+            if result_unloaded is not None:
+                return result_unloaded
+            if spec_to_shutdown is not None:
+                shutdown_result = _shutdown_workers([spec_to_shutdown])
+                if (
+                    isinstance(shutdown_result, WorkerShutdownResult)
+                    and shutdown_result.retained_spec(spec_to_shutdown)
+                ):
+                    with state.lock:
+                        spec_to_shutdown.status = "dead"
+                        spec_to_shutdown.job_id = None
+                        if not any(
+                            candidate is spec_to_shutdown
+                            for candidate in state.workers
+                        ):
+                            index = min(
+                                shutdown_index
+                                if shutdown_index is not None
+                                else len(state.workers),
+                                len(state.workers),
+                            )
+                            state.workers.insert(index, spec_to_shutdown)
+                    raise OperationError(
+                        "worker_shutdown_incomplete",
+                        f"worker on port {spec_to_shutdown.port} could not "
+                        "be fully released",
+                        status=503,
+                    )
+                return {
+                    "model_id": model_id,
+                    "loaded": False,
+                    "worker_terminated": True,
+                    "worker_port": spec_to_shutdown.port,
+                    "remaining_models_in_worker": [],
+                }
+
+            assert spec_to_restart is not None
+            try:
+                _restart_worker_inplace(
+                    spec_to_restart,
+                    models=planned_models,
+                    device=state.device,
+                    log_hub=getattr(state, "log_hub", None),
+                    stop_event=state.stop_event,
+                )
+            except Exception:
+                # A failed replacement could still serve its old command.
+                # Remove it from routing and reap it before relinquishing
+                # ownership so the disabled model cannot reappear.
+                with state.lock:
+                    former_index = (
+                        state.workers.index(spec_to_restart)
+                        if any(
+                            candidate is spec_to_restart
+                            for candidate in state.workers
+                        )
+                        else len(state.workers)
+                    )
+                    try:
+                        state.workers.remove(spec_to_restart)
+                    except ValueError:
+                        pass
+                    spec_to_restart.status = "dead"
+                    spec_to_restart.job_id = None
+                try:
+                    shutdown_result = _shutdown_workers([spec_to_restart])
+                except Exception:  # noqa: BLE001
+                    shutdown_result = None
+                retained = (
+                    isinstance(shutdown_result, WorkerShutdownResult)
+                    and shutdown_result.retained_spec(spec_to_restart)
+                )
+                if shutdown_result is None:
+                    with spec_to_restart.process_lock:
+                        retained = (
+                            spec_to_restart.process is not None
+                            or spec_to_restart.log_thread is not None
+                        )
+                if retained:
+                    _reinsert_retained_workers(
+                        state, [(former_index, spec_to_restart)],
+                    )
+                raise
+            with state.lock:
+                spec_to_restart.job_id = None
+            return {
+                "model_id": model_id,
+                "loaded": False,
+                "worker_terminated": False,
+                "worker_port": spec_to_restart.port,
+                "remaining_models_in_worker": list(planned_models),
+            }
+        finally:
+            finish_worker_operation(state, operation)
 
 
 def warmup_model(model_id: str, *, state: SupervisorState) -> dict:
@@ -776,6 +912,8 @@ def warmup_model(model_id: str, *, state: SupervisorState) -> dict:
         the catalog but its weights/venv haven't been pulled yet.
         Validated upfront, before involving the director, to mirror
         `enable_model`'s preflight behavior.
+      OperationError("model_disabled", status=409): the model was disabled
+        by the operator and cannot be warmed until it is enabled again.
       OperationError("director_unavailable", status=503): supervisor
         state has no director (supervisor not booted).
       OperationError("model_too_large_for_device", status=503): from
@@ -790,6 +928,12 @@ def warmup_model(model_id: str, *, state: SupervisorState) -> dict:
         raise OperationError(
             "model_not_pulled",
             f"model {model_id!r} not pulled; run pull first",
+            status=409,
+        )
+    if not is_enabled(model_id):
+        raise OperationError(
+            "model_disabled",
+            f"model {model_id!r} is disabled; enable it before warmup",
             status=409,
         )
 
@@ -807,9 +951,27 @@ def warmup_model(model_id: str, *, state: SupervisorState) -> dict:
     # model reads memory_gb as the fallback 0.0, so the director thinks
     # it "fits" for free, reserves 0 memory against concurrent loads,
     # and can over-admit -> OOM.
-    manifest = backfill_manifest_memory(manifest, model_id)
+    manifest = backfill_manifest_memory(
+        manifest, model_id, supervisor_device=state.device,
+    )
     worker_port = state.director.warmup(model_id, manifest=manifest)
     return {"model_id": model_id, "worker_port": worker_port}
+
+
+def _spec_may_hold_worker_resources(spec: WorkerSpec) -> bool:
+    """Return whether a spec can still own a process or its open files."""
+    if spec.status != "dead":
+        return True
+    with spec.process_lock:
+        # Even an exited leader remains an ownership token until its full
+        # process group, reader, and persistent registry record are released.
+        # Never poll here: reaping a pinned PID==PGID would make the stored
+        # numeric group identity unsafe before supervisor cleanup drains it.
+        return bool(
+            spec.process is not None
+            or spec.log_thread is not None
+            or spec.resource_id is not None
+        )
 
 
 def remove_model(model_id: str, *, state: SupervisorState, purge: bool) -> dict:
@@ -824,27 +986,103 @@ def remove_model(model_id: str, *, state: SupervisorState, purge: bool) -> dict:
         raise OperationError(
             "model_not_found", f"unknown model {model_id!r}", status=404,
         )
-    # A "dead" spec (exhausted its restart budget or failed initial spawn)
-    # lingers in state.workers but its process is gone, so it holds no FDs
-    # against the venv we're about to delete: it must NOT block removal.
-    # Every other status (running / pending / restarting / unhealthy) may
-    # still own a live subprocess, so those still 409 until the operator
-    # disables first (which reaps the process). See _drop_unserviceable for
-    # why "unhealthy" is treated as possibly-live. We check EVERY hosting
-    # spec, not just the first found, so a dead spec listed ahead of a live
-    # one can't mask the live one.
+    catalog_entry = _read_catalog().get(model_id)
     with state.lock:
-        live_host = any(
-            model_id in s.models and s.status != "dead" for s in state.workers
+        initial = next(
+            (s for s in state.workers if model_id in s.models), None,
         )
-    if live_host:
-        raise OperationError(
-            "model_loaded",
-            f"model {model_id!r} is currently loaded; disable it first",
-            status=409,
+    python_path = (
+        initial.python_path
+        if initial is not None
+        else (
+            str(catalog_entry.get("python_path"))
+            if isinstance(catalog_entry, dict) and catalog_entry.get("python_path")
+            else None
         )
-    catalog_remove(model_id, purge=purge)
-    return {"model_id": model_id, "removed": True, "purged": bool(purge)}
+    )
+
+    # A malformed pulled entry with no interpreter cannot be loaded, so it
+    # has no worker-operation key. Catalog removal still applies its own
+    # filesystem confinement and transaction lock.
+    if python_path is None:
+        catalog_remove(model_id, purge=purge)
+        _allow_director_model(state, model_id)
+        return {"model_id": model_id, "removed": True, "purged": bool(purge)}
+
+    while True:
+        operation, claimed = claim_worker_operation(
+            state,
+            python_path=python_path,
+            owner=f"admin-remove-{model_id}",
+        )
+        if not claimed:
+            _wait_for_worker_operation(state, operation)
+            # The completed operation may have replaced the catalog entry
+            # with a different venv. Recompute before claiming a generation.
+            refreshed = _read_catalog().get(model_id)
+            if isinstance(refreshed, dict) and refreshed.get("python_path"):
+                python_path = str(refreshed["python_path"])
+            continue
+
+        try:
+            # Recheck only after owning the venv. A concurrent load that won
+            # first is now visible and blocks deletion; a load that arrives
+            # later waits until removal completes and then fails its catalog
+            # revalidation rather than spawning from a deleted venv.
+            refreshed = _read_catalog().get(model_id)
+            refreshed_python_path = (
+                str(refreshed.get("python_path"))
+                if isinstance(refreshed, dict) and refreshed.get("python_path")
+                else None
+            )
+            if (
+                refreshed_python_path is not None
+                and refreshed_python_path != python_path
+            ):
+                python_path = refreshed_python_path
+                continue
+            with state.lock:
+                live_host = next(
+                    (
+                        s for s in state.workers
+                        if model_id in s.models
+                        and _spec_may_hold_worker_resources(s)
+                    ),
+                    None,
+                )
+                live_shared_venv = next(
+                    (
+                        s for s in state.workers
+                        if purge
+                        and s.python_path == python_path
+                        and _spec_may_hold_worker_resources(s)
+                    ),
+                    None,
+                )
+            if live_host is not None or live_shared_venv is not None:
+                shared_detail = (
+                    " or its shared environment is in use"
+                    if live_host is None else ""
+                )
+                raise OperationError(
+                    "model_loaded",
+                    f"model {model_id!r} is currently loaded{shared_detail}; "
+                    "disable the affected worker first",
+                    status=409,
+                )
+            if not is_pulled(model_id):
+                raise OperationError(
+                    "model_not_found", f"unknown model {model_id!r}", status=404,
+                )
+            catalog_remove(model_id, purge=purge)
+            _allow_director_model(state, model_id)
+            return {
+                "model_id": model_id,
+                "removed": True,
+                "purged": bool(purge),
+            }
+        finally:
+            finish_worker_operation(state, operation)
 
 
 def probe_model(
@@ -898,6 +1136,158 @@ def pull_model(identifier: str, *, store: JobStore, job: Job) -> None:
     _run_subprocess_into_job(cmd, store=store, job=job, success_op="pull")
 
 
+_SUBPROCESS_TIMEOUT_SECONDS = 1800
+_SUBPROCESS_STREAM_TAIL_BYTES = 256 * 1024
+_SUBPROCESS_READ_CHUNK_BYTES = 64 * 1024
+_SUBPROCESS_OUTPUT_DRAIN_SECONDS = 5.0
+_SUBPROCESS_FINAL_DRAIN_SECONDS = 1.0
+_SUBPROCESS_LOG_MAX_LINES = 2000
+
+
+class _BoundedByteTail:
+    """Thread-safe fixed-size tail of one subprocess byte stream."""
+
+    def __init__(self, *, limit: int, label: str) -> None:
+        self._limit = limit
+        self._label = label
+        self._data = bytearray()
+        self._total = 0
+        self._read_error: str | None = None
+        self._lock = threading.Lock()
+
+    def append(self, chunk: bytes) -> None:
+        with self._lock:
+            self._total += len(chunk)
+            if len(chunk) >= self._limit:
+                self._data[:] = chunk[-self._limit:]
+                return
+            overflow = len(self._data) + len(chunk) - self._limit
+            if overflow > 0:
+                del self._data[:overflow]
+            self._data.extend(chunk)
+
+    def record_read_error(self, error: BaseException) -> None:
+        with self._lock:
+            self._read_error = type(error).__name__
+
+    def render(self) -> str:
+        with self._lock:
+            data = bytes(self._data)
+            omitted = self._total - len(data)
+            read_error = self._read_error
+
+        parts: list[str] = []
+        if omitted:
+            parts.append(
+                f"[... {self._label} truncated; {omitted} byte(s) omitted ...]\n"
+            )
+        parts.append(data.decode("utf-8", errors="replace"))
+        if read_error:
+            if parts[-1] and not parts[-1].endswith("\n"):
+                parts.append("\n")
+            parts.append(
+                f"[... {self._label} capture failed: {read_error} ...]"
+            )
+        return "".join(parts)
+
+
+class _ProcessOutputCapture:
+    """Continuously drain two child pipes while retaining bounded tails.
+
+    `Popen.communicate()` accumulates each complete stream in memory. Pulls
+    and probes can be noisy and long-running, so two daemon readers drain the
+    pipes concurrently (avoiding a full-stderr/full-stdout deadlock) while
+    `_BoundedByteTail` keeps memory independent of total child output.
+    """
+
+    def __init__(self, stdout: BinaryIO | None, stderr: BinaryIO | None) -> None:
+        self._streams = {"stdout": stdout, "stderr": stderr}
+        self._tails = {
+            label: _BoundedByteTail(
+                limit=_SUBPROCESS_STREAM_TAIL_BYTES,
+                label=label,
+            )
+            for label in self._streams
+        }
+        self._threads = {
+            label: threading.Thread(
+                target=self._drain,
+                args=(label, stream),
+                name=f"muse-admin-{label}-drain",
+                daemon=True,
+            )
+            for label, stream in self._streams.items()
+        }
+        self._started: set[str] = set()
+
+    def start(self) -> None:
+        for label, thread in self._threads.items():
+            thread.start()
+            self._started.add(label)
+
+    def finish(self, timeout: float) -> bool:
+        """Boundedly drain, then close owned pipes and join their readers."""
+        timeout = max(0.0, timeout)
+        started_at = time.monotonic()
+        deadline = started_at + timeout
+        # Preserve most of the budget for natural EOF, while reserving time
+        # to close our read descriptors and let blocked readers unwind when a
+        # descendant inherited a write descriptor after the leader exited.
+        natural_deadline = started_at + timeout * 0.8
+        for label in self._started:
+            thread = self._threads[label]
+            thread.join(timeout=max(0.0, natural_deadline - time.monotonic()))
+
+        complete = len(self._started) == len(self._threads)
+        for label, thread in self._threads.items():
+            if label in self._started and thread.is_alive():
+                complete = False
+            stream = self._streams[label]
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("could not close owned %s capture pipe", label)
+
+        for label in self._started:
+            thread = self._threads[label]
+            if thread.is_alive():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return complete
+
+    def snapshot(self) -> tuple[str, str]:
+        return self._tails["stdout"].render(), self._tails["stderr"].render()
+
+    def _drain(self, label: str, stream: BinaryIO | None) -> None:
+        if stream is None:
+            self._tails[label].record_read_error(RuntimeError("missing pipe"))
+            return
+        try:
+            while True:
+                chunk = stream.read(_SUBPROCESS_READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
+                self._tails[label].append(bytes(chunk))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("could not capture admin subprocess %s: %s", label, e)
+            self._tails[label].record_read_error(e)
+
+
+def _bounded_subprocess_log_lines(stdout: str, stderr: str) -> list[str]:
+    """Combine stream tails while bounding pathological one-byte lines."""
+    lines = stdout.splitlines() + stderr.splitlines()
+    if len(lines) <= _SUBPROCESS_LOG_MAX_LINES:
+        return lines
+    retained = _SUBPROCESS_LOG_MAX_LINES - 1
+    omitted = len(lines) - retained
+    return [
+        f"[... {omitted} earlier combined log line(s) omitted ...]",
+        *lines[-retained:],
+    ]
+
+
 def _run_subprocess_into_job(
     cmd: list[str],
     *,
@@ -905,15 +1295,58 @@ def _run_subprocess_into_job(
     job: Job,
     success_op: str,
 ) -> None:
-    """Run `cmd` to completion; capture stdout/stderr into the Job.
+    """Run `cmd` to completion; retain bounded stdout/stderr tails.
 
     On success: state=done, log_lines populated, result contains the op
     name + return code + stdout. On failure: state=failed, error has the
-    return code + stderr.
+    return code + stderr. Pipes are drained concurrently throughout the run,
+    so neither a noisy child nor the serialized Job payload can grow memory
+    without bound.
     """
+    proc: subprocess.Popen | None = None
+    capture: _ProcessOutputCapture | None = None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        log_lines = (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines()
+        proc = store.spawn_process(
+            job.job_id,
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        capture = _ProcessOutputCapture(proc.stdout, proc.stderr)
+        capture.start()
+        store.wait_process(
+            job.job_id,
+            proc,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+
+        output_closed = capture.finish(_SUBPROCESS_OUTPUT_DRAIN_SECONDS)
+        if not output_closed:
+            # The direct child exited but a descendant may still hold an
+            # inherited pipe FD. The exact leader has already been reaped, so
+            # its numeric PGID is no longer a safe identity. `finish` closes
+            # Muse's owned read descriptors and boundedly joins the readers.
+            capture.finish(_SUBPROCESS_FINAL_DRAIN_SECONDS)
+
+        stdout, stderr = capture.snapshot()
+        log_lines = _bounded_subprocess_log_lines(stdout, stderr)
+        if store.process_cancel_requested(job.job_id, proc):
+            store.update(
+                job.job_id,
+                state="failed",
+                log_lines=log_lines,
+                error="subprocess cancelled during server shutdown",
+            )
+            return
+        if not output_closed:
+            store.update(
+                job.job_id,
+                state="failed",
+                log_lines=log_lines,
+                error="subprocess output streams did not close",
+            )
+            return
         if proc.returncode == 0:
             store.update(
                 job.job_id, state="done",
@@ -921,43 +1354,87 @@ def _run_subprocess_into_job(
                 result={
                     "op": success_op,
                     "returncode": 0,
-                    "stdout": proc.stdout,
+                    "stdout": stdout,
                 },
             )
         else:
             store.update(
                 job.job_id, state="failed",
                 log_lines=log_lines,
-                error=f"exit {proc.returncode}: {proc.stderr.strip() or 'subprocess failed'}",
+                error=f"exit {proc.returncode}: {stderr.strip() or 'subprocess failed'}",
             )
     except subprocess.TimeoutExpired:
-        store.update(job.job_id, state="failed", error="subprocess timed out")
+        if proc is not None:
+            store.terminate_process(job.job_id, proc, timeout=5.0)
+        if capture is not None:
+            capture.finish(_SUBPROCESS_FINAL_DRAIN_SECONDS)
+            timeout_stdout, timeout_stderr = capture.snapshot()
+        else:
+            timeout_stdout, timeout_stderr = "", ""
+        cancelled = bool(
+            proc is not None
+            and store.process_cancel_requested(job.job_id, proc)
+        )
+        store.update(
+            job.job_id,
+            state="failed",
+            error=(
+                "subprocess cancelled during server shutdown"
+                if cancelled else "subprocess timed out"
+            ),
+            log_lines=_bounded_subprocess_log_lines(
+                timeout_stdout, timeout_stderr,
+            ),
+        )
+    except JobStoreShuttingDownError:
+        store.update(
+            job.job_id,
+            state="failed",
+            error="subprocess cancelled during server shutdown",
+        )
     except Exception as e:  # noqa: BLE001
+        if proc is not None:
+            store.terminate_process(job.job_id, proc, timeout=5.0)
+        if capture is not None:
+            capture.finish(_SUBPROCESS_FINAL_DRAIN_SECONDS)
         logger.exception("subprocess job failed")
         store.update(job.job_id, state="failed", error=str(e))
+    finally:
+        if proc is not None:
+            store.release_process(job.job_id, proc)
 
 
 def _restart_worker_inplace(
     spec: WorkerSpec,
     *,
+    models: tuple[str, ...] | None = None,
     device: str,
     log_hub: "Any | None" = None,
     stop_event: "threading.Event | None" = None,
 ) -> None:
-    """Terminate + respawn one worker with its current `spec.models`.
+    """Terminate + respawn one worker from an immutable model snapshot.
 
     Used by enable_model (joining a venv group) and disable_model
-    (dropping a model from a multi-model worker). Reuses the spec's
-    port, python_path, and updated models list. restart_count bumps so
-    the auto-restart monitor sees this in its bookkeeping; failure_count
-    resets so we don't carry over stale unhealthy state.
+    (dropping a model from a multi-model worker). ``models`` is captured by
+    the operation owner before the slow phase; a concurrent caller waits
+    for that operation rather than changing this command plan. Direct
+    legacy callers may omit it to snapshot the current ``spec.models`` at
+    function entry. Reuses the spec's port and python_path. A replacement that
+    reaches readiness resets the consecutive auto-restart failure budget.
 
     `log_hub` is forwarded to `spawn_worker` so a restart-in-place keeps
     piping the worker's stdout into the LogHub when telemetry is enabled
     (callers pass `state.log_hub`).
     """
+    planned_models = tuple(spec.models) if models is None else tuple(models)
     _shutdown_workers([spec])
-    spec.process = None
+    with spec.process_lock:
+        if spec.process is not None:
+            raise OperationError(
+                "worker_shutdown_incomplete",
+                f"worker on port {spec.port} could not be fully released",
+                status=503,
+            )
     if stop_event is not None and stop_event.is_set():
         raise OperationError(
             "server_shutting_down",
@@ -965,11 +1442,15 @@ def _restart_worker_inplace(
             status=503,
         )
     spec.failure_count = 0
-    spec.restart_count += 1
+    spec.models = list(planned_models)
     try:
         spawn_worker(spec, device=device, log_hub=log_hub)
         wait_for_ready(
-            port=spec.port, timeout=120.0, stop_event=stop_event,
+            port=spec.port,
+            timeout=120.0,
+            stop_event=stop_event,
+            expected_nonce=spec.worker_nonce,
+            worker=spec,
         )
     except Exception:
         _shutdown_workers([spec])
@@ -980,6 +1461,7 @@ def _restart_worker_inplace(
                 status=503,
             ) from None
         raise
+    spec.restart_count = 0
     spec.status = "running"
 
 
@@ -1004,7 +1486,16 @@ def launch_async(
     positional argument (the common case for enable_model / probe_model
     / pull_model whose signature starts with `model_id`).
     """
-    job = store.create(op_name, model_id)
+    try:
+        job = store.create(op_name, model_id)
+    except JobStoreFullError as e:
+        raise OperationError(
+            "admin_job_capacity", str(e), status=503, retryable=True,
+        ) from e
+    except JobStoreShuttingDownError as e:
+        raise OperationError(
+            "server_shutting_down", str(e), status=503, retryable=True,
+        ) from e
     if not op_args:
         op_args = (model_id,)
     thread = threading.Thread(
@@ -1014,6 +1505,27 @@ def launch_async(
         daemon=True,
         name=f"muse-admin-{op_name}-{job.job_id}",
     )
-    job.thread = thread
-    thread.start()
+    try:
+        store.start_thread(job.job_id, thread)
+    except JobStoreShuttingDownError as e:
+        store.update(
+            job.job_id,
+            state="failed",
+            error="admin job cancelled during server shutdown",
+        )
+        raise OperationError(
+            "server_shutting_down", str(e), status=503, retryable=True,
+        ) from e
+    except Exception as e:  # noqa: BLE001
+        store.update(
+            job.job_id,
+            state="failed",
+            error="admin job thread could not be started",
+        )
+        raise OperationError(
+            "admin_job_start_failed",
+            "admin job thread could not be started",
+            status=503,
+            retryable=True,
+        ) from e
     return job

@@ -1,5 +1,5 @@
 """Tests for POST /v1/images/animations."""
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -59,7 +59,7 @@ def client_img2vid():
 
 
 def test_post_returns_webp_by_default(client_text_only):
-    client, _backend = client_text_only
+    client, backend = client_text_only
     r = client.post("/v1/images/animations", json={
         "prompt": "a cat playing", "model": "fake-anim",
     })
@@ -72,6 +72,7 @@ def test_post_returns_webp_by_default(client_text_only):
     assert asset[:4] == b"RIFF"
     assert asset[8:12] == b"WEBP"
     assert body["metadata"]["format"] == "webp"
+    assert backend.last_kwargs["frames"] == 16
 
 
 def test_post_response_format_gif(client_text_only):
@@ -128,6 +129,24 @@ def test_post_image_with_img2vid_model_passes_through(client_img2vid):
     assert backend.last_kwargs.get("strength") == 0.6
 
 
+def test_post_closes_decoded_init_image(client_img2vid):
+    client, _backend = client_img2vid
+    decoded = MagicMock()
+
+    with patch(
+        "muse.modalities.image_animation.routes.decode_image_input",
+        new=AsyncMock(return_value=decoded),
+    ):
+        response = client.post("/v1/images/animations", json={
+            "prompt": "x",
+            "model": "fake-anim",
+            "image": "data:image/png;base64,eA==",
+        })
+
+    assert response.status_code == 200, response.text
+    decoded.close.assert_called_once_with()
+
+
 def test_post_unknown_model_returns_404(client_text_only):
     client, _ = client_text_only
     r = client.post("/v1/images/animations", json={
@@ -163,6 +182,25 @@ def test_post_frames_out_of_range_rejected(client_text_only):
         "prompt": "x", "model": "fake-anim", "frames": 999,
     })
     assert r.status_code in (400, 422)
+
+
+def test_post_oversized_dimensions_rejected_before_backend(client_text_only):
+    client, backend = client_text_only
+    r = client.post("/v1/images/animations", json={
+        "prompt": "x", "model": "fake-anim", "size": "99999x99999",
+    })
+    assert r.status_code == 422
+    assert backend.last_kwargs is None
+
+
+def test_post_excessive_pixel_frame_workload_rejected(client_text_only):
+    client, backend = client_text_only
+    r = client.post("/v1/images/animations", json={
+        "prompt": "x", "model": "fake-anim", "size": "2048x1024",
+        "frames": 64, "n": 4,
+    })
+    assert r.status_code == 422
+    assert backend.last_kwargs is None
 
 
 def test_backend_error_returns_openai_envelope():

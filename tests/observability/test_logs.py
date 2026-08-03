@@ -1,6 +1,14 @@
 import queue
 
+import pytest
+
 from muse.observability.logs import LogHub, SUBSCRIBER_QUEUE_MAXSIZE
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "32"])
+def test_buffer_bytes_requires_positive_integer(value):
+    with pytest.raises(ValueError, match="positive integer"):
+        LogHub(buffer_bytes=value)
 
 def test_snapshot_and_byte_bound():
     hub = LogHub(buffer_bytes=20)
@@ -19,6 +27,19 @@ def test_pubsub_delivers_new_lines():
     hub.append("m", "after")
     assert q.qsize() == 0  # unsubscribed -> no more
 
+
+def test_subscribe_with_snapshot_has_gap_free_nonduplicating_handoff():
+    hub = LogHub()
+    hub.append("m", "before")
+
+    history, q = hub.subscribe_with_snapshot("m")
+    hub.append("m", "after")
+
+    assert history == ["before"]
+    assert q.get_nowait() == "after"
+    assert q.empty()
+    hub.unsubscribe("m", q)
+
 def test_eviction_counts_utf8_bytes_not_chars():
     # 3 emoji chars, but each is a 4-byte UTF-8 sequence -> 12 bytes total.
     # Under (buggy) char-count accounting this line would measure as 3
@@ -32,20 +53,31 @@ def test_eviction_counts_utf8_bytes_not_chars():
     hub = LogHub(buffer_bytes=8)
     hub.append("m", emoji_line)
 
-    # Oversized-single-line rule: 12 > 8, but it's the only line, so it
-    # is retained rather than evicted to empty.
+    # A single line can no longer bypass the total byte bound. The UTF-8
+    # sequence is replaced with an ASCII truncation marker that fits exactly.
     snap = hub.snapshot("m")
-    assert snap == [emoji_line]
+    assert len(snap) == 1
+    assert len(snap[0].encode("utf-8")) <= 8
+    assert emoji_line not in snap
 
-    # A second short ASCII line pushes the running byte count to 14
-    # (12 + 2), which is > 8 with more than one line buffered, so the
-    # emoji line must be evicted. Under char-count accounting the running
-    # count would have been 3 + 2 = 5 <= 8, and the emoji line would have
-    # wrongly survived.
+    # A second short line evicts the capped predecessor as needed.
     hub.append("m", "hi")
     snap = hub.snapshot("m")
     assert emoji_line not in snap
     assert snap == ["hi"]
+
+
+def test_oversized_line_is_capped_before_subscriber_fanout():
+    hub = LogHub(buffer_bytes=32)
+    q = hub.subscribe("m")
+
+    hub.append("m", "x" * 10_000)
+
+    buffered = hub.snapshot("m")[0]
+    published = q.get_nowait()
+    assert buffered == published
+    assert len(buffered.encode("utf-8")) <= 32
+    assert buffered.endswith("...[truncated]")
 
 
 def test_subscriber_queue_is_bounded_and_does_not_block_or_raise():
@@ -76,3 +108,12 @@ def test_fresh_subscriber_after_a_stalled_one_still_receives_new_lines():
     assert fresh.get_nowait() == "fresh-line"
     # The stalled subscriber's queue is still capped, not raising/blocking.
     assert stalled.qsize() == SUBSCRIBER_QUEUE_MAXSIZE
+
+
+def test_unsubscribe_removes_empty_model_subscription_bucket():
+    hub = LogHub()
+    q = hub.subscribe("transient-model")
+
+    hub.unsubscribe("transient-model", q)
+
+    assert "transient-model" not in hub._subscribers

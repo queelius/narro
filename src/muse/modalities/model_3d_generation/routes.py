@@ -22,7 +22,6 @@ the client.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 
 from fastapi import APIRouter, File, Form, UploadFile
@@ -32,6 +31,11 @@ from pydantic import BaseModel, Field
 from muse.core import config
 from muse.core.errors import ModelNotFoundError, error_response
 from muse.core.registry import ModalityRegistry
+from muse.modalities._native_offload import run_native_offload
+from muse.modalities.image_generation.image_input import (
+    close_decoded_images,
+    decode_image_file,
+)
 from muse.modalities.model_3d_generation.codec import encode_3d_response
 
 
@@ -134,7 +138,7 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 return backend.text_to_3d(req.prompt, **kwargs)
 
         try:
-            results = await asyncio.to_thread(_call)
+            results = await run_native_offload(_call)
         except Exception:  # noqa: BLE001
             # Log the real exception server-side but never leak it to the
             # client: str(e) can carry internal filesystem paths, CUDA
@@ -162,20 +166,7 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
         seed: int | None = Form(None),
         response_format: str = Form("b64_json"),
     ):
-        # Bounded read so a malicious giant upload doesn't OOM the
-        # worker. Cap is read per-request (env override takes effect
-        # immediately).
         cap = _max_bytes()
-        raw = await image.read(cap + 1)
-        if not raw:
-            return error_response(
-                400, "invalid_image", "uploaded image is empty",
-            )
-        if len(raw) > cap:
-            return error_response(
-                400, "invalid_image",
-                f"uploaded image exceeds MUSE_3D_INPUT_MAX_BYTES={cap} bytes",
-            )
 
         # n + response_format gates: 400 before invoking the backend.
         if not (1 <= n <= 2):
@@ -214,7 +205,7 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 f"prompt instead",
             )
 
-        # Decode the raw bytes to a PIL Image once, in the async layer,
+        # Decode the bounded upload to a PIL Image once, in the async layer,
         # before entering the worker thread. All runtimes (TripoSR,
         # TRELLIS, Hunyuan3D) accept PIL.Image.Image; the unified contract
         # avoids runtime-specific path vs. PIL dispatching.
@@ -225,11 +216,26 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 "the uploaded image. Run `muse models refresh <id>`.",
             )
         try:
-            pil_image = _PIL_Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception as e:  # noqa: BLE001
+            pil_image = await decode_image_file(image, max_bytes=cap)
+            if pil_image.mode != "RGB":
+                original = pil_image
+                try:
+                    pil_image = original.convert("RGB")
+                except BaseException:
+                    close_decoded_images([original])
+                    raise
+                else:
+                    close_decoded_images([original])
+        except ValueError as e:
+            message = str(e)
+            if "image bytes exceeds max" in message:
+                message = (
+                    "uploaded image exceeds "
+                    f"MUSE_3D_INPUT_MAX_BYTES={cap} bytes"
+                )
             return error_response(
                 400, "invalid_image",
-                f"uploaded file is not a valid image: {e}",
+                f"uploaded file is not a valid image: {message}",
             )
 
         kwargs: dict = {"n": n}
@@ -240,8 +246,17 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
             with backend._inference_lock:
                 return backend.image_to_3d(pil_image, **kwargs)
 
+        abandoned = False
         try:
-            results = await asyncio.to_thread(_call)
+            results = await run_native_offload(
+                _call,
+                cleanup_abandoned=(
+                    lambda _result: close_decoded_images([pil_image])
+                ),
+            )
+        except asyncio.CancelledError:
+            abandoned = True
+            raise
         except Exception:  # noqa: BLE001
             # Log the real exception server-side but never leak it to the
             # client: str(e) can carry internal filesystem paths, CUDA
@@ -251,6 +266,9 @@ def build_router(registry: ModalityRegistry) -> APIRouter:
                 500, "internal_error",
                 "image-to-3d backend failed; see server logs",
             )
+        finally:
+            if not abandoned:
+                close_decoded_images([pil_image])
 
         body = encode_3d_response(
             results,

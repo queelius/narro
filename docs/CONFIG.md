@@ -86,7 +86,7 @@ A snapshot of the defaults:
 | `server.shutdown_grace_seconds` | `MUSE_SHUTDOWN_GRACE_SECONDS` | null |
 | `server.default_max_concurrency` | `MUSE_DEFAULT_MAX_CONCURRENCY` | 0 (unlimited) |
 | `server.queue_timeout_seconds` | `MUSE_QUEUE_TIMEOUT_SECONDS` | 300.0 (5 min) |
-| `server.max_queue_depth` | `MUSE_MAX_QUEUE_DEPTH` | 0 (unbounded) |
+| `server.max_queue_depth` | `MUSE_MAX_QUEUE_DEPTH` | 256 (`0` opts into unbounded) |
 | `server.gpu_budget_gb` | `MUSE_GPU_BUDGET_GB` | null |
 | `server.cpu_budget_gb` | `MUSE_CPU_BUDGET_GB` | null |
 | `server.gpu_headroom_gb` | `MUSE_GPU_HEADROOM_GB` | 1.0 |

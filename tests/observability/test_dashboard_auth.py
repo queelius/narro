@@ -6,6 +6,15 @@ from muse.core import config
 from muse.observability.dashboard_auth import check_dashboard_token, require_dashboard_auth
 
 
+@pytest.fixture(autouse=True)
+def _isolate_operator_config(tmp_path, monkeypatch):
+    """Auth tests must not inherit the developer's real Muse token."""
+    monkeypatch.setenv("MUSE_CONFIG", str(tmp_path / "absent-config.yaml"))
+    config.reset_config()
+    yield
+    config.reset_config()
+
+
 def test_no_token_configured_returns_503_dashboard_closed(monkeypatch):
     monkeypatch.delenv("MUSE_ADMIN_TOKEN", raising=False)
     config.reset_config()
