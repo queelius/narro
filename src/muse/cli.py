@@ -123,8 +123,28 @@ doctor_app = typer.Typer(
 app.add_typer(doctor_app, name="doctor")
 
 
+def _version_callback(value: bool) -> bool:
+    """Print the installed distribution version for eager version flags."""
+    if value:
+        from muse import __version__
+
+        typer.echo(__version__)
+        raise typer.Exit()
+    return value
+
+
 @app.callback()
 def _root(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            callback=_version_callback,
+            is_eager=True,
+            help="show the installed muse version and exit",
+        ),
+    ] = False,
     log_level: Annotated[
         LogLevel,
         typer.Option("--log-level", help="root logger verbosity"),

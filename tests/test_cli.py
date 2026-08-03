@@ -9,6 +9,7 @@ mappings (the anti-pattern this CLI design rejects).
 import os
 import subprocess
 import sys
+from importlib.metadata import version
 
 import pytest
 
@@ -54,6 +55,14 @@ def test_no_args_does_not_print_traceback():
     assert "NoArgsIsHelpError" not in combined, (
         f"click internal exception leaked through main():\n{combined}"
     )
+
+
+@pytest.mark.parametrize("flag", ("--version", "-V"))
+def test_version_flags_report_installed_distribution(flag):
+    r = _run(flag)
+    assert r.returncode == 0
+    assert r.stdout.strip() == version("museq")
+    assert r.stderr == ""
 
 
 def test_top_level_help_lists_only_admin_subcommands():
