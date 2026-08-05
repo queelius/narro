@@ -160,9 +160,11 @@ default", so setting one to 0 falls back rather than rejecting every request.
 | key | env | default |
 |---|---|---|
 | `telemetry.enabled` | `MUSE_TELEMETRY_ENABLED` | true |
+| `telemetry.require_auth` | `MUSE_TELEMETRY_REQUIRE_AUTH` | true |
 | `telemetry.retention_days` | `MUSE_TELEMETRY_RETENTION_DAYS` | 7 |
 | `telemetry.log_buffer_kb` | `MUSE_TELEMETRY_LOG_BUFFER_KB` | 64 |
 | `telemetry.sample_interval_seconds` | `MUSE_TELEMETRY_SAMPLE_INTERVAL_SECONDS` | 10.0 |
+| `telemetry.trace_sample_interval_seconds` | `MUSE_TELEMETRY_TRACE_SAMPLE_INTERVAL_SECONDS` | 0.25 |
 | `telemetry.log_ticket_ttl_seconds` | `MUSE_TELEMETRY_LOG_TICKET_TTL_SECONDS` | 60.0 |
 
 `telemetry.enabled` gates the whole subsystem: the event recorder, the
@@ -170,16 +172,22 @@ per-model log ring buffer, the periodic resource sampler, and the
 `/dashboard` data endpoints. Setting it to `false` swaps in a no-op
 recorder (zero queue/thread overhead) and skips wiring the log hub, so
 worker spawning is unchanged from a pre-telemetry `muse serve`.
+`telemetry.require_auth` independently controls the admin-token gate on
+dashboard data and log endpoints. It defaults to true; disable it only for an
+explicitly trusted development or loopback-only deployment.
 `telemetry.retention_days` bounds how far back `/v1/telemetry/series`
 history is pruned. `telemetry.log_buffer_kb` sizes each model's
 per-worker stdout ring buffer (KB, not lines).
 `telemetry.sample_interval_seconds` is how often the background sampler
 records a `sample` event (free VRAM/RAM, loaded/in-flight counts).
+`telemetry.trace_sample_interval_seconds` is the higher-cadence sampling
+interval used only while one or more requests are active; it supplies observed
+per-request peak VRAM and the detailed working-set graph.
 `telemetry.log_ticket_ttl_seconds` is how long a short-lived SSE
 log-stream ticket (minted via `POST /v1/telemetry/logs-ticket`) stays
 valid; the dashboard's `EventSource` client uses one of these instead of
-putting the admin token in the URL. See the "Observability" section of
-`CLAUDE.md` for the full event model and endpoint surface.
+putting the admin token in the URL. See `docs/TELEMETRY.md` for measurement
+semantics, CLI commands, and the full endpoint surface.
 
 ### federation (coordinator: `muse federate`)
 

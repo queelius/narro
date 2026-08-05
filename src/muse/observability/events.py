@@ -5,6 +5,8 @@ EVENT_COLUMNS: tuple[str, ...] = (
     "ts", "type", "model_id", "pool", "gb", "latency_ms", "queued_ms",
     "status", "reason", "cold_load_seconds", "stream", "free_vram_gb",
     "free_ram_gb", "gpu_used_gb", "loaded_count", "in_flight_count", "modality",
+    "request_id", "cold", "load_ms", "forward_ms", "peak_vram_gb",
+    "evicted_models",
 )
 _FIELD_COLUMNS = frozenset(EVENT_COLUMNS) - {"ts", "type"}
 

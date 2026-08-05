@@ -179,9 +179,11 @@ def test_telemetry_settings_present():
     from muse.core import config as cfg
     for key, default in [
         ("telemetry.enabled", True),
+        ("telemetry.require_auth", True),
         ("telemetry.retention_days", 7),
         ("telemetry.log_buffer_kb", 64),
         ("telemetry.sample_interval_seconds", 10.0),
+        ("telemetry.trace_sample_interval_seconds", 0.25),
     ]:
         assert key in cfg.SETTINGS_BY_KEY, key
         assert cfg.SETTINGS_BY_KEY[key].default == default

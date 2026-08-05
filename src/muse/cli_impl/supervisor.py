@@ -52,7 +52,7 @@ from muse.core.resource_registry import (
 
 from muse.observability.store import TelemetryStore
 from muse.observability.recorder import init_recorder, reset_recorder
-from muse.observability.sampler import Sampler
+from muse.observability.sampler import Sampler, VramTracker
 from muse.observability.logs import LogHub
 
 logger = logging.getLogger(__name__)
@@ -258,6 +258,7 @@ class SupervisorState:
     log_hub: "Any | None" = None
     telemetry_recorder: "Any | None" = None
     telemetry_sampler: "Any | None" = None
+    telemetry_vram_tracker: "Any | None" = None
     telemetry_prune_thread: "threading.Thread | None" = None
     # Persistent identity of this exact supervisor process. Retained along
     # with the singleton when any subordinate cleanup fails, so a later
@@ -2357,6 +2358,7 @@ def _shutdown_telemetry(state: SupervisorState) -> bool:
             return False
         state.telemetry_store = None
     state.log_hub = None
+    state.telemetry_vram_tracker = None
     return True
 
 
@@ -2400,12 +2402,18 @@ def _init_telemetry(state: SupervisorState) -> None:
             state.telemetry_store,
             state.telemetry_recorder,
             state.telemetry_sampler,
+            state.telemetry_vram_tracker,
             state.telemetry_prune_thread,
         )
     ):
         raise RuntimeError("telemetry is already initialized for this supervisor")
     if state.stop_event.is_set():
         raise RuntimeError("supervisor shutdown requested during telemetry startup")
+    if not config.get("telemetry.require_auth"):
+        logger.warning(
+            "telemetry authentication is disabled; dashboard data and worker "
+            "logs are available without an admin token"
+        )
 
     store_path = Path(config.get("paths.catalog_dir")).expanduser() / "telemetry.db"
     store = TelemetryStore(store_path)
@@ -2414,6 +2422,8 @@ def _init_telemetry(state: SupervisorState) -> None:
         log_buffer_kb = config.get("telemetry.log_buffer_kb")
         state.log_hub = LogHub(buffer_bytes=int(log_buffer_kb) * 1024)
 
+        vram_tracker = VramTracker()
+        state.telemetry_vram_tracker = vram_tracker
         sampler = Sampler(
             interval=float(config.get("telemetry.sample_interval_seconds")),
             loaded_fn=lambda: state.director.loaded,
@@ -2421,9 +2431,17 @@ def _init_telemetry(state: SupervisorState) -> None:
                 getattr(state.director, "in_flight_loads", {}) or {}
             ),
             stop_event=state.stop_event,
+            vram_tracker=vram_tracker,
+            active_interval=float(
+                config.get("telemetry.trace_sample_interval_seconds")
+            ),
         )
         state.telemetry_sampler = sampler
         state.telemetry_recorder = init_recorder(store, enabled=True)
+        try:
+            sampler.sample_once()
+        except Exception:
+            logger.warning("initial telemetry sample failed", exc_info=True)
         if not sampler.start():
             raise RuntimeError(
                 "supervisor shutdown requested during telemetry startup"

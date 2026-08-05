@@ -31,6 +31,12 @@ def _reset_module_sentinels():
     """
     import muse.core.memory_probe as mod
     orig = (mod.pynvml, mod._init_attempted, mod._init_ok)
+    # Other observability tests may legitimately initialize the process-wide
+    # probe before this module is collected. Each unit test needs the same
+    # pristine first-call state regardless of suite order.
+    mod.pynvml = None
+    mod._init_attempted = False
+    mod._init_ok = False
     yield
     (mod.pynvml, mod._init_attempted, mod._init_ok) = orig
 

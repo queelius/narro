@@ -57,6 +57,13 @@ def test_token_set_correct_via_bearer_returns_none(monkeypatch):
     assert check_dashboard_token("Bearer secret123") is None
 
 
+def test_auth_can_be_explicitly_disabled(monkeypatch):
+    monkeypatch.setenv("MUSE_TELEMETRY_REQUIRE_AUTH", "false")
+    monkeypatch.delenv("MUSE_ADMIN_TOKEN", raising=False)
+    config.reset_config()
+    assert check_dashboard_token(None) is None
+
+
 @pytest.fixture
 def app():
     """A trivial FastAPI app whose only route requires the dashboard token.

@@ -20,7 +20,7 @@ from muse.observability.recorder import (
     reset_recorder,
 )
 from muse.observability.logs import LogHub
-from muse.observability.sampler import Sampler
+from muse.observability.sampler import Sampler, VramTracker
 
 __all__ = [
     "EVENT_COLUMNS",
@@ -33,6 +33,7 @@ __all__ = [
     "reset_recorder",
     "LogHub",
     "Sampler",
+    "VramTracker",
     "build_dashboard_router",
     "DASHBOARD_HTML",
     "require_dashboard_auth",

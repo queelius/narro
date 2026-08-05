@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from muse.observability.sampler import Sampler
+from muse.observability.sampler import Sampler, VramTracker
 
 
 def test_sample_once_records(monkeypatch):
@@ -140,3 +140,26 @@ def test_stop_clears_an_inert_thread_whose_start_never_completed():
 
     assert s.stop() is True
     assert s._thread is None
+
+
+def test_vram_tracker_captures_peak_for_each_active_request(monkeypatch):
+    import muse.observability.sampler as smod
+    monkeypatch.setattr(smod, "gpu_free_gb", lambda: 4.0)
+    monkeypatch.setattr(smod, "gpu_total_gb", lambda: 12.0)
+    monkeypatch.setattr(smod, "cpu_free_gb", lambda: 20.0)
+    tracker = VramTracker()
+    seen = []
+    sampler = Sampler(
+        interval=10,
+        active_interval=0.01,
+        loaded_fn=lambda: {},
+        inflight_fn=lambda: 0,
+        record_fn=lambda event, **fields: seen.append((event, fields)),
+        vram_tracker=tracker,
+    )
+
+    tracker.begin("request-1")
+    sampler.sample_once()
+
+    assert tracker.finish("request-1") == 8.0
+    assert seen[0][1]["gpu_used_gb"] == 8.0
