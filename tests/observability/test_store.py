@@ -57,6 +57,17 @@ def test_vram_series(store):
     assert p["avg"] == 5.0
 
 
+def test_vram_series_recovers_legacy_used_values_after_one_new_sample(store):
+    store.insert_many([
+        event_to_row("sample", 61.0, free_vram_gb=8.0),
+        event_to_row("sample", 65.0, free_vram_gb=6.0, gpu_used_gb=6.0),
+    ])
+    point = store.series("vram", since_ts=0, bucket_seconds=60)["points"][0]
+    assert point["used"] == 5.0
+    samples = store.samples(since_ts=0)
+    assert samples[0]["gpu_used_gb"] == 4.0
+
+
 def test_ram_series(store):
     store.insert_many([
         event_to_row("sample", 61.0, free_ram_gb=8.0),
@@ -113,3 +124,81 @@ def test_close_is_idempotent_and_later_operations_fail_clearly(tmp_path):
         store.summary_counts()
     with pytest.raises(RuntimeError, match="telemetry store is closed"):
         store.insert_many([event_to_row("request", 1.0, model_id="m")])
+
+
+def test_request_report_and_recent_traces(store):
+    store.insert_many([
+        event_to_row(
+            "request", 100.0, request_id="cold-1", model_id="tts",
+            modality="audio/speech", cold=True, latency_ms=1200.0,
+            load_ms=900.0, forward_ms=300.0, peak_vram_gb=4.25,
+            evicted_models='["whisper"]', status=200,
+        ),
+        event_to_row(
+            "request", 110.0, request_id="hot-1", model_id="tts",
+            modality="audio/speech", cold=False, latency_ms=250.0,
+            load_ms=0.0, forward_ms=240.0, peak_vram_gb=4.0,
+            evicted_models="[]", status=200,
+        ),
+    ])
+
+    report = store.request_report(since_ts=0.0)
+    assert report == [{
+        "modality": "audio/speech",
+        "model_id": "tts",
+        "cold_count": 1,
+        "hot_count": 1,
+        "cold_latency_ms": 1200.0,
+        "hot_latency_ms": 250.0,
+        "peak_vram_gb": 4.25,
+        "request_count": 2,
+        "evicted_models": '["whisper"]',
+        "estimated": False,
+        "legacy_count": 0,
+        "basis": "measured",
+    }]
+    traces = store.recent_requests(since_ts=0.0, limit=1)
+    assert traces[0]["request_id"] == "hot-1"
+
+
+def test_store_migrates_request_trace_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE events (ts REAL NOT NULL, type TEXT NOT NULL)")
+    conn.commit()
+    conn.close()
+
+    migrated = TelemetryStore(path)
+    try:
+        migrated.insert_many([
+            event_to_row("request", 1.0, request_id="r", cold=True),
+        ])
+        assert migrated.recent_requests(since_ts=0, limit=10)[0]["request_id"] == "r"
+    finally:
+        migrated.close()
+
+
+def test_request_report_estimates_legacy_cold_hot_and_eviction(store):
+    store.insert_many([
+        event_to_row(
+            "request", 100.0, model_id="new", modality="audio/speech",
+            latency_ms=200.0, status=200,
+        ),
+        event_to_row(
+            "model_load", 90.0, model_id="new", cold_load_seconds=1.0,
+        ),
+        event_to_row(
+            "model_evict", 89.0, model_id="old", reason="evicted_for_new",
+        ),
+    ])
+
+    row = store.request_report(since_ts=0)[0]
+
+    assert row["cold_latency_ms"] == 1200.0
+    assert row["hot_latency_ms"] == 200.0
+    assert row["cold_count"] == 1
+    assert row["legacy_count"] == 1
+    assert row["evicted_models"] == '["old"]'
+    assert row["basis"] == "estimated"

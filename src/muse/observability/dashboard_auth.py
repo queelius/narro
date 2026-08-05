@@ -38,6 +38,9 @@ def check_dashboard_token(bearer: str | None) -> None:
       - candidate mismatches expected         -> 403 invalid_token
       - candidate matches                     -> return None (caller proceeds)
     """
+    if not config.get("telemetry.require_auth"):
+        return
+
     expected = config.get("admin.token")
     # Strip the operator-supplied token: a whitespace-only value is treated
     # as "unset" (closed-by-default), and this defends against the common

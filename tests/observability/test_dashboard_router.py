@@ -14,6 +14,7 @@ from muse.core import config
 from muse.observability.dashboard import _stream_model_logs, build_dashboard_router
 from muse.observability.logs import LogHub
 from muse.observability.store import TelemetryStore
+from muse.observability.events import event_to_row
 
 
 @pytest.fixture(autouse=True)
@@ -288,6 +289,48 @@ def test_dashboard_html_is_self_contained(client_with_token):
     # no external resource loads (works internet-exposed / strict CSP)
     assert not re.search(r'(src|href)\s*=\s*["\']https?://', body)
     assert body.isascii()
+    assert "VRAM over time" in body
+    assert "Cold vs hot evidence" in body
+    assert "Recent request traces" in body
+
+
+def test_report_and_traces_endpoints(client_with_token):
+    state = client_with_token.state_ref
+    state.telemetry_store.insert_many([
+        event_to_row(
+            "request", 9999999999.0, request_id="r1", model_id="m",
+            modality="audio/speech", cold=True, latency_ms=1000.0,
+            load_ms=700.0, peak_vram_gb=3.5,
+            evicted_models='["old"]', status=200,
+        ),
+    ])
+    headers = {"Authorization": "Bearer t"}
+
+    report = client_with_token.get(
+        "/v1/telemetry/report?window=9999999999", headers=headers,
+    )
+    traces = client_with_token.get(
+        "/v1/telemetry/traces?window=9999999999", headers=headers,
+    )
+
+    assert report.status_code == 200
+    assert report.json()["rows"][0]["evicted_models"] == ["old"]
+    assert traces.status_code == 200
+    assert traces.json()["rows"][0]["cold"] is True
+
+
+def test_dashboard_data_can_be_opened_explicitly(tmp_path, monkeypatch):
+    monkeypatch.setenv("MUSE_TELEMETRY_REQUIRE_AUTH", "false")
+    monkeypatch.delenv("MUSE_ADMIN_TOKEN", raising=False)
+    config.reset_config()
+    app, state = _make_app(tmp_path)
+    try:
+        client = TestClient(app)
+        response = client.get("/v1/telemetry/summary")
+        assert response.status_code == 200
+        assert response.json()["auth_required"] is False
+    finally:
+        state.telemetry_store.close()
 
 
 def test_dashboard_is_ungated(client_no_token):

@@ -55,6 +55,7 @@ from muse.core.server import _format_loaded_at, build_model_entry
 # that guarantee.
 from muse.observability.dashboard import build_dashboard_router
 from muse.observability.recorder import record
+from muse.observability.traces import begin_request_trace, reset_request_trace
 
 # Module-top (no import cycle: supervisor imports gateway only lazily).
 # `revalidate_servability` re-checks a stale boot unservable stamp against
@@ -259,6 +260,18 @@ class _OwnedStreamingResponse(StreamingResponse):
     ) -> None:
         self._cleanup = cleanup
         super().__init__(*args, **kwargs)
+
+    def add_cleanup(self, cleanup: Callable[[], Awaitable[None]]) -> None:
+        """Run an additional owner cleanup after the stream settles."""
+        previous = self._cleanup
+
+        async def _combined_cleanup() -> None:
+            try:
+                await previous()
+            finally:
+                await cleanup()
+
+        self._cleanup = _combined_cleanup
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         try:
@@ -1029,6 +1042,100 @@ async def _route_via_director(
     state: Any,
     timeout: float,
 ) -> Response:
+    """Own one end-to-end telemetry trace around director routing."""
+    if not config.get("telemetry.enabled"):
+        return await _route_via_director_inner(
+            request, full_path, model_id, state, timeout, trace=None,
+        )
+    modality = _modality_from_path(full_path)
+    trace, trace_token = begin_request_trace(model_id, modality)
+    started = time.monotonic()
+    response: Response | None = None
+    raised_status: int | None = None
+    finished = False
+    deferred = False
+    vram_tracker = getattr(state, "telemetry_vram_tracker", None)
+    if vram_tracker is not None:
+        try:
+            vram_tracker.begin(trace.request_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("request VRAM tracking failed to start", exc_info=True)
+            vram_tracker = None
+    def _finish_trace() -> None:
+        nonlocal finished
+        if finished:
+            return
+        finished = True
+        peak_vram_gb = None
+        if vram_tracker is not None:
+            try:
+                peak_vram_gb = vram_tracker.finish(trace.request_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("request VRAM tracking failed to finish", exc_info=True)
+        if (
+            isinstance(response, StreamingResponse)
+            and trace.forward_started_at is not None
+        ):
+            trace.forward_ms = (
+                time.monotonic() - trace.forward_started_at
+            ) * 1000.0
+        snapshot = trace.snapshot()
+        try:
+            record(
+                "request",
+                request_id=trace.request_id,
+                model_id=model_id,
+                modality=modality,
+                latency_ms=(time.monotonic() - started) * 1000.0,
+                queued_ms=snapshot["queued_ms"],
+                load_ms=snapshot["load_ms"],
+                forward_ms=snapshot["forward_ms"],
+                cold=snapshot["cold"],
+                peak_vram_gb=peak_vram_gb,
+                evicted_models=json.dumps(
+                    snapshot["evicted_models"], separators=(",", ":"),
+                ),
+                status=(
+                    getattr(response, "status_code", None)
+                    if response is not None else raised_status
+                ),
+                stream=isinstance(response, StreamingResponse),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("telemetry record('request') failed", exc_info=True)
+
+    try:
+        response = await _route_via_director_inner(
+            request, full_path, model_id, state, timeout, trace=trace,
+        )
+        if isinstance(response, _OwnedStreamingResponse):
+            async def _finish_stream_trace() -> None:
+                _finish_trace()
+
+            response.add_cleanup(_finish_stream_trace)
+            deferred = True
+        return response
+    except asyncio.CancelledError:
+        raised_status = 499
+        raise
+    except BaseException:
+        raised_status = 500
+        raise
+    finally:
+        if not deferred:
+            _finish_trace()
+        reset_request_trace(trace_token)
+
+
+async def _route_via_director_inner(
+    request: Request,
+    full_path: str,
+    model_id: str,
+    state: Any,
+    timeout: float,
+    *,
+    trace: Any,
+) -> Response:
     """Director-driven request routing for v0.40.0 lazy load.
 
     Order of operations:
@@ -1315,6 +1422,8 @@ async def _route_via_director(
         _release_slot()
         raise
     queued_ms = (gate_wait_seconds + capacity_wait_seconds) * 1000.0
+    if trace is not None:
+        trace.queued_ms = queued_ms
 
     # 4. Forward. The release calls (director.release + the gate slot release)
     # are wired into the response shape: for buffered responses, fire in a
@@ -1323,6 +1432,8 @@ async def _route_via_director(
     # raises). Both paths converge in `_forward_with_release`.
     target_url = f"http://127.0.0.1:{worker_port}/{full_path}"
     t0 = time.monotonic()
+    if trace is not None:
+        trace.forward_started_at = t0
     try:
         response = await _forward_with_release(
             request, target_url, timeout,
@@ -1352,25 +1463,8 @@ async def _route_via_director(
             error_type="server_error",
         )
     latency_ms = (time.monotonic() - t0) * 1000.0
-    stream = isinstance(response, StreamingResponse)
-    # Fire-and-forget: telemetry must NEVER break request forwarding, even
-    # if `record` or `_modality_from_path` regresses. Latency semantic:
-    # for buffered responses this is the full request duration; for
-    # streams it is time-to-response-object only, since
-    # StreamingResponse returns before the body actually streams (the
-    # `stream` flag records which one this event measured).
-    try:
-        record(
-            "request",
-            model_id=model_id,
-            modality=_modality_from_path(full_path),
-            latency_ms=latency_ms,
-            queued_ms=queued_ms,
-            status=getattr(response, "status_code", None),
-            stream=stream,
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning("telemetry record('request') failed", exc_info=True)
+    if trace is not None:
+        trace.forward_ms = latency_ms
     return response
 
 

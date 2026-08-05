@@ -18,7 +18,7 @@ rather than inventing a new one.
 """
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -62,6 +62,11 @@ class TestRequestTelemetry:
         assert fields["status"] == r.status_code
         assert fields["stream"] is False
         assert fields["modality"] == "chat/completions"
+        assert isinstance(fields["request_id"], str) and fields["request_id"]
+        assert fields["cold"] is False
+        assert fields["latency_ms"] >= fields["forward_ms"]
+        assert fields["load_ms"] == 0.0
+        assert fields["evicted_models"] == "[]"
 
     def test_record_failure_never_breaks_the_forward(self, monkeypatch):
         """record() raising must not propagate: telemetry is fire-and-forget."""
@@ -83,6 +88,121 @@ class TestRequestTelemetry:
             )
 
         assert r.status_code == 200
+
+    def test_cold_annotation_crosses_asyncio_to_thread_context(self, monkeypatch):
+        from muse.observability.traces import note_model_eviction, note_model_load
+
+        captured = []
+        monkeypatch.setattr(
+            "muse.cli_impl.gateway.record",
+            lambda event_type, **fields: captured.append((event_type, fields)),
+        )
+        state = _make_state_with_director(acquire_port=9001)
+
+        def acquire(model_id, *, manifest):
+            # gateway invokes this through asyncio.to_thread; ContextVar
+            # propagation is what links these notes to the outer request.
+            note_model_eviction("old-model")
+            note_model_load(model_id, 0.5)
+            return 9001
+
+        state.director.acquire.side_effect = acquire
+        app = build_gateway(state=state)
+        client = TestClient(app)
+        with _patch_get_manifest(), patch(
+            "muse.cli_impl.gateway.httpx.AsyncClient"
+        ) as mock_cls:
+            _wire_async_client_json(mock_cls, response_status=200)
+            response = client.post(
+                "/v1/audio/speech",
+                json={"input": "hi", "model": "fake-model"},
+            )
+
+        assert response.status_code == 200
+        fields = [fields for event, fields in captured if event == "request"][0]
+        assert fields["cold"] is True
+        assert fields["load_ms"] == 500.0
+        assert fields["evicted_models"] == '["old-model"]'
+
+    def test_stream_trace_finishes_after_the_response_body(self, monkeypatch):
+        captured = []
+        chunks_seen = []
+        finish_at = []
+        monkeypatch.setattr(
+            "muse.cli_impl.gateway.record",
+            lambda event_type, **fields: captured.append((event_type, fields)),
+        )
+        state = _make_state_with_director(acquire_port=9001)
+
+        class Tracker:
+            def begin(self, request_id):
+                self.request_id = request_id
+
+            def finish(self, request_id):
+                assert request_id == self.request_id
+                finish_at.append(len(chunks_seen))
+                return 5.5
+
+        state.telemetry_vram_tracker = Tracker()
+        app = build_gateway(state=state)
+        client = TestClient(app)
+        chunks = [b"data: one\n\n", b"event: done\ndata: \n\n"]
+        with _patch_get_manifest(), patch(
+            "muse.cli_impl.gateway.httpx.AsyncClient"
+        ) as mock_cls:
+            mock_client = MagicMock()
+            mock_client.aclose = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.headers = {"content-type": "text/event-stream"}
+
+            async def aiter_raw():
+                for chunk in chunks:
+                    chunks_seen.append(chunk)
+                    yield chunk
+
+            mock_response.aiter_raw = aiter_raw
+            stream_ctx = MagicMock()
+            stream_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+            stream_ctx.__aexit__ = AsyncMock(return_value=None)
+            mock_client.stream.return_value = stream_ctx
+            mock_cls.return_value = mock_client
+
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": "fake-model", "messages": [], "stream": True},
+            )
+
+        assert response.status_code == 200
+        assert finish_at == [len(chunks)]
+        fields = [fields for event, fields in captured if event == "request"][0]
+        assert fields["stream"] is True
+        assert fields["peak_vram_gb"] == 5.5
+
+    def test_disabled_telemetry_skips_trace_creation(self, monkeypatch):
+        monkeypatch.setenv("MUSE_TELEMETRY_ENABLED", "false")
+        config.reset_config()
+        monkeypatch.setattr(
+            "muse.cli_impl.gateway.begin_request_trace",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("trace must not be created when telemetry is disabled")
+            ),
+        )
+        state = _make_state_with_director(acquire_port=9001)
+        app = build_gateway(state=state)
+        client = TestClient(app)
+        try:
+            with _patch_get_manifest(), patch(
+                "muse.cli_impl.gateway.httpx.AsyncClient"
+            ) as mock_cls:
+                _wire_async_client_json(mock_cls, response_status=200)
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={"model": "fake-model", "messages": []},
+                )
+            assert response.status_code == 200
+        finally:
+            config.reset_config()
 
 
 class TestDashboardMount:

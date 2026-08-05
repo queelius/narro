@@ -119,6 +119,65 @@ def test_storage_commands_expose_safe_cleanup_controls():
         assert option in prune_opts
 
 
+def test_telemetry_commands_expose_view_export_and_management_surface():
+    import typer
+
+    from muse.cli import app
+
+    telemetry = typer.main.get_command(app).commands["telemetry"]
+    for command in ("status", "summary", "traces", "vram", "export", "prune"):
+        assert command in telemetry.commands
+
+
+def test_telemetry_summary_and_vram_render_recorded_data(tmp_path):
+    from muse.observability.events import event_to_row
+    from muse.observability.store import TelemetryStore
+
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    store = TelemetryStore(catalog / "telemetry.db")
+    try:
+        now = 2_000_000_000.0
+        store.insert_many([
+            event_to_row(
+                "request", now, model_id="tts", modality="audio/speech",
+                cold=True, latency_ms=1234.0, peak_vram_gb=4.5,
+                evicted_models='["whisper"]', status=200,
+            ),
+            event_to_row(
+                "sample", now, gpu_used_gb=4.5, free_vram_gb=7.5,
+            ),
+        ])
+    finally:
+        store.close()
+
+    summary = _run("telemetry", "summary", "--since", "3000d")
+    graph = _run("telemetry", "vram", "--since", "3000d", "--width", "20")
+
+    assert summary.returncode == 0, summary.stdout + summary.stderr
+    assert "Generate speech" in summary.stdout
+    assert "whisper" in summary.stdout
+    assert graph.returncode == 0, graph.stdout + graph.stderr
+    assert "GPU working set" in graph.stdout
+    assert "4.50 GB" in graph.stdout
+
+    export_path = tmp_path / "trace.json"
+    exported = _run(
+        "telemetry", "export", str(export_path), "--since", "3000d",
+    )
+    refused = _run(
+        "telemetry", "export", str(export_path), "--since", "3000d",
+    )
+    forced = _run(
+        "telemetry", "export", str(export_path), "--since", "3000d", "--force",
+    )
+    assert exported.returncode == 0
+    assert json.loads(export_path.read_text())[0]["model_id"] == "tts"
+    assert refused.returncode != 0
+    assert "refusing to overwrite" in (refused.stdout + refused.stderr)
+    assert forced.returncode == 0
+
+
 def test_doctor_storage_json_is_read_only_on_empty_state(tmp_path):
     catalog = tmp_path / "catalog"
     assert not catalog.exists()
